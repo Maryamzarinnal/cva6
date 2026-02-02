@@ -98,6 +98,16 @@ sources:
       - core/include/std_cache_pkg.sv
       - core/include/aes_pkg.sv
 
+      # Trace Cache (passive)
+      - core/trace_cache/trace_cache_pkg.sv
+      - core/trace_cache/tracebuilder_instr_if.sv
+      - core/trace_cache/tc_ghr.sv
+      - core/trace_cache/tc_sram.sv
+      - core/trace_cache/tag_sram.sv
+      - core/trace_cache/trace_tag_compare.sv
+      - core/trace_cache/trace_builder.sv
+      - core/trace_cache/trace_cache_top.sv
+
       # Extension Interface
       - core/cvxif_example/include/cvxif_instr_pkg.sv
       - core/cvxif_fu.sv
