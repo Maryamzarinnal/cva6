@@ -589,38 +589,41 @@ module frontend
       .fetch_entry_valid_o(fetch_entry_valid_o),   // to back-end
       .fetch_entry_ready_i(fetch_entry_ready_i)    // to back-end
   );
-  // ------------------------------------------------------------
-  // Trace Cache (passive tap) - observe only accepted slot 0
-  // ------------------------------------------------------------
-  logic tc_instr_valid;
-  logic tc_is_branch;
-  logic tc_branch_taken;
 
-  assign tc_instr_valid  = instr_queue_consumed[0] & ~flush_i;
-  assign tc_is_branch    = is_branch[0];
-  
-  //this is frontend control-flow decision (predicted taken)
-  assign tc_branch_taken = taken_rvi_cf[0] | taken_rvc_cf[0];
+// Trace Cache (passive tap) 
+// ------------------------------------------------------------
+logic tc_instr_valid;
+logic tc_is_branch;
+logic tc_branch_taken;
+logic [31:0] tc_next_pc;
 
-  trace_cache_top #(
-    .WINDOW_SIZE  (4),
-    .TRACE_LEN    (4),
-    .MAX_BRANCHES (2),
-    .ADDRW        (10),
-    .GHR_W        (8)
-  ) i_trace_cache_top (
-    .clk_i              (clk_i),
-    .rst_ni             (rst_ni),
+assign tc_instr_valid  = instruction_valid[0] & ~flush_i;
+assign tc_is_branch    = is_branch[0];
 
-    .instr_valid_i      (tc_instr_valid),
-    .instr_i            (instr[0]),
-    .pc_i               (addr[0][31:0]),
-    .is_branch_i        (tc_is_branch),
-    .branch_taken_i     (tc_branch_taken),
-    .next_pc_i          (32'b0),
+// predicted taken
+assign tc_branch_taken = taken_rvi_cf[0] | taken_rvc_cf[0];
 
-    .flush_i            (flush_i),
-    .instr_queue_ready_i(instr_queue_ready)
-  );
+// Calculate next PC:
+assign tc_next_pc = (taken_rvi_cf[0] | taken_rvc_cf[0]) ? predict_address[31:0] :
+                    (addr[0][31:0] + ((instr[0][1:0] == 2'b11) ? 32'd4 : 32'd2));
+
+trace_cache_top #(
+  .WINDOW_SIZE  (4),
+  .TRACE_LEN    (4),
+  .MAX_BRANCHES (2),
+  .ADDRW        (10),
+  .GHR_W        (8)
+) i_trace_cache_top (
+  .clk_i              (clk_i),
+  .rst_ni             (rst_ni),
+  .instr_valid_i      (tc_instr_valid),
+  .instr_i            (instr[0]),
+  .pc_i               (addr[0][31:0]),
+  .is_branch_i        (tc_is_branch),
+  .branch_taken_i     (tc_branch_taken),
+  .next_pc_i          (tc_next_pc),        
+  .flush_i            (flush_i),
+  .instr_queue_ready_i(instr_queue_ready)
+);
 
 endmodule
