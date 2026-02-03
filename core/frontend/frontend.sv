@@ -590,6 +590,31 @@ module frontend
       .fetch_entry_ready_i(fetch_entry_ready_i)    // to back-end
   );
 
+integer debug_cycle_count = 0;
+
+always_ff @(posedge clk_i or negedge rst_ni) begin
+  if (!rst_ni) begin
+    debug_cycle_count <= 0;
+  end else begin
+    debug_cycle_count <= debug_cycle_count + 1;
+    
+    // Print every 1000 cycles
+    if (debug_cycle_count % 1000 == 0) begin
+      $display("[FE-CYCLE-%0d] v[0]=%b v[1]=%b | pc[0]=%h pc[1]=%h",
+               debug_cycle_count,
+               instruction_valid[0], instruction_valid[1],
+               addr[0][31:0], addr[1][31:0]);
+    end
+    
+    // Also print when BOTH are valid (rare event)
+    if (instruction_valid[0] && instruction_valid[1]) begin
+      $display("[FE-DUAL-ISSUE] cycle=%0d pc[0]=%h pc[1]=%h inst[0]=%h inst[1]=%h",
+               debug_cycle_count,
+               addr[0][31:0], addr[1][31:0],
+               instr[0], instr[1]);
+    end
+  end
+end
 
 // Print EVERY cycle to see what's happening
 always_ff @(posedge clk_i) begin
