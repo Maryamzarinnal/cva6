@@ -598,7 +598,6 @@ logic tc_branch_taken;
 logic [31:0] tc_next_pc;
 
 assign tc_instr_valid  = instruction_valid[0] & ~flush_i;
-assign tc_is_branch    = is_branch[0];
 
 // Detect ANY control flow (branches + jumps + returns)
 assign tc_is_branch = is_branch[0] | is_jump[0] | is_jalr[0] | is_return[0];
