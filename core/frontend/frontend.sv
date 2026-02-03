@@ -600,8 +600,12 @@ logic [31:0] tc_next_pc;
 assign tc_instr_valid  = instruction_valid[0] & ~flush_i;
 assign tc_is_branch    = is_branch[0];
 
-// predicted taken
-assign tc_branch_taken = taken_rvi_cf[0] | taken_rvc_cf[0];
+// Detect ANY control flow (branches + jumps + returns)
+assign tc_is_branch = is_branch[0] | is_jump[0] | is_jalr[0] | is_return[0];
+
+// Detect if ANY control flow is taken
+assign tc_branch_taken = taken_rvi_cf[0] | taken_rvc_cf[0] | 
+                         is_jump[0] | is_jalr[0] | is_return[0];
 
 // Calculate next PC:
 assign tc_next_pc = (taken_rvi_cf[0] | taken_rvc_cf[0]) ? predict_address[31:0] :
