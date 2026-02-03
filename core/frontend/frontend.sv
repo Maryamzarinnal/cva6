@@ -601,7 +601,27 @@ module frontend
   
   //this is frontend control-flow decision (predicted taken)
   assign tc_branch_taken = taken_rvi_cf[0] | taken_rvc_cf[0];
-
+  // ------------------------------------------------------------
+  // TC DEBUG: show exactly why builder sees valid=0
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      // no-op
+    end else begin
+      // Print when lane0 is consumed OR when we are about to send a valid to TC
+      if (instr_queue_consumed[0] || tc_instr_valid) begin
+        $display("[FE-TC] cons0=%0b ready=%0b flush=%0b -> tc_valid=%0b | pc0=%h inst0=%h br0=%0b tk0=%0b",
+                 instr_queue_consumed[0],
+                 instr_queue_ready,
+                 flush_i,
+                 tc_instr_valid,
+                 addr[0][31:0],
+                 instr[0],
+                 tc_is_branch,
+                 tc_branch_taken);
+      end
+    end
+  end
   trace_cache_top #(
     .WINDOW_SIZE  (4),
     .TRACE_LEN    (4),
