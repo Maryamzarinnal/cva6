@@ -590,14 +590,14 @@ module frontend
       .fetch_entry_ready_i(fetch_entry_ready_i)    // to back-end
   );
 
-  
+
+// Print EVERY cycle to see what's happening
 always_ff @(posedge clk_i) begin
-  if (|instruction_valid & ~flush_i) begin  // If ANY instruction is valid
-    $display("[FE-SLOTS] time=%0t | v[0]=%b v[1]=%b v[2]=%b v[3]=%b | pc[0]=%h pc[1]=%h pc[2]=%h pc[3]=%h",
-             $time,
-             instruction_valid[0], instruction_valid[1], instruction_valid[2], instruction_valid[3],
-             addr[0][31:0], addr[1][31:0], addr[2][31:0], addr[3][31:0]);
-  end
+  $display("[FE-SLOTS] time=%0t flush=%b | v[0]=%b v[1]=%b v[2]=%b v[3]=%b",
+           $time,
+           flush_i,
+           instruction_valid[0], instruction_valid[1], 
+           instruction_valid[2], instruction_valid[3]);
 end
 // ----------------
 // Trace Cache (passive tap) 
