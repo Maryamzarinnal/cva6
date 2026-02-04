@@ -1,20 +1,18 @@
 `timescale 1ns/1ps
 import trace_cache_pkg::*;
 
-interface tracebuilder_instr_if #(
-  parameter int SLOTS = 4
-)(
+interface tracebuilder_instr_if (
   input logic clk_i,
   input logic rst_ni
 );
 
-  logic [SLOTS-1:0]              valid;
-  logic                          ready;
-  logic [SLOTS-1:0][PC_WIDTH-1:0] pc;        
-  logic [SLOTS-1:0][31:0]        inst;       
-  logic [SLOTS-1:0]              is_branch;
-  logic [SLOTS-1:0]              taken;
-  logic [SLOTS-1:0][PC_WIDTH-1:0] next_pc;   
+  logic [SLOTS_PER_CYCLE-1:0]                    valid;
+  logic                                          ready;
+  logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH_FULL-1:0] pc;
+  logic [SLOTS_PER_CYCLE-1:0][31:0]              inst;
+  logic [SLOTS_PER_CYCLE-1:0]                    is_branch;
+  logic [SLOTS_PER_CYCLE-1:0]                    taken;
+  logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH_FULL-1:0] next_pc;
 
   modport producer (
     output valid, pc, inst, is_branch, taken, next_pc,

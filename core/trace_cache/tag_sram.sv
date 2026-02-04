@@ -1,46 +1,60 @@
 `timescale 1ns/1ps
+import trace_cache_pkg::*;
 
-module tag_sram #(
-    parameter int unsigned TAG_W = 48,   // PC(32) + GHR(16)
-    parameter int unsigned ADDRW = 10    // depth = 2^ADDRW
-)(
-    input  logic               clk_i,
-    input  logic               rst_ni,
-
-    input  logic               req_i,
-    input  logic               we_i,
-    input  logic [ADDRW-1:0]   addr_i,
-    input  logic [TAG_W-1:0]   wdata_i,
-    input  logic               valid_i,      
-
-    output logic               valid_o,      // read valid bit
-    output logic [TAG_W-1:0]   rdata_o       // read tag
+module tag_sram (
+    input  logic                     clk_i,
+    input  logic                     rst_ni,
+    input  logic                     req_i,       // Request signal
+    input  logic                     we_i,        // Write enable
+    input  logic [TRACE_ADDRW-1:0]   addr_i,      // Address
+    input  logic [TAG_W-1:0]         wdata_i,     // Write data 
+    input  logic                     valid_i,     // Valid bit to write
+    output logic                     valid_o,     // Read valid bit
+    output logic [TAG_W-1:0]         rdata_o      // Read tag data
 );
 
-  // Total memory width = tag + valid = 49 bits
+  // ========================================================================
+  // Derived Constants
+  // ========================================================================
+  
+  // Tag width: Full 64-bit PC + GHR width
+  localparam int unsigned TAG_W = PC_WIDTH_FULL + GHR_WIDTH;
+  
   localparam int unsigned MEM_W = TAG_W + 1;
 
-  // SRAM
-  logic [MEM_W-1:0] mem [0:(1<<ADDRW)-1];
+  // ========================================================================
+  // SRAM Storage
+  // ========================================================================
+  
+  logic [MEM_W-1:0] mem [0:(1<<TRACE_ADDRW)-1];  
 
-  // Registered read address
-  logic [ADDRW-1:0] addr_q;
+  logic [TRACE_ADDRW-1:0] addr_q;
 
-  // Register address for sync-read
+  // ========================================================================
+  // Address Register 
+  // ========================================================================
+  
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni)
       addr_q <= '0;
     else if (req_i)
-      addr_q <= addr_i;
+      addr_q <= addr_i;  // Latch address on request
   end
 
-  // Write: synchronous
+  // ========================================================================
+  // Write Logic 
+  // ========================================================================
+  
   always_ff @(posedge clk_i) begin
     if (req_i && we_i)
-      mem[addr_i] <= {valid_i, wdata_i}; // store: valid + tag
+      mem[addr_i] <= {valid_i, wdata_i};  
   end
 
-  // Read: synchronous via addr_q
+  // ========================================================================
+  // Read Logic 
+  // ========================================================================
+  
+  // Read uses the registered address from previous cycle
   assign {valid_o, rdata_o} = mem[addr_q];
 
 endmodule
