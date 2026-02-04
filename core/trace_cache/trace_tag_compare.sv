@@ -1,17 +1,15 @@
 `timescale 1ns/1ps
+import trace_cache_pkg::*;
 
-module trace_tag_compare #(
-    parameter int unsigned PC_W  = 32,
-    parameter int unsigned GHR_W = 16
-)(
-    input  logic [PC_W-1:0]          pc_i,
-    input  logic [GHR_W-1:0]         ghr_i,
-
-    input  logic                     valid_rd_i,
-    input  logic [PC_W+GHR_W-1:0]    tag_rd_i,
-
-    output logic                     hit_o,
-    output logic [PC_W+GHR_W-1:0]    tag_new_o
+module trace_tag_compare (
+    input  logic [PC_WIDTH-1:0]              pc_i,      
+    input  logic [GHR_WIDTH-1:0]             ghr_i,
+    
+    input  logic                             valid_rd_i,
+    input  logic [PC_WIDTH+GHR_WIDTH-1:0]    tag_rd_i,  
+    
+    output logic                             hit_o,
+    output logic [PC_WIDTH+GHR_WIDTH-1:0]    tag_new_o  
 );
 
   assign tag_new_o = {pc_i, ghr_i};
