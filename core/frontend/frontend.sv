@@ -17,6 +17,7 @@
 
 module frontend
   import ariane_pkg::*;
+  import trace_cache_pkg::*;
 #(
     parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty,
     parameter type bp_resolve_t = logic,
@@ -590,76 +591,44 @@ module frontend
       .fetch_entry_ready_i(fetch_entry_ready_i)    // to back-end
   );
 
-integer debug_cycle_count = 0;
-
-always_ff @(posedge clk_i or negedge rst_ni) begin
-  if (!rst_ni) begin
-    debug_cycle_count <= 0;
-  end else begin
-    debug_cycle_count <= debug_cycle_count + 1;
-    
-    // Print every 1000 cycles
-    if (debug_cycle_count % 1000 == 0) begin
-      $display("[FE-CYCLE-%0d] v[0]=%b v[1]=%b | pc[0]=%h pc[1]=%h",
-               debug_cycle_count,
-               instruction_valid[0], instruction_valid[1],
-               addr[0][31:0], addr[1][31:0]);
-    end
-    
-    // Also print when BOTH are valid (rare event)
-    if (instruction_valid[0] && instruction_valid[1]) begin
-      $display("[FE-DUAL-ISSUE] cycle=%0d pc[0]=%h pc[1]=%h inst[0]=%h inst[1]=%h",
-               debug_cycle_count,
-               addr[0][31:0], addr[1][31:0],
-               instr[0], instr[1]);
-    end
-  end
-end
-
-// Print EVERY cycle to see what's happening
-always_ff @(posedge clk_i) begin
-  $display("[FE-SLOTS] time=%0t flush=%b | v[0]=%b v[1]=%b v[2]=%b v[3]=%b",
-           $time,
-           flush_i,
-           instruction_valid[0], instruction_valid[1], 
-           instruction_valid[2], instruction_valid[3]);
-end
-// ----------------
+// ========================================================================
 // Trace Cache (passive tap) 
-// ------------------------------------------------------------
-logic tc_instr_valid;
-logic tc_is_branch;
-logic tc_branch_taken;
-logic [31:0] tc_next_pc;
+// ========================================================================
+import trace_cache_pkg::*;
 
-assign tc_instr_valid  = instruction_valid[0] & ~flush_i;
+logic [SLOTS_PER_CYCLE-1:0]                    tc_instr_valid;
+logic [SLOTS_PER_CYCLE-1:0][31:0]              tc_instr;
+logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH_FULL-1:0] tc_pc;
+logic [SLOTS_PER_CYCLE-1:0]                    tc_is_cf;
+logic [SLOTS_PER_CYCLE-1:0]                    tc_taken;
+logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH_FULL-1:0] tc_next_pc;
 
-// Detect ANY control flow (branches + jumps + returns)
-assign tc_is_branch = is_branch[0] | is_jump[0] | is_jalr[0] | is_return[0];
+for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
+  assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
+  
+  assign tc_pc[i] = {{(PC_WIDTH_FULL-32){1'b0}}, addr[i][31:0]};
+  
+  assign tc_instr[i] = instr[i];
+  
+  assign tc_is_cf[i] = is_branch[i] | is_jump[i] | is_jalr[i] | is_return[i];
+  
+  assign tc_taken[i] = taken_rvi_cf[i] | taken_rvc_cf[i] | 
+                       is_jump[i] | is_jalr[i] | is_return[i];
+  
+  assign tc_next_pc[i] = {{(PC_WIDTH_FULL-32){1'b0}}, 
+                          ((taken_rvi_cf[i] | taken_rvc_cf[i]) ? predict_address[31:0] :
+                           (addr[i][31:0] + ((instr[i][1:0] == 2'b11) ? 32'd4 : 32'd2)))};
+end
 
-// Detect if ANY control flow is taken
-assign tc_branch_taken = taken_rvi_cf[0] | taken_rvc_cf[0] | 
-                         is_jump[0] | is_jalr[0] | is_return[0];
-
-// Calculate next PC:
-assign tc_next_pc = (taken_rvi_cf[0] | taken_rvc_cf[0]) ? predict_address[31:0] :
-                    (addr[0][31:0] + ((instr[0][1:0] == 2'b11) ? 32'd4 : 32'd2));
-
-trace_cache_top #(
-  .WINDOW_SIZE  (4),
-  .TRACE_LEN    (4),
-  .MAX_BRANCHES (2),
-  .ADDRW        (10),
-  .GHR_W        (8)
-) i_trace_cache_top (
+trace_cache_top i_trace_cache_top (
   .clk_i              (clk_i),
   .rst_ni             (rst_ni),
   .instr_valid_i      (tc_instr_valid),
-  .instr_i            (instr[0]),
-  .pc_i               (addr[0][31:0]),
-  .is_branch_i        (tc_is_branch),
-  .branch_taken_i     (tc_branch_taken),
-  .next_pc_i          (tc_next_pc),        
+  .instr_i            (tc_instr),
+  .pc_i               (tc_pc),
+  .is_branch_i        (tc_is_cf),
+  .branch_taken_i     (tc_taken),
+  .next_pc_i          (tc_next_pc),
   .flush_i            (flush_i),
   .instr_queue_ready_i(instr_queue_ready)
 );
