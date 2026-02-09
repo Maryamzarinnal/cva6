@@ -590,36 +590,42 @@ module frontend
       .fetch_entry_valid_o(fetch_entry_valid_o),   // to back-end
       .fetch_entry_ready_i(fetch_entry_ready_i)    // to back-end
   );
-
 // ========================================================================
 // Trace Cache (passive tap) 
 // ========================================================================
-import trace_cache_pkg::*;
 
-logic [SLOTS_PER_CYCLE-1:0]                    tc_instr_valid;
-logic [SLOTS_PER_CYCLE-1:0][31:0]              tc_instr;
-logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH_FULL-1:0] tc_pc;
-logic [SLOTS_PER_CYCLE-1:0]                    tc_is_cf;
-logic [SLOTS_PER_CYCLE-1:0]                    tc_taken;
-logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH_FULL-1:0] tc_next_pc;
+logic [SLOTS_PER_CYCLE-1:0]               tc_instr_valid;
+logic [SLOTS_PER_CYCLE-1:0][31:0]         tc_instr;
+logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_pc;
+logic [SLOTS_PER_CYCLE-1:0]               tc_is_cf;
+logic [SLOTS_PER_CYCLE-1:0]               tc_taken;
+logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
 
+// Generate signals for all 4 slots
 for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
+  // Valid when instruction valid and not flushing
   assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
   
-  assign tc_pc[i] = {{(PC_WIDTH_FULL-32){1'b0}}, addr[i][31:0]};
+  // Pass through full 64-bit PC
+  assign tc_pc[i] = addr[i];
   
+  // Pass through instruction
   assign tc_instr[i] = instr[i];
   
+  // Detect any control flow
   assign tc_is_cf[i] = is_branch[i] | is_jump[i] | is_jalr[i] | is_return[i];
   
+  // Detect if control flow is taken
   assign tc_taken[i] = taken_rvi_cf[i] | taken_rvc_cf[i] | 
                        is_jump[i] | is_jalr[i] | is_return[i];
   
-  assign tc_next_pc[i] = {{(PC_WIDTH_FULL-32){1'b0}}, 
-                          ((taken_rvi_cf[i] | taken_rvc_cf[i]) ? predict_address[31:0] :
-                           (addr[i][31:0] + ((instr[i][1:0] == 2'b11) ? 32'd4 : 32'd2)))};
+  // Branch target address 
+  assign tc_target[i] = (taken_rvi_cf[i] || taken_rvc_cf[i]) ? 
+                        predict_address : 
+                        addr[i];  // For non-branches, just pass PC
 end
 
+// Instantiate trace cache
 trace_cache_top i_trace_cache_top (
   .clk_i              (clk_i),
   .rst_ni             (rst_ni),
@@ -628,7 +634,7 @@ trace_cache_top i_trace_cache_top (
   .pc_i               (tc_pc),
   .is_branch_i        (tc_is_cf),
   .branch_taken_i     (tc_taken),
-  .next_pc_i          (tc_next_pc),
+  .branch_target_i    (tc_target),
   .flush_i            (flush_i),
   .instr_queue_ready_i(instr_queue_ready)
 );
