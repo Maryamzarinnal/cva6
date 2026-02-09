@@ -30,10 +30,7 @@ module trace_builder (
   // Derived Constants
   // ========================================================================
   
-  // Chunk pointer: counts 16-bit chunks (0 to 8)
   localparam int unsigned CHUNK_PTR_W = $clog2(CHUNKS_PER_TRACE + 1);
-  
-  // Branch counter: counts taken branches (0 to 2)
   localparam int unsigned BR_CNT_W = $clog2(MAX_BRANCHES + 1);
 
   // ========================================================================
@@ -41,9 +38,7 @@ module trace_builder (
   // ========================================================================
   
   typedef enum logic [1:0] { 
-    IDLE,   // Wait for first instruction
-    ACCUM,  // Accumulate instructions
-    COMMIT  // Write trace to SRAM
+    IDLE, ACCUM, COMMIT
   } state_t;
 
   // ========================================================================
@@ -51,29 +46,20 @@ module trace_builder (
   // ========================================================================
   
   state_t state_q, state_d;
-  
-  // Trace being built
   trace_data_t trace_q, trace_d;
   
-  // Chunk pointer: how many 16-bit chunks collected
   logic [CHUNK_PTR_W-1:0] chunk_ptr_q, chunk_ptr_d;
-  
-  // Branch counter: how many taken branches seen
   logic [BR_CNT_W-1:0] br_cnt_q, br_cnt_d;
   
-  // Track last branch's target for computing trace next addresses
   logic [PC_WIDTH-1:0] last_branch_pc_q, last_branch_pc_d;
   logic [PC_WIDTH-1:0] last_branch_target_q, last_branch_target_d;
   logic                last_branch_taken_q, last_branch_taken_d;
   
-  // SRAM write pointer
   logic [TRACE_ADDRW-1:0] sram_wr_ptr_q, sram_wr_ptr_d;
   
-  // Commit pipeline registers
   logic                   commit_valid_q, commit_valid_d;
   logic [TRACE_WIDTH-1:0] commit_data_q, commit_data_d;
   
-  // Trace metadata for tag SRAM
   logic [PC_WIDTH-1:0] trace_start_pc_q, trace_start_pc_d;
   logic [GHR_WIDTH-1:0] trace_start_ghr_q, trace_start_ghr_d;
 
@@ -81,24 +67,21 @@ module trace_builder (
   // Output Assignments
   // ========================================================================
   
-  assign instr_i.ready = 1'b1;  // Always ready
+  assign instr_i.ready = 1'b1;
 
-  // SRAM write interface
   assign mem_req_o   = commit_valid_q;
   assign mem_we_o    = commit_valid_q;
   assign mem_addr_o  = sram_wr_ptr_q;
   assign mem_wdata_o = commit_data_q;
   assign mem_be_o    = {BE_WIDTH{1'b1}};
 
-  // Trace output
   assign trace_valid_o = commit_valid_q;
   assign trace_data_o  = commit_data_q;
 
-  // Tag SRAM interface
   assign tag_valid_o     = commit_valid_q;
   assign tag_start_pc_o  = trace_start_pc_q;
   assign tag_start_ghr_o = trace_start_ghr_q;
-  assign tag_trace_len_o = chunk_ptr_q;  // Number of chunks (approximate length)
+  assign tag_trace_len_o = chunk_ptr_q;
   assign tag_sram_addr_o = sram_wr_ptr_q;
 
   // ========================================================================
@@ -136,11 +119,10 @@ module trace_builder (
   end
 
   // ========================================================================
-  // Combinational Logic - State Machine
+  // Combinational Logic
   // ========================================================================
   
   always_comb begin
-    // Default: hold state
     state_d              = state_q;
     trace_d              = trace_q;
     chunk_ptr_d          = chunk_ptr_q;
@@ -154,7 +136,6 @@ module trace_builder (
     trace_start_pc_d     = trace_start_pc_q;
     trace_start_ghr_d    = trace_start_ghr_q;
 
-    // Handle flush
     if (flush_i) begin
       state_d     = IDLE;
       chunk_ptr_d = '0;
@@ -163,74 +144,69 @@ module trace_builder (
       
       case (state_q)
 
-        // ====================================================================
-        // IDLE: Wait for first instruction to start new trace
-        // ====================================================================
         IDLE: begin
           chunk_ptr_d = '0;
           br_cnt_d    = '0;
-          trace_d     = '0;  // Clear trace
+          trace_d     = '0;
           
           last_branch_pc_d     = '0;
           last_branch_target_d = '0;
           last_branch_taken_d  = 1'b0;
 
-          // Look for first valid instruction
           for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
             if (instr_i.valid[i] && instr_i.ready && chunk_ptr_d == 0) begin
               state_d = ACCUM;
               
-              // Store trace metadata
               trace_start_pc_d  = instr_i.pc[i];
               trace_start_ghr_d = ghr_i;
               trace_d.base_pc   = instr_i.pc[i];
               
-              // Store instruction as 16-bit chunks
               if (instr_i.inst[i][1:0] == 2'b11) begin
-                // Normal 32-bit instruction (2 chunks)
                 trace_d.chunks[0] = instr_i.inst[i][15:0];
                 trace_d.chunks[1] = instr_i.inst[i][31:16];
-                trace_d.valid[0]  = 1'b1;  // Mark first chunk as instruction start
-                trace_d.valid[1]  = 1'b0;  // Second chunk is continuation
+                trace_d.valid[0]  = 1'b1;
+                trace_d.valid[1]  = 1'b0;
                 chunk_ptr_d = 2;
               end else begin
-                // Compressed 16-bit instruction (1 chunk)
                 trace_d.chunks[0] = instr_i.inst[i][15:0];
                 trace_d.valid[0]  = 1'b1;
                 chunk_ptr_d = 1;
               end
               
-              // Track if this is a taken branch
               if (instr_i.is_branch[i] && instr_i.taken[i]) begin
                 br_cnt_d = 1;
                 last_branch_pc_d     = instr_i.pc[i];
                 last_branch_target_d = instr_i.target[i];
                 last_branch_taken_d  = 1'b1;
-                trace_d.branch_flags[0] = 1'b1;  // First branch taken
+                trace_d.branch_flags[0] = 1'b1;
               end
             end
           end
         end
 
-        // ====================================================================
-        // ACCUM: Accumulate instructions with intra-cycle window
-        // ====================================================================
         ACCUM: begin
           logic window_closed;
           logic [CHUNK_PTR_W-1:0] temp_chunk_ptr;
           logic [BR_CNT_W-1:0] temp_br_cnt;
+          logic is_compressed;
+          logic has_space;
           
           window_closed = 1'b0;
           temp_chunk_ptr = chunk_ptr_q;
           temp_br_cnt = br_cnt_q;
 
-          // Process slots in order
           for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
-            if (instr_i.valid[i] && instr_i.ready && 
-                !window_closed && (temp_chunk_ptr + 2) <= CHUNKS_PER_TRACE) begin
+            // Check if instruction is compressed
+            is_compressed = (instr_i.inst[i][1:0] != 2'b11);
+            
+            // Check if we have space for this instruction
+            has_space = is_compressed ? 
+                        (temp_chunk_ptr + 1 <= CHUNKS_PER_TRACE) : 
+                        (temp_chunk_ptr + 2 <= CHUNKS_PER_TRACE);
+            
+            if (instr_i.valid[i] && instr_i.ready && !window_closed && has_space) begin
               
-              // Check if 32-bit or compressed instruction
-              if (instr_i.inst[i][1:0] == 2'b11) begin
+              if (!is_compressed) begin
                 // 32-bit instruction
                 trace_d.chunks[temp_chunk_ptr]   = instr_i.inst[i][15:0];
                 trace_d.chunks[temp_chunk_ptr+1] = instr_i.inst[i][31:16];
@@ -238,25 +214,22 @@ module trace_builder (
                 trace_d.valid[temp_chunk_ptr+1]  = 1'b0;
                 temp_chunk_ptr = temp_chunk_ptr + 2;
               end else begin
-                // Compressed instruction
+                // 16-bit compressed instruction
                 trace_d.chunks[temp_chunk_ptr] = instr_i.inst[i][15:0];
                 trace_d.valid[temp_chunk_ptr]  = 1'b1;
                 temp_chunk_ptr = temp_chunk_ptr + 1;
               end
               
-              // Track taken branches
               if (instr_i.is_branch[i] && instr_i.taken[i]) begin
                 temp_br_cnt++;
                 last_branch_pc_d     = instr_i.pc[i];
                 last_branch_target_d = instr_i.target[i];
                 last_branch_taken_d  = 1'b1;
                 
-                // Store branch flag (only for non-last branches)
                 if (temp_br_cnt < MAX_BRANCHES) begin
                   trace_d.branch_flags[temp_br_cnt-1] = 1'b1;
                 end
                 
-                // Close window after taken branch
                 window_closed = 1'b1;
               end
             end
@@ -265,44 +238,30 @@ module trace_builder (
           chunk_ptr_d = temp_chunk_ptr;
           br_cnt_d    = temp_br_cnt;
           
-          // Commit conditions: trace full OR max branches hit
           if (chunk_ptr_d >= CHUNKS_PER_TRACE || br_cnt_d >= MAX_BRANCHES) begin
             state_d = COMMIT;
           end
         end
 
-        // ====================================================================
-        // COMMIT: Write completed trace to SRAM
-        // ====================================================================
         COMMIT: begin
           commit_valid_d = 1'b1;
           
-          // Compute next fetch addresses
           if (last_branch_taken_q) begin
-            // Last instruction was taken branch
             trace_d.target_addr = last_branch_target_q;
             trace_d.fall_through_addr = last_branch_pc_q + 
-                                        ((last_branch_pc_q[1:0] == 2'b11) ? 64'd4 : 64'd2);
+                                        ((last_branch_pc_q[1]) ? 64'd2 : 64'd4);
           end else begin
-            // No taken branch at end, both addresses are sequential
             logic [PC_WIDTH-1:0] last_pc;
-            last_pc = trace_q.base_pc;
-            // Approximate: assume each instruction = 4 bytes
-            last_pc = last_pc + (chunk_ptr_q * 2);  
+            last_pc = trace_q.base_pc + (chunk_ptr_q * 2);
             trace_d.target_addr = last_pc;
             trace_d.fall_through_addr = last_pc;
           end
           
-          // Store branch count
           trace_d.num_branches = br_cnt_q;
-          
-          // Pack trace into flat vector
           commit_data_d = trace_d;
           
-          // Increment SRAM write pointer
           sram_wr_ptr_d = sram_wr_ptr_q + 1;
           
-          // Return to IDLE
           state_d     = IDLE;
           chunk_ptr_d = '0;
           br_cnt_d    = '0;
@@ -313,7 +272,7 @@ module trace_builder (
   end
 
   // ========================================================================
-  // Debug Display
+  // Debug
   // ========================================================================
   
   always_ff @(posedge clk_i) begin
