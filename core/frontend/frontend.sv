@@ -591,15 +591,17 @@ module frontend
       .fetch_entry_ready_i(fetch_entry_ready_i)    // to back-end
   );
 // ========================================================================
-// Trace Cache (passive tap) 
+// Trace Cache Integration (Passive Mode - Recording Only)
 // ========================================================================
 
+// Signals for trace cache (passive tap)
 logic [SLOTS_PER_CYCLE-1:0]               tc_instr_valid;
 logic [SLOTS_PER_CYCLE-1:0][31:0]         tc_instr;
 logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_pc;
-logic [SLOTS_PER_CYCLE-1:0]               tc_is_cf;
+logic [SLOTS_PER_CYCLE-1:0]               tc_is_branch;
 logic [SLOTS_PER_CYCLE-1:0]               tc_taken;
 logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
+logic [MAX_BRANCHES-1:0]                  tc_branch_predictions;
 
 // Generate signals for all 4 slots
 for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
@@ -607,36 +609,91 @@ for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
   assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
   
   // Pass through full 64-bit PC
-  assign tc_pc[i] = addr[i];
+  assign tc_pc[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, addr[i]};
   
   // Pass through instruction
   assign tc_instr[i] = instr[i];
   
-  // Detect any control flow
-  assign tc_is_cf[i] = is_branch[i] | is_jump[i] | is_jalr[i] | is_return[i];
+  // Detect control flow (branches, jumps, etc.)
+  assign tc_is_branch[i] = is_branch[i] | is_jump[i] | is_jalr[i] | is_return[i] | is_call[i];
   
   // Detect if control flow is taken
-  assign tc_taken[i] = taken_rvi_cf[i] | taken_rvc_cf[i] | 
-                       is_jump[i] | is_jalr[i] | is_return[i];
+  // For branches: check taken flags
+  // For jumps/returns: always "taken"
+  assign tc_taken[i] = (taken_rvi_cf[i] | taken_rvc_cf[i]) |  // Conditional branch taken
+                       is_jump[i] |                           // Unconditional jump
+                       is_jalr[i] |                           // Jump register
+                       is_return[i];                          // Return
   
-  // Branch target address 
-  assign tc_target[i] = (taken_rvi_cf[i] || taken_rvc_cf[i]) ? 
-                        predict_address : 
-                        addr[i];  // For non-branches, just pass PC
+  // Branch target address
+  // For taken branches: use predicted address (calculated per instruction)
+  // For jumps: use immediate offset
+  // For returns: use RAS prediction
+  // For non-control-flow: next sequential PC
+  always_comb begin
+    if (taken_rvi_cf[i]) begin
+      // Taken RVI branch/jump - use immediate
+      tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, (addr[i] + rvi_imm[i])};
+    end else if (taken_rvc_cf[i]) begin
+      // Taken RVC branch/jump - use immediate  
+      tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, (addr[i] + rvc_imm[i])};
+    end else if (is_return[i] && ras_predict.valid) begin
+      // Return - use RAS
+      tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, ras_predict.ra};
+    end else if (is_jalr[i] && btb_prediction_shifted[i].valid) begin
+      // Indirect jump - use BTB
+      tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, btb_prediction_shifted[i].target_address};
+    end else begin
+      // Sequential or not taken
+      tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, (addr[i] + 4)};
+    end
+  end
 end
 
-// Instantiate trace cache
+// Gather branch predictions for trace cache lookup
+// Use BHT predictions for first MAX_BRANCHES branches
+always_comb begin
+  tc_branch_predictions = '0;
+  automatic int br_idx = 0;
+  
+  for (int i = 0; i < SLOTS_PER_CYCLE && br_idx < MAX_BRANCHES; i++) begin
+    if (is_branch[i]) begin
+      tc_branch_predictions[br_idx] = bht_prediction_shifted[i].valid ? 
+                                      bht_prediction_shifted[i].taken : 
+                                      1'b0;
+      br_idx++;
+    end
+  end
+end
+
+// Instantiate trace cache (passive mode - only recording)
 trace_cache_top i_trace_cache_top (
   .clk_i              (clk_i),
   .rst_ni             (rst_ni),
+  
+  // Instruction stream (for building traces)
   .instr_valid_i      (tc_instr_valid),
   .instr_i            (tc_instr),
   .pc_i               (tc_pc),
-  .is_branch_i        (tc_is_cf),
+  .is_branch_i        (tc_is_branch),
   .branch_taken_i     (tc_taken),
   .branch_target_i    (tc_target),
+  
   .flush_i            (flush_i),
-  .instr_queue_ready_i(instr_queue_ready)
+  .instr_queue_ready_i(instr_queue_ready),
+  
+  // Branch predictions (for future lookup - not used in passive mode)
+  .branch_predictions_i(tc_branch_predictions),
+  
+  // Lookup interface 
+  .lookup_valid_i     (1'b0),
+  .lookup_pc_i        ('0),
+  
+  // Outputs 
+  .trace_hit_o        (),
+  .trace_instructions_o(),
+  .trace_length_o     (),
+  .trace_next_pc_o    ()
 );
 
 endmodule

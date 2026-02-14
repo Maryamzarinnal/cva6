@@ -22,7 +22,7 @@ module trace_builder (
     output logic                   tag_valid_o,
     output logic [PC_WIDTH-1:0]    tag_start_pc_o,
     output logic [GHR_WIDTH-1:0]   tag_start_ghr_o,
-    output logic [3:0]             tag_trace_len_o,
+    output logic [4:0]             tag_trace_len_o,  
     output logic [TRACE_ADDRW-1:0] tag_sram_addr_o
 );
 
@@ -30,8 +30,8 @@ module trace_builder (
   // Derived Constants
   // ========================================================================
   
-  localparam int unsigned CHUNK_PTR_W = $clog2(CHUNKS_PER_TRACE + 1);
-  localparam int unsigned BR_CNT_W = $clog2(MAX_BRANCHES + 1);
+  localparam int unsigned CHUNK_PTR_W = $clog2(CHUNKS_PER_TRACE + 1);  
+  localparam int unsigned BR_CNT_W = $clog2(MAX_BRANCHES + 1);         
 
   // ========================================================================
   // Type Definitions
@@ -81,7 +81,7 @@ module trace_builder (
   assign tag_valid_o     = commit_valid_q;
   assign tag_start_pc_o  = trace_start_pc_q;
   assign tag_start_ghr_o = trace_start_ghr_q;
-  assign tag_trace_len_o = chunk_ptr_q;
+  assign tag_trace_len_o = chunk_ptr_q[4:0];
   assign tag_sram_addr_o = sram_wr_ptr_q;
 
   // ========================================================================
@@ -121,6 +121,13 @@ module trace_builder (
   // ========================================================================
   // Combinational Logic
   // ========================================================================
+  // Filling is complete when either N instructions have been
+  // traced or B branches have been detected in the trace.
+  //
+  // The trace cache does not store returns, indirect
+  // jumps, or traps at all; the line-fill buffer aborts a fill when it
+  // detects any of these instructions.
+  // ========================================================================
   
   always_comb begin
     state_d              = state_q;
@@ -145,6 +152,7 @@ module trace_builder (
       case (state_q)
 
         IDLE: begin
+          // Reset accumulator for new trace
           chunk_ptr_d = '0;
           br_cnt_d    = '0;
           trace_d     = '0;
@@ -153,45 +161,56 @@ module trace_builder (
           last_branch_target_d = '0;
           last_branch_taken_d  = 1'b0;
 
+          // Start building a new trace with the first valid instruction
           for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
             if (instr_i.valid[i] && instr_i.ready && chunk_ptr_d == 0) begin
               state_d = ACCUM;
               
+              // Capture trace start metadata
               trace_start_pc_d  = instr_i.pc[i];
               trace_start_ghr_d = ghr_i;
               trace_d.base_pc   = instr_i.pc[i];
               
+              // Add first instruction
               if (instr_i.inst[i][1:0] == 2'b11) begin
+                // 32-bit instruction
                 trace_d.chunks[0] = instr_i.inst[i][15:0];
                 trace_d.chunks[1] = instr_i.inst[i][31:16];
-                trace_d.valid[0]  = 1'b1;
-                trace_d.valid[1]  = 1'b0;
+                trace_d.valid_chunks[0]  = 1'b1;
+                trace_d.valid_chunks[1]  = 1'b0;
                 chunk_ptr_d = 2;
               end else begin
+                // 16-bit compressed instruction
                 trace_d.chunks[0] = instr_i.inst[i][15:0];
-                trace_d.valid[0]  = 1'b1;
+                trace_d.valid_chunks[0]  = 1'b1;
                 chunk_ptr_d = 1;
               end
               
+              // Track first branch if taken
               if (instr_i.is_branch[i] && instr_i.taken[i]) begin
                 br_cnt_d = 1;
                 last_branch_pc_d     = instr_i.pc[i];
                 last_branch_target_d = instr_i.target[i];
                 last_branch_taken_d  = 1'b1;
-                trace_d.branch_flags[0] = 1'b1;
+                // Note: branch_flags[0] will be set in COMMIT state
               end
             end
           end
         end
 
         ACCUM: begin
+          // Accumulate instructions over multiple cycles to build 16-instruction trace
+          //The basic blocks are latched one at a time into the line-fill buffer
+          
           logic window_closed;
+          logic abort_trace;  // For indirect branches/returns
           logic [CHUNK_PTR_W-1:0] temp_chunk_ptr;
           logic [BR_CNT_W-1:0] temp_br_cnt;
           logic is_compressed;
           logic has_space;
           
           window_closed = 1'b0;
+          abort_trace   = 1'b0;
           temp_chunk_ptr = chunk_ptr_q;
           temp_br_cnt = br_cnt_q;
 
@@ -204,41 +223,56 @@ module trace_builder (
                         (temp_chunk_ptr + 1 <= CHUNKS_PER_TRACE) : 
                         (temp_chunk_ptr + 2 <= CHUNKS_PER_TRACE);
             
-            if (instr_i.valid[i] && instr_i.ready && !window_closed && has_space) begin
+            if (instr_i.valid[i] && instr_i.ready && !window_closed && !abort_trace && has_space) begin
               
+              // Add instruction to trace
               if (!is_compressed) begin
                 // 32-bit instruction
                 trace_d.chunks[temp_chunk_ptr]   = instr_i.inst[i][15:0];
                 trace_d.chunks[temp_chunk_ptr+1] = instr_i.inst[i][31:16];
-                trace_d.valid[temp_chunk_ptr]    = 1'b1;
-                trace_d.valid[temp_chunk_ptr+1]  = 1'b0;
+                trace_d.valid_chunks[temp_chunk_ptr]    = 1'b1;
+                trace_d.valid_chunks[temp_chunk_ptr+1]  = 1'b0;
                 temp_chunk_ptr = temp_chunk_ptr + 2;
               end else begin
                 // 16-bit compressed instruction
                 trace_d.chunks[temp_chunk_ptr] = instr_i.inst[i][15:0];
-                trace_d.valid[temp_chunk_ptr]  = 1'b1;
+                trace_d.valid_chunks[temp_chunk_ptr]  = 1'b1;
                 temp_chunk_ptr = temp_chunk_ptr + 1;
               end
               
+              // Handle control flow instructions
               if (instr_i.is_branch[i] && instr_i.taken[i]) begin
                 temp_br_cnt++;
                 last_branch_pc_d     = instr_i.pc[i];
                 last_branch_target_d = instr_i.target[i];
                 last_branch_taken_d  = 1'b1;
                 
+                // Store branch direction in branch_flags (only first B-1 branches)
                 if (temp_br_cnt < MAX_BRANCHES) begin
                   trace_d.branch_flags[temp_br_cnt-1] = 1'b1;
                 end
                 
+                // Close window after taken branch (found next basic block boundary)
                 window_closed = 1'b1;
               end
+              
+              // TODO: Add detection for returns and indirect jumps
+              // The line-fill buffer aborts a fill when it detects
+              // any of these instructions" (returns, indirect jumps, traps)
+              // For now, we don't detect these - this can be added later
+              // if (is_return || is_indirect_jump) begin
+              //   abort_trace = 1'b1;
+              // end
             end
           end
           
           chunk_ptr_d = temp_chunk_ptr;
           br_cnt_d    = temp_br_cnt;
           
-          if (chunk_ptr_d >= CHUNKS_PER_TRACE || br_cnt_d >= MAX_BRANCHES) begin
+          // Check termination conditions
+          // Filling is complete when either N instructions have been
+          // traced or B branches have been detected
+          if (chunk_ptr_d >= CHUNKS_PER_TRACE || br_cnt_d >= MAX_BRANCHES || abort_trace) begin
             state_d = COMMIT;
           end
         end
@@ -246,22 +280,30 @@ module trace_builder (
         COMMIT: begin
           commit_valid_d = 1'b1;
           
+          // Mark trace as valid
+          trace_d.valid = 1'b1;
+          
+          // Set next fetch addresses based on last branch
           if (last_branch_taken_q) begin
             trace_d.target_addr = last_branch_target_q;
             trace_d.fall_through_addr = last_branch_pc_q + 
                                         ((last_branch_pc_q[1]) ? 64'd2 : 64'd4);
           end else begin
+            // No branch at end - fall through sequentially
             logic [PC_WIDTH-1:0] last_pc;
             last_pc = trace_q.base_pc + (chunk_ptr_q * 2);
             trace_d.target_addr = last_pc;
             trace_d.fall_through_addr = last_pc;
           end
           
+          // Set number of branches in trace
           trace_d.num_branches = br_cnt_q;
           commit_data_d = trace_d;
           
+          // write pointer increment for next trace
           sram_wr_ptr_d = sram_wr_ptr_q + 1;
           
+          // Return to IDLE to start next trace
           state_d     = IDLE;
           chunk_ptr_d = '0;
           br_cnt_d    = '0;
@@ -277,8 +319,8 @@ module trace_builder (
   
   always_ff @(posedge clk_i) begin
     if (state_q != IDLE || |instr_i.valid) begin
-      $display("[TB-%0t] state=%s chunks=%0d br=%0d | v=%4b pc={%h,%h,%h,%h}",
-               $time, state_q.name(), chunk_ptr_q, br_cnt_q,
+      $display("[TB-%0t] state=%s chunks=%0d/%0d br=%0d/%0d | v=%4b pc={%h,%h,%h,%h}",
+               $time, state_q.name(), chunk_ptr_q, CHUNKS_PER_TRACE, br_cnt_q, MAX_BRANCHES,
                instr_i.valid,
                instr_i.pc[0][31:0], instr_i.pc[1][31:0],
                instr_i.pc[2][31:0], instr_i.pc[3][31:0]);

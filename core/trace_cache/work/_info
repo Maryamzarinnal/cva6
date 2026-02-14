@@ -25,10 +25,11 @@ o-quiet -auto_acc_if_foreign -work work
 Z2 tCvgOpt 0
 n@_opt
 OL;O;2024.3;79
+R1
 vtb_trace_cache
 2tb_trace_cache.sv
 Z3 DXx6 sv_std 3 std 0 22 9oUSJO;AeEaW`l:M@^WG92
-Z4 DXx4 work 15 trace_cache_pkg 0 22 h_n;5?kAhLGQjB4AaYe7^1
+DXx4 work 15 trace_cache_pkg 0 22 h_n;5?kAhLGQjB4AaYe7^1
 !s110 1770476523
 !i10b 1
 !s100 U4=7zP?B_KkXSim0=i:`;1
@@ -40,8 +41,8 @@ w1770476448
 Ftb_trace_cache.sv
 !i122 3
 L0 3 148
-Z5 VDg1SIo80bB@j0V0VzS_@n1
-Z6 OL;L;2024.3;79
+Z4 VDg1SIo80bB@j0V0VzS_@n1
+Z5 OL;L;2024.3;79
 r1
 !s85 0
 31
@@ -49,95 +50,230 @@ r1
 !s107 tb_trace_cache.sv|
 !s90 -reportprogress|300|tb_trace_cache.sv|
 !i113 0
-Z7 o-L mtiAvm -L mtiRnm -L mtiOvm -L mtiUvm -L mtiUPF -L infact
+Z6 o-L mtiAvm -L mtiRnm -L mtiOvm -L mtiUvm -L mtiUPF -L infact
 R2
-vtrace_builder
-Z8 2trace_builder.sv
+vtc_ghr
+Z7 2tc_ghr.sv
 R3
+Z8 DXx4 work 15 trace_cache_pkg 0 22 R_[[On]1]mAlcMDVaz6Bm0
+DXx4 work 14 tc_ghr_sv_unit 0 22 kfjnVLDm[^=HQn@I;YPR:0
+Z9 !s110 1770996179
 R4
-DXx4 work 21 trace_builder_sv_unit 0 22 @XRN0;_^7O:bHAR6mEoDd2
-Z9 !s110 1770476518
-R5
 r1
 !s85 0
 !i10b 1
-!s100 O=]UYEljVGd>NSOJJW6Cn2
-IOU20Q5hz0;@TeQJBj5UWM1
-!s105 trace_builder_sv_unit
+!s100 JSdET_RDe]V=<F2OO_eog2
+I``CV3jGCnTnMh0[0>O@_53
+!s105 tc_ghr_sv_unit
 S1
 R1
-Z10 w1770476084
-Z11 8trace_builder.sv
-Z12 Ftrace_builder.sv
-!i122 2
-L0 4 326
-R6
+Z10 w1770216488
+Z11 8tc_ghr.sv
+Z12 Ftc_ghr.sv
+!i122 17
+L0 4 37
+R5
 31
-Z13 !s108 1770476518.000000
-Z14 !s107 trace_builder.sv|
-Z15 !s90 -reportprogress|300|trace_builder.sv|
+Z13 !s108 1770996179.000000
+Z14 !s107 tc_ghr.sv|
+Z15 !s90 tc_ghr.sv|
 !i113 0
-R7
+R6
 R2
-Xtrace_builder_sv_unit
-R8
+Xtc_ghr_sv_unit
+R7
 R3
-R4
+R8
 R9
-V@XRN0;_^7O:bHAR6mEoDd2
+VkfjnVLDm[^=HQn@I;YPR:0
 r1
 !s85 0
 !i10b 1
-!s100 8UCHjL:V8HV@>1[FcPlj^2
-I@XRN0;_^7O:bHAR6mEoDd2
+!s100 YQBUGZ:1ROGoHzMW4F_he0
+IkfjnVLDm[^=HQn@I;YPR:0
 !i103 1
 S1
 R1
 R10
 R11
 R12
-!i122 2
+!i122 17
 Z16 L0 2 0
-R6
+R5
 31
 R13
 R14
 R15
 !i113 0
-R7
+R6
+R2
+vtc_sram
+2tc_sram.sv
+R3
+!s110 1770996173
+!i10b 1
+!s100 [:Hf<Cn7PJUVJAZBk1jTJ1
+IgJNR61j8:J8<[G51h`eYU2
+S1
+R1
+w1770040160
+8tc_sram.sv
+Ftc_sram.sv
+!i122 16
+L0 56 191
+R4
+R5
+r1
+!s85 0
+31
+!s108 1770996173.000000
+!s107 tc_sram.sv|
+!s90 tc_sram.sv|
+!i113 0
+R6
+R2
+vtrace_builder
+Z17 2trace_builder.sv
+R3
+R8
+DXx4 work 21 trace_builder_sv_unit 0 22 WCdOLkDWR;2BTU^bGnI<k3
+Z18 !s110 1770996229
+R4
+r1
+!s85 0
+!i10b 1
+!s100 bME4BZo@0PQZE5EG_QPLD0
+I@kdS1m2O21l?E_UoefHg_3
+!s105 trace_builder_sv_unit
+S1
+R1
+Z19 w1770995822
+Z20 8trace_builder.sv
+Z21 Ftrace_builder.sv
+!i122 20
+L0 4 327
+R5
+31
+Z22 !s108 1770996229.000000
+Z23 !s107 trace_builder.sv|
+Z24 !s90 trace_builder.sv|
+!i113 0
+R6
+R2
+Xtrace_builder_sv_unit
+R17
+R3
+R8
+R18
+VWCdOLkDWR;2BTU^bGnI<k3
+r1
+!s85 0
+!i10b 1
+!s100 =]eM6o<f<7IeA>LCT><bX1
+IWCdOLkDWR;2BTU^bGnI<k3
+!i103 1
+S1
+R1
+R19
+R20
+R21
+!i122 20
+R16
+R5
+31
+R22
+R23
+R24
+!i113 0
+R6
 R2
 Xtrace_cache_pkg
 2trace_cache_pkg.sv
 R3
-!s110 1770476501
+!s110 1770996213
 !i10b 1
-!s100 CdT:d28Hkgg2igPd[gMU20
-Ih_n;5?kAhLGQjB4AaYe7^1
+!s100 >GZb7BOEe=z=^Ym4fhdlE1
+IR_[[On]1]mAlcMDVaz6Bm0
 S1
 R1
-w1770475492
+w1770995630
 8trace_cache_pkg.sv
 Ftrace_cache_pkg.sv
-!i122 0
+!i122 18
 L0 3 0
-Vh_n;5?kAhLGQjB4AaYe7^1
-R6
+VR_[[On]1]mAlcMDVaz6Bm0
+R5
 r1
 !s85 0
 31
-!s108 1770476501.000000
+!s108 1770996213.000000
 !s107 trace_cache_pkg.sv|
-!s90 -reportprogress|300|trace_cache_pkg.sv|
+!s90 trace_cache_pkg.sv|
 !i113 0
-R7
+R6
+R2
+vtrace_cache_top
+Z25 2trace_cache_top.sv
+R3
+R8
+DXx4 work 23 trace_cache_top_sv_unit 0 22 L8PAUCc5<LSaRB5@9j6E;3
+Z26 !s110 1770996358
+R4
+r1
+!s85 0
+!i10b 1
+!s100 BCBLOe]=?goj2LKZLl6kL1
+ISOhAMlb3Uaz_hJ0=>ZQhn0
+!s105 trace_cache_top_sv_unit
+S1
+R1
+Z27 w1770996353
+Z28 8trace_cache_top.sv
+Z29 Ftrace_cache_top.sv
+!i122 23
+L0 4 188
+R5
+31
+Z30 !s108 1770996358.000000
+!s107 trace_cache_top.sv|
+Z31 !s90 trace_cache_top.sv|
+!i113 0
+R6
+R2
+Xtrace_cache_top_sv_unit
+R25
+R3
+R8
+R26
+VL8PAUCc5<LSaRB5@9j6E;3
+r1
+!s85 0
+!i10b 1
+!s100 h?]^_@UR:@`PT>SQ>O3kH0
+IL8PAUCc5<LSaRB5@9j6E;3
+!i103 1
+S1
+R1
+R27
+R28
+R29
+!i122 23
+R16
+R5
+31
+R30
+Z32 !s107 trace_cache_top.sv|
+R31
+!i113 0
+R6
 R2
 Ytracebuilder_instr_if
-Z17 2tracebuilder_instr_if.sv
+Z33 2tracebuilder_instr_if.sv
 R3
-R4
+R8
 DXx4 work 29 tracebuilder_instr_if_sv_unit 0 22 >AHKfVabHBF7ibPmX9YeC0
-Z18 !s110 1770476511
-R5
+Z34 !s110 1770996220
+R4
 r1
 !s85 0
 !i10b 1
@@ -146,24 +282,24 @@ IN>=zmU6bbOU@OfI<HElMC1
 !s105 tracebuilder_instr_if_sv_unit
 S1
 R1
-Z19 w1770475852
-Z20 8tracebuilder_instr_if.sv
-Z21 Ftracebuilder_instr_if.sv
-!i122 1
+Z35 w1770994823
+Z36 8tracebuilder_instr_if.sv
+Z37 Ftracebuilder_instr_if.sv
+!i122 19
 L0 4 0
-R6
+R5
 31
-Z22 !s108 1770476511.000000
-Z23 !s107 tracebuilder_instr_if.sv|
-Z24 !s90 -reportprogress|300|tracebuilder_instr_if.sv|
+Z38 !s108 1770996220.000000
+Z39 !s107 tracebuilder_instr_if.sv|
+Z40 !s90 tracebuilder_instr_if.sv|
 !i113 0
-R7
+R6
 R2
 Xtracebuilder_instr_if_sv_unit
-R17
+R33
 R3
-R4
-R18
+R8
+R34
 V>AHKfVabHBF7ibPmX9YeC0
 r1
 !s85 0
@@ -173,16 +309,16 @@ I>AHKfVabHBF7ibPmX9YeC0
 !i103 1
 S1
 R1
-R19
-R20
-R21
-!i122 1
+R35
+R36
+R37
+!i122 19
 R16
-R6
+R5
 31
-R22
-R23
-R24
+R38
+R39
+R40
 !i113 0
-R7
+R6
 R2
