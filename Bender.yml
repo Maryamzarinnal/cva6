@@ -103,8 +103,6 @@ sources:
       - core/trace_cache/tracebuilder_instr_if.sv
       - core/trace_cache/tc_ghr.sv
       - core/trace_cache/tc_sram.sv
-      - core/trace_cache/tag_sram.sv
-      - core/trace_cache/trace_tag_compare.sv
       - core/trace_cache/trace_builder.sv
       - core/trace_cache/trace_cache_top.sv
 
