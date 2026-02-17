@@ -17,13 +17,7 @@ module trace_builder (
     output logic                   mem_we_o,
     output logic [TRACE_ADDRW-1:0] mem_addr_o,
     output logic [TRACE_WIDTH-1:0] mem_wdata_o,
-    output logic [BE_WIDTH-1:0]    mem_be_o,
-
-    output logic                   tag_valid_o,
-    output logic [PC_WIDTH-1:0]    tag_start_pc_o,
-    output logic [GHR_WIDTH-1:0]   tag_start_ghr_o,
-    output logic [5:0]             tag_trace_len_o,
-    output logic [TRACE_ADDRW-1:0] tag_sram_addr_o
+    output logic [BE_WIDTH-1:0]    mem_be_o
 );
 
   localparam int unsigned CHUNK_PTR_W = $clog2(CHUNKS_PER_TRACE + 1);
@@ -62,11 +56,7 @@ module trace_builder (
   assign trace_valid_o = commit_valid_q;
   assign trace_data_o  = commit_data_q;
 
-  assign tag_valid_o     = commit_valid_q;
-  assign tag_start_pc_o  = trace_start_pc_q;
-  assign tag_start_ghr_o = trace_start_ghr_q;
-  assign tag_trace_len_o = chunk_ptr_q[5:0];
-  assign tag_sram_addr_o = sram_wr_ptr_q;
+
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin

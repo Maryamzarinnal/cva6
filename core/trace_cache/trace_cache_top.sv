@@ -69,13 +69,7 @@ module trace_cache_top (
     .mem_we_o        (mem_we),
     .mem_addr_o      (mem_addr_write),
     .mem_wdata_o     (mem_wdata),
-    .mem_be_o        (mem_be),
-
-    .tag_valid_o     (),
-    .tag_start_pc_o  (),
-    .tag_start_ghr_o (),
-    .tag_trace_len_o (),
-    .tag_sram_addr_o ()
+    .mem_be_o        (mem_be)
   );
 
   logic                   mem_req_read;

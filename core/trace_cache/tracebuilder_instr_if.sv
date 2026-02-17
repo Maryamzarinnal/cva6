@@ -19,12 +19,12 @@ interface tracebuilder_instr_if (
 
   // Modports
   modport producer (
-    output valid, inst, pc, is_branch, taken,
+    output valid, inst, pc, is_branch, taken, target,
     input  ready
   );
 
   modport consumer (
-    input  valid, inst, pc, is_branch, taken,
+    input  valid, inst, pc, is_branch, taken, target,
     output ready
   );
 
