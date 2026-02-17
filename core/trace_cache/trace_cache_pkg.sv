@@ -3,7 +3,7 @@ package trace_cache_pkg;
 
   localparam int unsigned SLOTS_PER_CYCLE = 4;
 
-  localparam int unsigned TRACE_LEN = 16;
+  localparam int unsigned TRACE_LEN = 4;
   localparam int unsigned MAX_INSTRUCTIONS = TRACE_LEN;
 
   localparam int unsigned MAX_BRANCHES = 3;

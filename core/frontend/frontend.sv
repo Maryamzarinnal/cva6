@@ -671,4 +671,35 @@ trace_cache_top i_trace_cache_top (
   .trace_next_pc_o    ()
 );
 
+// ========================================================================
+// Branch Frequency Counter (Non-Synthesizable)
+// ========================================================================
+`ifndef SYNTHESIS
+  int unsigned branch_hist[SLOTS_PER_CYCLE+1];
+  int unsigned window_count;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      for (int i = 0; i <= SLOTS_PER_CYCLE; i++) branch_hist[i] = 0;
+      window_count = 0;
+    end else if (|tc_instr_valid) begin
+      automatic int unsigned taken_count = 0;
+      for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
+        if (tc_instr_valid[i] && tc_taken[i]) taken_count++;
+      end
+      branch_hist[taken_count]++;
+      window_count++;
+    end
+  end
+
+  final begin
+    $display("\n[TC-STATS] Branch frequency over %0d windows:", window_count);
+    for (int i = 0; i <= SLOTS_PER_CYCLE; i++) begin
+      $display("[TC-STATS]   %0d taken branches: %0d windows (%.1f%%)",
+               i, branch_hist[i],
+               (window_count > 0) ? (branch_hist[i] * 100.0 / window_count) : 0.0);
+    end
+  end
+`endif
+
 endmodule
