@@ -21,7 +21,6 @@ package trace_cache_pkg;
     (MAX_BRANCHES - 1) +
     2 +
     PC_WIDTH +
-    PC_WIDTH +
     (CHUNKS_PER_TRACE * 16) +
     CHUNKS_PER_TRACE;
 
@@ -35,8 +34,6 @@ package trace_cache_pkg;
     logic [MAX_BRANCHES-2:0] branch_flags;
 
     logic [1:0] num_branches;
-
-    logic [PC_WIDTH-1:0] fall_through_addr;
 
     logic [PC_WIDTH-1:0] target_addr;
 

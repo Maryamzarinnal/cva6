@@ -591,9 +591,7 @@ module frontend
       .fetch_entry_ready_i(fetch_entry_ready_i)    // to back-end
   );
 
-// ========================================================================
-// Trace Cache Integration (Passive Mode - Recording Only)
-// ========================================================================
+// trace cache integration - passive recording
 
 logic [SLOTS_PER_CYCLE-1:0]               tc_instr_valid;
 logic [SLOTS_PER_CYCLE-1:0][31:0]         tc_instr;
@@ -671,33 +669,30 @@ trace_cache_top i_trace_cache_top (
   .trace_next_pc_o    ()
 );
 
-// ========================================================================
-// Branch Frequency Counter (Non-Synthesizable)
-// ========================================================================
+// taken branch frequency per fetch window (non-synthesizable)
 `ifndef SYNTHESIS
   int unsigned branch_hist[SLOTS_PER_CYCLE+1];
   int unsigned window_count;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      for (int i = 0; i <= SLOTS_PER_CYCLE; i++) branch_hist[i] = 0;
-      window_count = 0;
+      for (int i = 0; i <= SLOTS_PER_CYCLE; i++) branch_hist[i] <= 0;
+      window_count <= 0;
     end else if (|tc_instr_valid) begin
       automatic int unsigned taken_count = 0;
       for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
         if (tc_instr_valid[i] && tc_taken[i]) taken_count++;
       end
-      branch_hist[taken_count]++;
-      window_count++;
+      branch_hist[taken_count] <= branch_hist[taken_count] + 1;
+      window_count             <= window_count + 1;
     end
   end
 
-  final begin
-    $display("\n[TC-STATS] Branch frequency over %0d windows:", window_count);
-    for (int i = 0; i <= SLOTS_PER_CYCLE; i++) begin
-      $display("[TC-STATS]   %0d taken branches: %0d windows (%.1f%%)",
-               i, branch_hist[i],
-               (window_count > 0) ? (branch_hist[i] * 100.0 / window_count) : 0.0);
+  always_ff @(posedge clk_i) begin
+    if (window_count > 0 && !(|tc_instr_valid)) begin
+      $display("\n[TC-STATS] Branch frequency over %0d windows:", window_count);
+      for (int i = 0; i <= SLOTS_PER_CYCLE; i++)
+        $display("[TC-STATS]   %0d taken: %0d windows", i, branch_hist[i]);
     end
   end
 `endif
