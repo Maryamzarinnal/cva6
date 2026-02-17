@@ -223,14 +223,4 @@ module trace_builder (
     end
   end
 
-  always_ff @(posedge clk_i) begin
-    if (state_q != IDLE || |instr_i.valid) begin
-      $display("[TB-%0t] state=%s chunks=%0d/%0d br=%0d/%0d | v=%4b pc={%h,%h,%h,%h}",
-               $time, state_q.name(), chunk_ptr_q, CHUNKS_PER_TRACE, br_cnt_q, MAX_BRANCHES,
-               instr_i.valid,
-               instr_i.pc[0][31:0], instr_i.pc[1][31:0],
-               instr_i.pc[2][31:0], instr_i.pc[3][31:0]);
-    end
-  end
-
 endmodule

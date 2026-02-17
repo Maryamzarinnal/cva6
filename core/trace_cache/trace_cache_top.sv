@@ -159,15 +159,4 @@ module trace_cache_top (
     end
   end
 
-  always_ff @(posedge clk_i) begin
-    if (trace_hit) begin
-      $display("[TC-%0t] HIT: PC=%h, num_br=%0d, next_pc=%h",
-               $time, lookup_pc, trace_read.num_branches,
-               trace_read.target_addr);
-    end
-    if (mem_req_write) begin
-      $display("[TC-%0t] FILL: addr=%0d", $time, mem_addr_write);
-    end
-  end
-
 endmodule

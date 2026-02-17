@@ -603,17 +603,9 @@ logic [MAX_BRANCHES-1:0]                  tc_branch_predictions;
 
 for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
   assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
-
-  assign tc_pc[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, addr[i]};
-
-  assign tc_instr[i] = instr[i];
-
-  assign tc_is_branch[i] = is_branch[i] | is_jump[i] | is_jalr[i] | is_return[i] | is_call[i];
-
-  assign tc_taken[i] = (taken_rvi_cf[i] | taken_rvc_cf[i]) |
-                       is_jump[i] |
-                       is_jalr[i] |
-                       is_return[i];
+  assign tc_pc[i]          = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, addr[i]};
+  assign tc_instr[i]       = instr[i];
+  assign tc_is_branch[i]   = is_branch[i] | is_jump[i] | is_jalr[i] | is_return[i] | is_call[i];
 
   always_comb begin
     if (taken_rvi_cf[i]) begin
@@ -626,6 +618,23 @@ for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
       tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, btb_prediction_shifted[i].target_address};
     end else begin
       tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, (addr[i] + 4)};
+    end
+  end
+end
+
+// mask tc_taken after first taken branch in window
+always_comb begin
+  logic found_taken;
+  found_taken = 1'b0;
+  for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
+    automatic logic raw_taken;
+    raw_taken = (taken_rvi_cf[i] | taken_rvc_cf[i]) |
+                is_jump[i] | is_jalr[i] | is_return[i];
+    if (found_taken) begin
+      tc_taken[i] = 1'b0;
+    end else begin
+      tc_taken[i] = raw_taken & tc_instr_valid[i];
+      if (raw_taken & tc_instr_valid[i]) found_taken = 1'b1;
     end
   end
 end
@@ -668,33 +677,5 @@ trace_cache_top i_trace_cache_top (
   .trace_length_o     (),
   .trace_next_pc_o    ()
 );
-
-// taken branch frequency per fetch window (non-synthesizable)
-`ifndef SYNTHESIS
-  int unsigned branch_hist[SLOTS_PER_CYCLE+1];
-  int unsigned window_count;
-  logic        stats_printed;
-
-  always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) begin
-      for (int i = 0; i <= SLOTS_PER_CYCLE; i++) branch_hist[i] <= 0;
-      window_count  <= 0;
-      stats_printed <= 1'b0;
-    end else if (|tc_instr_valid) begin
-      automatic int unsigned taken_count = 0;
-      for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
-        if (tc_instr_valid[i] && tc_taken[i]) taken_count++;
-      end
-      branch_hist[taken_count] <= branch_hist[taken_count] + 1;
-      window_count             <= window_count + 1;
-      stats_printed            <= 1'b0;
-    end else if (window_count > 0 && !stats_printed) begin
-      $display("\n[TC-STATS] Branch frequency over %0d windows:", window_count);
-      for (int i = 0; i <= SLOTS_PER_CYCLE; i++)
-        $display("[TC-STATS]   %0d taken: %0d windows", i, branch_hist[i]);
-      stats_printed <= 1'b1;
-    end
-  end
-`endif
 
 endmodule
