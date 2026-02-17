@@ -673,11 +673,13 @@ trace_cache_top i_trace_cache_top (
 `ifndef SYNTHESIS
   int unsigned branch_hist[SLOTS_PER_CYCLE+1];
   int unsigned window_count;
+  logic        stats_printed;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       for (int i = 0; i <= SLOTS_PER_CYCLE; i++) branch_hist[i] <= 0;
-      window_count <= 0;
+      window_count  <= 0;
+      stats_printed <= 1'b0;
     end else if (|tc_instr_valid) begin
       automatic int unsigned taken_count = 0;
       for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
@@ -685,14 +687,12 @@ trace_cache_top i_trace_cache_top (
       end
       branch_hist[taken_count] <= branch_hist[taken_count] + 1;
       window_count             <= window_count + 1;
-    end
-  end
-
-  always_ff @(posedge clk_i) begin
-    if (window_count > 0 && !(|tc_instr_valid)) begin
+      stats_printed            <= 1'b0;
+    end else if (window_count > 0 && !stats_printed) begin
       $display("\n[TC-STATS] Branch frequency over %0d windows:", window_count);
       for (int i = 0; i <= SLOTS_PER_CYCLE; i++)
         $display("[TC-STATS]   %0d taken: %0d windows", i, branch_hist[i]);
+      stats_printed <= 1'b1;
     end
   end
 `endif
