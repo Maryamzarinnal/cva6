@@ -231,5 +231,9 @@ module trace_builder (
       endcase
     end
   end
-
+always_ff @(posedge clk_i) begin
+  if (commit_valid_q) begin
+    $display("[TC-COUNT] Trace #%0d written", sram_wr_ptr_q);
+  end
+end
 endmodule
