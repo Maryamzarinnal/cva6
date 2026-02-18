@@ -49,11 +49,12 @@ module trace_cache_top (
     .ghr_o          (ghr)
   );
 
-  logic                   mem_req_write;
+  logic                   mem_req;
   logic                   mem_we;
-  logic [TRACE_ADDRW-1:0] mem_addr_write;
+  logic [TRACE_ADDRW-1:0] mem_addr;
   logic [TRACE_WIDTH-1:0] mem_wdata;
   logic [BE_WIDTH-1:0]    mem_be;
+  logic [TRACE_WIDTH-1:0] mem_rdata;
 
   trace_builder i_trace_builder (
     .clk_i,
@@ -65,24 +66,13 @@ module trace_cache_top (
     .trace_valid_o   (),
     .trace_data_o    (),
 
-    .mem_req_o       (mem_req_write),
+    .mem_req_o       (mem_req),
     .mem_we_o        (mem_we),
-    .mem_addr_o      (mem_addr_write),
+    .mem_addr_o      (mem_addr),
     .mem_wdata_o     (mem_wdata),
-    .mem_be_o        (mem_be)
+    .mem_be_o        (mem_be),
+    .mem_rdata_i     (mem_rdata)
   );
-
-  logic                   mem_req_read;
-  logic [TRACE_ADDRW-1:0] mem_addr_read;
-  logic [TRACE_WIDTH-1:0] mem_rdata;
-
-  logic                   sram_req;
-  logic                   sram_we;
-  logic [TRACE_ADDRW-1:0] sram_addr;
-
-  assign sram_req  = mem_req_write | mem_req_read;
-  assign sram_we   = mem_req_write;
-  assign sram_addr = mem_req_write ? mem_addr_write : mem_addr_read;
 
   tc_sram #(
     .NumWords  (1 << TRACE_ADDRW),
@@ -92,9 +82,9 @@ module trace_cache_top (
   ) i_trace_sram (
     .clk_i,
     .rst_ni,
-    .req_i   ({sram_req}),
-    .we_i    ({sram_we}),
-    .addr_i  ({sram_addr}),
+    .req_i   ({mem_req}),
+    .we_i    ({mem_we}),
+    .addr_i  ({mem_addr}),
     .wdata_i ({mem_wdata}),
     .be_i    ({mem_be}),
     .rdata_o ({mem_rdata})
@@ -108,9 +98,6 @@ module trace_cache_top (
 
   trace_data_t trace_read;
   assign trace_read = mem_rdata;
-
-  assign mem_addr_read = lookup_pc[TRACE_ADDRW+1:2];
-  assign mem_req_read  = lookup_valid && !mem_req_write;
 
   logic trace_hit;
   logic pc_match;

@@ -17,14 +17,16 @@ module trace_builder (
     output logic                   mem_we_o,
     output logic [TRACE_ADDRW-1:0] mem_addr_o,
     output logic [TRACE_WIDTH-1:0] mem_wdata_o,
-    output logic [BE_WIDTH-1:0]    mem_be_o
+    output logic [BE_WIDTH-1:0]    mem_be_o,
+
+    input  logic [TRACE_WIDTH-1:0] mem_rdata_i
 );
 
   localparam int unsigned CHUNK_PTR_W = $clog2(CHUNKS_PER_TRACE + 1);
   localparam int unsigned BR_CNT_W    = $clog2(MAX_BRANCHES + 1);
 
-  typedef enum logic [1:0] {
-    IDLE, ACCUM, COMMIT
+  typedef enum logic [2:0] {
+    IDLE, ACCUM, LOOKUP, COMPARE, COMMIT
   } state_t;
 
   state_t state_q, state_d;
@@ -35,17 +37,24 @@ module trace_builder (
 
   logic [PC_WIDTH-1:0]    last_branch_target_q, last_branch_target_d;
   logic [TRACE_ADDRW-1:0] sram_wr_ptr_q, sram_wr_ptr_d;
+  logic [TRACE_ADDRW-1:0] unique_count_q, unique_count_d;
 
   logic                   commit_valid_q, commit_valid_d;
   logic [TRACE_WIDTH-1:0] commit_data_q, commit_data_d;
 
   logic [GHR_WIDTH-1:0]   trace_start_ghr_q, trace_start_ghr_d;
+  
+  logic [TRACE_ADDRW-1:0] lookup_idx_q, lookup_idx_d;
+  trace_data_t            sram_trace;
+  logic                   duplicate_found;
 
   assign instr_i.ready = 1'b1;
 
-  assign mem_req_o   = commit_valid_q;
+  assign sram_trace = mem_rdata_i;
+
+  assign mem_req_o   = (state_q == LOOKUP) || commit_valid_q;
   assign mem_we_o    = commit_valid_q;
-  assign mem_addr_o  = sram_wr_ptr_q;
+  assign mem_addr_o  = (state_q == LOOKUP) ? lookup_idx_q : sram_wr_ptr_q;
   assign mem_wdata_o = commit_data_q;
   assign mem_be_o    = {BE_WIDTH{1'b1}};
 
@@ -60,9 +69,11 @@ module trace_builder (
       br_cnt_q             <= '0;
       last_branch_target_q <= '0;
       sram_wr_ptr_q        <= '0;
+      unique_count_q       <= '0;
       commit_valid_q       <= 1'b0;
       commit_data_q        <= '0;
       trace_start_ghr_q    <= '0;
+      lookup_idx_q         <= '0;
     end else begin
       state_q              <= state_d;
       trace_q              <= trace_d;
@@ -70,9 +81,11 @@ module trace_builder (
       br_cnt_q             <= br_cnt_d;
       last_branch_target_q <= last_branch_target_d;
       sram_wr_ptr_q        <= sram_wr_ptr_d;
+      unique_count_q       <= unique_count_d;
       commit_valid_q       <= commit_valid_d;
       commit_data_q        <= commit_data_d;
       trace_start_ghr_q    <= trace_start_ghr_d;
+      lookup_idx_q         <= lookup_idx_d;
     end
   end
 
@@ -91,9 +104,12 @@ module trace_builder (
     br_cnt_d             = br_cnt_q;
     last_branch_target_d = last_branch_target_q;
     sram_wr_ptr_d        = sram_wr_ptr_q;
+    unique_count_d       = unique_count_q;
     commit_valid_d       = 1'b0;
     commit_data_d        = commit_data_q;
     trace_start_ghr_d    = trace_start_ghr_q;
+    lookup_idx_d         = lookup_idx_q;
+    duplicate_found      = 1'b0;
 
     temp_chunk_ptr = '0;
     temp_br_cnt    = '0;
@@ -112,19 +128,16 @@ module trace_builder (
 
       case (state_q)
 
-        // wait for a window with a taken branch, start recording
         IDLE: begin
           chunk_ptr_d = '0;
           br_cnt_d    = '0;
           trace_d     = '0;
 
-          // find first taken branch in current window
           for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
             if (instr_i.valid[i] && instr_i.is_branch[i] && instr_i.taken[i] && !found_taken) begin
               found_taken = 1'b1;
               branch_slot = CHUNK_PTR_W'(i);
               
-              // check if branch is last valid slot (skip if true)
               branch_is_last = 1'b1;
               for (int j = i + 1; j < SLOTS_PER_CYCLE; j++) begin
                 if (instr_i.valid[j]) branch_is_last = 1'b0;
@@ -132,7 +145,6 @@ module trace_builder (
             end
           end
 
-          // record from slot 0 up to and including the taken branch
           if (found_taken && !branch_is_last) begin
             trace_start_ghr_d = ghr_i;
             temp_chunk_ptr    = '0;
@@ -145,7 +157,6 @@ module trace_builder (
                 if (i == 0)
                   trace_d.base_pc = instr_i.pc[i];
 
-                // store instruction chunks
                 if (!is_compressed) begin
                   trace_d.chunks[temp_chunk_ptr]         = instr_i.inst[i][15:0];
                   trace_d.chunks[temp_chunk_ptr+1]       = instr_i.inst[i][31:16];
@@ -158,7 +169,6 @@ module trace_builder (
                   temp_chunk_ptr = temp_chunk_ptr + 1;
                 end
 
-                // track branches for multi-branch traces
                 if (instr_i.is_branch[i] && instr_i.taken[i]) begin
                   temp_br_cnt          = temp_br_cnt + 1;
                   last_branch_target_d = instr_i.target[i];
@@ -174,7 +184,6 @@ module trace_builder (
           end
         end
 
-        // record instructions from target window until trace is full
         ACCUM: begin
           temp_chunk_ptr = chunk_ptr_q;
           temp_br_cnt    = br_cnt_q;
@@ -198,7 +207,6 @@ module trace_builder (
                 temp_chunk_ptr = temp_chunk_ptr + 1;
               end
 
-              // handle additional taken branches in target window
               if (instr_i.is_branch[i] && instr_i.taken[i] && temp_br_cnt < MAX_BRANCHES) begin
                 temp_br_cnt          = temp_br_cnt + 1;
                 last_branch_target_d = instr_i.target[i];
@@ -210,10 +218,33 @@ module trace_builder (
 
           chunk_ptr_d = temp_chunk_ptr;
           br_cnt_d    = temp_br_cnt;
-          state_d     = COMMIT;
+          lookup_idx_d = '0;
+          state_d     = LOOKUP;
         end
 
-        // write completed trace to SRAM
+        LOOKUP: begin
+          if (lookup_idx_q < unique_count_q) begin
+            lookup_idx_d = lookup_idx_q + 1;
+            state_d = COMPARE;
+          end else begin
+            state_d = COMMIT;
+          end
+        end
+
+        COMPARE: begin
+          if (sram_trace.valid && 
+              sram_trace.base_pc == trace_q.base_pc &&
+              sram_trace.branch_flags == trace_q.branch_flags) begin
+            duplicate_found = 1'b1;
+            state_d = IDLE;
+            chunk_ptr_d = '0;
+            br_cnt_d = '0;
+            trace_d = '0;
+          end else begin
+            state_d = LOOKUP;
+          end
+        end
+
         COMMIT: begin
           commit_valid_d       = 1'b1;
           trace_d.valid        = 1'b1;
@@ -221,19 +252,30 @@ module trace_builder (
           trace_d.num_branches = br_cnt_q;
           commit_data_d        = trace_d;
           sram_wr_ptr_d        = sram_wr_ptr_q + 1;
+          unique_count_d       = unique_count_q + 1;
           state_d              = IDLE;
           chunk_ptr_d          = '0;
           br_cnt_d             = '0;
           trace_d              = '0;
-          
         end
 
       endcase
     end
   end
-always_ff @(posedge clk_i) begin
-  if (commit_valid_q) begin
-    $display("[TC-COUNT] Trace #%0d written", sram_wr_ptr_q);
+
+`ifndef SYNTHESIS
+  always_ff @(posedge clk_i) begin
+    if (commit_valid_q) begin
+      $display("[TC-UNIQUE] Trace #%0d: pc=%h target=%h branches=%0d", 
+               unique_count_q, trace_q.base_pc, last_branch_target_q, br_cnt_q);
+    end
   end
-end
+  
+  always_ff @(posedge clk_i) begin
+    if (state_q == COMPARE && duplicate_found) begin
+      $display("[TC-DUP] Duplicate found: pc=%h", trace_q.base_pc);
+    end
+  end
+`endif
+
 endmodule
