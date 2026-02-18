@@ -112,16 +112,19 @@ module trace_builder (
 
       case (state_q)
 
+        // wait for a window with a taken branch, start recording
         IDLE: begin
           chunk_ptr_d = '0;
           br_cnt_d    = '0;
           trace_d     = '0;
 
+          // find first taken branch in current window
           for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
             if (instr_i.valid[i] && instr_i.is_branch[i] && instr_i.taken[i] && !found_taken) begin
               found_taken = 1'b1;
               branch_slot = CHUNK_PTR_W'(i);
-              // skip if taken branch is the last valid slot in the window
+              
+              // check if branch is last valid slot (skip if true)
               branch_is_last = 1'b1;
               for (int j = i + 1; j < SLOTS_PER_CYCLE; j++) begin
                 if (instr_i.valid[j]) branch_is_last = 1'b0;
@@ -129,6 +132,7 @@ module trace_builder (
             end
           end
 
+          // record from slot 0 up to and including the taken branch
           if (found_taken && !branch_is_last) begin
             trace_start_ghr_d = ghr_i;
             temp_chunk_ptr    = '0;
@@ -141,6 +145,7 @@ module trace_builder (
                 if (i == 0)
                   trace_d.base_pc = instr_i.pc[i];
 
+                // store instruction chunks
                 if (!is_compressed) begin
                   trace_d.chunks[temp_chunk_ptr]         = instr_i.inst[i][15:0];
                   trace_d.chunks[temp_chunk_ptr+1]       = instr_i.inst[i][31:16];
@@ -153,6 +158,7 @@ module trace_builder (
                   temp_chunk_ptr = temp_chunk_ptr + 1;
                 end
 
+                // track branches for multi-branch traces
                 if (instr_i.is_branch[i] && instr_i.taken[i]) begin
                   temp_br_cnt          = temp_br_cnt + 1;
                   last_branch_target_d = instr_i.target[i];
@@ -168,8 +174,8 @@ module trace_builder (
           end
         end
 
+        // record instructions from target window until trace is full
         ACCUM: begin
-          // record instructions from target window
           temp_chunk_ptr = chunk_ptr_q;
           temp_br_cnt    = br_cnt_q;
 
@@ -192,6 +198,7 @@ module trace_builder (
                 temp_chunk_ptr = temp_chunk_ptr + 1;
               end
 
+              // handle additional taken branches in target window
               if (instr_i.is_branch[i] && instr_i.taken[i] && temp_br_cnt < MAX_BRANCHES) begin
                 temp_br_cnt          = temp_br_cnt + 1;
                 last_branch_target_d = instr_i.target[i];
@@ -206,6 +213,7 @@ module trace_builder (
           state_d     = COMMIT;
         end
 
+        // write completed trace to SRAM
         COMMIT: begin
           commit_valid_d       = 1'b1;
           trace_d.valid        = 1'b1;
@@ -217,6 +225,9 @@ module trace_builder (
           chunk_ptr_d          = '0;
           br_cnt_d             = '0;
           trace_d              = '0;
+          
+          $display("[TC] addr=%0d base_pc=%h chunks=%0d br=%0d target=%h",
+                   sram_wr_ptr_q, trace_q.base_pc, chunk_ptr_q, br_cnt_q, last_branch_target_q);
         end
 
       endcase
