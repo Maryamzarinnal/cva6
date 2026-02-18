@@ -70,8 +70,7 @@ module trace_cache_top (
     .mem_we_o        (mem_we),
     .mem_addr_o      (mem_addr),
     .mem_wdata_o     (mem_wdata),
-    .mem_be_o        (mem_be),
-    .mem_rdata_i     (mem_rdata)
+    .mem_be_o        (mem_be)
   );
 
   tc_sram #(
