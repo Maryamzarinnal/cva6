@@ -244,4 +244,13 @@ module trace_builder (
     end
   end
 
+`ifndef SYNTHESIS
+  always_ff @(posedge clk_i) begin
+    if (commit_valid_q) begin
+      $display("[TC-TRACE] addr=%0d pc=%h target=%h branches=%0d chunks=%0d", 
+               sram_wr_ptr_q, trace_q.base_pc, last_branch_target_q, br_cnt_q, chunk_ptr_q);
+    end
+  end
+`endif
+
 endmodule
