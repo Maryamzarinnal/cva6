@@ -677,5 +677,35 @@ trace_cache_top i_trace_cache_top (
   .trace_length_o     (),
   .trace_next_pc_o    ()
 );
+// pragma translate_off
+logic counting_active;
+int unsigned branch_hist[SLOTS_PER_CYCLE+1];
+int unsigned window_count;
+
+always_ff @(posedge clk_i or negedge rst_ni) begin
+  if (!rst_ni) begin
+    counting_active <= 1'b0;
+    for (int i = 0; i <= SLOTS_PER_CYCLE; i++) branch_hist[i] <= 0;
+    window_count <= 0;
+  end else begin
+    if (pc_commit_i == 64'h80001568) counting_active <= 1'b1;
+    if (pc_commit_i == 64'h80001576) begin
+      counting_active <= 1'b0;
+      $display("\n[BENCH-STATS] Branch frequency over %0d windows:", window_count);
+      for (int i = 0; i <= SLOTS_PER_CYCLE; i++)
+        $display("[BENCH-STATS]   %0d taken: %0d", i, branch_hist[i]);
+    end
+    
+    if (counting_active && |tc_instr_valid) begin
+      automatic int unsigned taken_count = 0;
+      for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
+        if (tc_instr_valid[i] && tc_taken[i]) taken_count++;
+      end
+      branch_hist[taken_count] <= branch_hist[taken_count] + 1;
+      window_count <= window_count + 1;
+    end
+  end
+end
+// pragma translate_on
 
 endmodule

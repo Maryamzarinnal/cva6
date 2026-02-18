@@ -226,8 +226,6 @@ module trace_builder (
           br_cnt_d             = '0;
           trace_d              = '0;
           
-          $display("[TC] addr=%0d base_pc=%h chunks=%0d br=%0d target=%h",
-                   sram_wr_ptr_q, trace_q.base_pc, chunk_ptr_q, br_cnt_q, last_branch_target_q);
         end
 
       endcase
