@@ -677,31 +677,62 @@ trace_cache_top i_trace_cache_top (
   .trace_length_o     (),
   .trace_next_pc_o    ()
 );
+
 // pragma translate_off
 logic counting_active;
-int unsigned branch_hist[SLOTS_PER_CYCLE+1];
+logic stats_printed;
+int unsigned taken_hist[SLOTS_PER_CYCLE+1];
+int unsigned not_taken_hist[SLOTS_PER_CYCLE+1];
+int unsigned total_branch_hist[SLOTS_PER_CYCLE+1];
 int unsigned window_count;
 
 always_ff @(posedge clk_i or negedge rst_ni) begin
   if (!rst_ni) begin
     counting_active <= 1'b0;
-    for (int i = 0; i <= SLOTS_PER_CYCLE; i++) branch_hist[i] <= 0;
+    stats_printed   <= 1'b0;
+    for (int i = 0; i <= SLOTS_PER_CYCLE; i++) begin
+      taken_hist[i] <= 0;
+      not_taken_hist[i] <= 0;
+      total_branch_hist[i] <= 0;
+    end
     window_count <= 0;
   end else begin
-    if (pc_commit_i == 64'h80001568) counting_active <= 1'b1;
-    if (pc_commit_i == 64'h80001576) begin
+    if (pc_commit_i == 64'h80001568) begin
+      counting_active <= 1'b1;
+      stats_printed   <= 1'b0;
+    end
+    
+    if (pc_commit_i == 64'h80001576 && !stats_printed) begin
       counting_active <= 1'b0;
+      stats_printed   <= 1'b1;
       $display("\n[BENCH-STATS] Branch frequency over %0d windows:", window_count);
+      $display("[BENCH-STATS] Taken branches per window:");
       for (int i = 0; i <= SLOTS_PER_CYCLE; i++)
-        $display("[BENCH-STATS]   %0d taken: %0d", i, branch_hist[i]);
+        $display("[BENCH-STATS]   %0d taken: %0d", i, taken_hist[i]);
+      $display("[BENCH-STATS] Not-taken branches per window:");
+      for (int i = 0; i <= SLOTS_PER_CYCLE; i++)
+        $display("[BENCH-STATS]   %0d not-taken: %0d", i, not_taken_hist[i]);
+      $display("[BENCH-STATS] Total branches per window:");
+      for (int i = 0; i <= SLOTS_PER_CYCLE; i++)
+        $display("[BENCH-STATS]   %0d total: %0d", i, total_branch_hist[i]);
     end
     
     if (counting_active && |tc_instr_valid) begin
       automatic int unsigned taken_count = 0;
+      automatic int unsigned not_taken_count = 0;
+      automatic int unsigned total_branch_count = 0;
       for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
-        if (tc_instr_valid[i] && tc_taken[i]) taken_count++;
+        if (tc_instr_valid[i] && tc_is_branch[i]) begin
+          total_branch_count++;
+          if (tc_taken[i]) 
+            taken_count++;
+          else 
+            not_taken_count++;
+        end
       end
-      branch_hist[taken_count] <= branch_hist[taken_count] + 1;
+      taken_hist[taken_count] <= taken_hist[taken_count] + 1;
+      not_taken_hist[not_taken_count] <= not_taken_hist[not_taken_count] + 1;
+      total_branch_hist[total_branch_count] <= total_branch_hist[total_branch_count] + 1;
       window_count <= window_count + 1;
     end
   end
