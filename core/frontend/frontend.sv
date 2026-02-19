@@ -593,36 +593,72 @@ module frontend
 
 // trace cache integration - passive recording
 
+// ---------------------------------------------------------
+// Trace cache signal preparation
+// We build a clean set of signals from the raw frontend decode
+// outputs and feed them to trace_cache_top.
+// ---------------------------------------------------------
+
+// Per-slot instruction signals for the trace cache
 logic [SLOTS_PER_CYCLE-1:0]               tc_instr_valid;
 logic [SLOTS_PER_CYCLE-1:0][31:0]         tc_instr;
 logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_pc;
 logic [SLOTS_PER_CYCLE-1:0]               tc_is_branch;
 logic [SLOTS_PER_CYCLE-1:0]               tc_taken;
 logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
-logic [MAX_BRANCHES-1:0]                  tc_branch_predictions;
+
+// Branch predictions from BHT ? sized to CHUNKS_PER_TRACE (worst case all
+// instructions in a trace are compressed branches).
+// Only conditional branches get a BHT prediction; jumps/calls/returns
+// use BTB/RAS and are always "taken" so they don't need a prediction bit.
+logic [CHUNKS_PER_TRACE-1:0] tc_branch_predictions;
+
+// Unused outputs from trace_cache_top ? lookup is disabled during bring-up.
+// Wired to dummy signals to avoid tool warnings.
+logic                             tc_trace_hit;
+logic [TRACE_LEN-1:0][31:0]       tc_trace_instructions;
+logic [4:0]                       tc_trace_length;
+logic [PC_WIDTH-1:0]              tc_trace_next_pc;
 
 for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
+  // Only pass valid instructions when not flushing
   assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
   assign tc_pc[i]          = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, addr[i]};
   assign tc_instr[i]       = instr[i];
+
+  // tc_is_branch covers all control flow instructions ? the trace builder
+  // needs to know about any instruction that can redirect the PC
   assign tc_is_branch[i]   = is_branch[i] | is_jump[i] | is_jalr[i] | is_return[i] | is_call[i];
 
+  // Compute the branch target address based on instruction type.
+  // This is our best prediction at fetch time.
   always_comb begin
     if (taken_rvi_cf[i]) begin
+      // RVI conditional branch with known immediate offset
       tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, (addr[i] + rvi_imm[i])};
     end else if (taken_rvc_cf[i]) begin
+      // RVC compressed branch with known immediate offset
       tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, (addr[i] + rvc_imm[i])};
     end else if (is_return[i] && ras_predict.valid) begin
+      // Return ? use return address stack prediction
       tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, ras_predict.ra};
     end else if (is_jalr[i] && btb_prediction_shifted[i].valid) begin
+      // Indirect jump ? use branch target buffer prediction
       tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, btb_prediction_shifted[i].target_address};
     end else begin
+      // Fallback: sequential (shouldn't happen for real taken branches)
       tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, (addr[i] + 4)};
     end
   end
 end
 
-// mask tc_taken after first taken branch in window
+// Mask tc_taken so only the first taken branch in a window is marked.
+// This is important: the trace builder only handles one taken branch
+// per window, so we hide any subsequent ones ? they'll be seen in the
+// next cycle's window naturally.
+// Note: this already handles Riccardo's concern about BHT artifacts ?
+// tc_taken is only set when tc_instr_valid is also high, so fake
+// predictions from non-instruction chunks are already suppressed.
 always_comb begin
   logic found_taken;
   found_taken = 1'b0;
@@ -639,11 +675,17 @@ always_comb begin
   end
 end
 
+// Build branch predictions for tag matching at lookup time.
+// We only fill predictions for actual conditional branches (is_branch),
+// because only those have BHT entries. Jumps/calls/returns are always
+// taken and don't need a prediction ? they're handled by BTB/RAS.
+// Loop limit is CHUNKS_PER_TRACE (not MAX_BRANCHES which no longer exists)
+// to match the new branch_flags width.
 always_comb begin
   integer br_idx;
   tc_branch_predictions = '0;
   br_idx = 0;
-  for (int i = 0; i < SLOTS_PER_CYCLE && br_idx < MAX_BRANCHES; i++) begin
+  for (int i = 0; i < SLOTS_PER_CYCLE && br_idx < CHUNKS_PER_TRACE; i++) begin
     if (is_branch[i]) begin
       tc_branch_predictions[br_idx] = bht_prediction_shifted[i].valid ?
                                       bht_prediction_shifted[i].taken :
@@ -669,13 +711,14 @@ trace_cache_top i_trace_cache_top (
 
   .branch_predictions_i(tc_branch_predictions),
 
+  // Lookup is disabled during bring-up 
   .lookup_valid_i     (1'b0),
   .lookup_pc_i        ('0),
 
-  .trace_hit_o        (),
-  .trace_instructions_o(),
-  .trace_length_o     (),
-  .trace_next_pc_o    ()
+  .trace_hit_o        (tc_trace_hit),
+  .trace_instructions_o(tc_trace_instructions),
+  .trace_length_o     (tc_trace_length),
+  .trace_next_pc_o    (tc_trace_next_pc)
 );
 
 // pragma translate_off
