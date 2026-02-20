@@ -1,12 +1,20 @@
 `timescale 1ns/1ps
 import trace_cache_pkg::*;
 
-// the lookup path (read side) is currently disabled in frontend.sv
+// trace_cache_top is the top-level wrapper that connects everything together:
+//   - Takes raw instruction signals from the CVA6 frontend
+//   - Feeds them to trace_builder for recording
+//   - Stores completed traces in a small SRAM (64 entries, direct mapped)
+//   - Handles lookup requests and returns hit/miss + trace data
+//
+// Note: the lookup path (read side) is currently disabled in frontend.sv
+// (lookup_valid_i tied to 0). This is intentional during bring-up ?
+// we first validate the write/record path, then enable lookup.
 module trace_cache_top (
   input  logic clk_i,
   input  logic rst_ni,
 
-  // Raw instruction window from the frontend 
+  // Raw instruction window from the frontend (4 slots per cycle)
   input  logic [SLOTS_PER_CYCLE-1:0]               instr_valid_i,
   input  logic [SLOTS_PER_CYCLE-1:0][31:0]         instr_i,
   input  logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] pc_i,
@@ -14,13 +22,14 @@ module trace_cache_top (
   input  logic [SLOTS_PER_CYCLE-1:0]               branch_taken_i,
   input  logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] branch_target_i,
 
-  input  logic flush_i,             // pipeline flush
-  input  logic instr_queue_ready_i, // only record when the instr queue is ready
+  input  logic flush_i,                                        // pipeline flush
+  input  logic instr_queue_ready_i,                           // only record when the instr queue is ready
+  input  logic [SLOTS_PER_CYCLE-1:0] instr_queue_consumed_i, // per-slot consumed pulse from instr_queue
 
-  // Current branch predictions from BHT 
+  // Current branch predictions from BHT ? used for tag matching at lookup
   input  logic [CHUNKS_PER_TRACE-1:0] branch_predictions_i,
 
-  // Lookup interface provide a PC, get back hit/miss + trace
+  // Lookup interface ? provide a PC, get back hit/miss + trace
   input  logic                   lookup_valid_i,
   input  logic [PC_WIDTH-1:0]    lookup_pc_i,
 
@@ -32,6 +41,7 @@ module trace_cache_top (
 );
 
   // ---------------------------------------------------------
+  // Internal interface ? bundles up the instruction window
   // signals into a clean interface for trace_builder
   // ---------------------------------------------------------
   tracebuilder_instr_if instr_if (
@@ -39,15 +49,21 @@ module trace_cache_top (
     .rst_ni(rst_ni)
   );
 
+  // Only pass instructions when the queue is ready and no flush is happening.
+  // This ensures we don't record garbage during stalls or flushes.
   assign instr_if.valid     = instr_valid_i & {SLOTS_PER_CYCLE{instr_queue_ready_i & ~flush_i}};
   assign instr_if.pc        = pc_i;
   assign instr_if.inst      = instr_i;
   assign instr_if.is_branch = is_branch_i;
   assign instr_if.taken     = branch_taken_i;
   assign instr_if.target    = branch_target_i;
+  // consumed pulses tell trace_builder when a genuinely new window has advanced
+  assign instr_if.consumed  = instr_queue_consumed_i & {SLOTS_PER_CYCLE{~flush_i}};
 
   // ---------------------------------------------------------
-  // GHR 
+  // GHR ? tracks global branch history.
+  // Snapshot is taken at trace start for potential future use
+  // in multi-table prediction schemes.
   // ---------------------------------------------------------
   logic [GHR_WIDTH-1:0] ghr;
 
@@ -61,7 +77,9 @@ module trace_cache_top (
   );
 
   // ---------------------------------------------------------
-  // SRAM signals
+  // SRAM signals ? single port, shared between write (builder)
+  // and read (lookup). No arbitration needed right now since
+  // lookup is disabled. When lookup is enabled, add an arbiter.
   // ---------------------------------------------------------
   logic                   mem_req;
   logic                   mem_we;
@@ -71,7 +89,7 @@ module trace_cache_top (
   logic [TRACE_WIDTH-1:0] mem_rdata;
 
   // ---------------------------------------------------------
-  // trace_builder 
+  // trace_builder ? watches the fetch stream and records traces
   // ---------------------------------------------------------
   trace_builder i_trace_builder (
     .clk_i,
@@ -91,8 +109,8 @@ module trace_cache_top (
   );
 
   // ---------------------------------------------------------
-  // SRAM 
-  // Latency = 1 cycle
+  // SRAM ? 64 entries, one trace per entry.
+  // Latency = 1 cycle (read data appears one cycle after request).
   // ---------------------------------------------------------
   tc_sram #(
     .NumWords  (1 << TRACE_ADDRW),
@@ -112,19 +130,23 @@ module trace_cache_top (
 
   // ---------------------------------------------------------
   // Lookup / read path
+  // The read address is derived from lookup_pc using the same
+  // direct-mapped hash as the write side: bits [TRACE_ADDRW+1:2]
+  // (skipping the 2 alignment bits).
   // After 1 cycle latency the SRAM returns the entry, then we
   // check base_pc and branch_flags to confirm it's a real hit.
   // ---------------------------------------------------------
 
-  // Cast raw SRAM output to our struct 
+  // Cast raw SRAM output to our struct for easy field access
   trace_data_t trace_read;
   assign trace_read = mem_rdata;
 
-  // base_pc match
+  // Step 1: does the stored base_pc match what we looked up?
   logic pc_match;
   assign pc_match = (trace_read.base_pc == lookup_pc_i);
 
-  // branch flags match
+  // Step 2: do the branch predictions match the stored branch flags?
+  // We only compare the first num_branches bits ? the rest are don't-cares.
   logic branch_flags_match;
   always_comb begin
     branch_flags_match = 1'b1;
@@ -144,7 +166,9 @@ module trace_cache_top (
   assign trace_next_pc_o = trace_read.target_addr;
 
   // ---------------------------------------------------------
-  // Instruction count 
+  // Instruction count ? walk the valid_chunks array to count
+  // how many actual instructions are stored in this trace.
+  // Each instruction starts at a chunk where valid_chunks[i]=1.
   // ---------------------------------------------------------
   logic [4:0] instr_count;
   always_comb begin
@@ -157,8 +181,11 @@ module trace_cache_top (
   assign trace_length_o = trace_read.valid ? instr_count : 5'b0;
 
   // ---------------------------------------------------------
-  // Instruction reconstruction: unpack 16-bit chunks back into
+  // Instruction reconstruction ? unpack 16-bit chunks back into
   // 32-bit instructions for the frontend to use on a hit.
+  // valid_chunks[i]=1 marks the start of an instruction.
+  // If the next chunk has valid_chunks=0, it's the upper half
+  // of a 32-bit instruction. If valid_chunks=1, it's compressed.
   // ---------------------------------------------------------
   always_comb begin
     int instr_idx;

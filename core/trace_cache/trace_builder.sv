@@ -44,6 +44,9 @@ module trace_builder (
   logic                   commit_valid_q, commit_valid_d;
   logic [TRACE_WIDTH-1:0] commit_data_q,  commit_data_d;
   logic [GHR_WIDTH-1:0] trace_start_ghr_q, trace_start_ghr_d;
+  // snapshot of chunk_ptr taken at commit time, so the debug print is correct
+  // (chunk_ptr_q itself is reset to 0 in the same COMMIT cycle)
+  logic [CHUNK_PTR_W-1:0] commit_chunk_ptr_q, commit_chunk_ptr_d;
 
   assign instr_i.ready = 1'b1;
   assign mem_req_o   = commit_valid_q;
@@ -65,6 +68,7 @@ module trace_builder (
       commit_valid_q       <= 1'b0;
       commit_data_q        <= '0;
       trace_start_ghr_q    <= '0;
+      commit_chunk_ptr_q   <= '0;
     end else begin
       state_q              <= state_d;
       trace_q              <= trace_d;
@@ -75,6 +79,7 @@ module trace_builder (
       commit_valid_q       <= commit_valid_d;
       commit_data_q        <= commit_data_d;
       trace_start_ghr_q    <= trace_start_ghr_d;
+      commit_chunk_ptr_q   <= commit_chunk_ptr_d;
     end
   end
 
@@ -98,6 +103,7 @@ module trace_builder (
     commit_valid_d       = 1'b0;
     commit_data_d        = commit_data_q;
     trace_start_ghr_d    = trace_start_ghr_q;
+    commit_chunk_ptr_d   = commit_chunk_ptr_q;
 
     temp_chunk_ptr     = '0;
     temp_br_cnt        = '0;
@@ -119,32 +125,109 @@ module trace_builder (
 
       case (state_q)
 
+        // -------------------------------------------------
+        // IDLE: scan each new fetch window for a taken branch.
+        // When we see one, record instructions up to and
+        // including the taken branch, then move to ACCUM to
+        // continue filling the trace from the next window.
+        //
+        // Gate on |instr_i.consumed so we only act on fresh
+        // windows ? stale windows (same data held while the
+        // pipeline is stalled) are ignored.
+        // -------------------------------------------------
         IDLE: begin
-          for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
-            if (instr_i.valid[i] && instr_i.is_branch[i] && instr_i.taken[i] && !found_taken) begin
-              found_taken = 1'b1;
-              branch_slot = CHUNK_PTR_W'(i);
-              branch_is_last = 1'b1;
-              for (int j = i + 1; j < SLOTS_PER_CYCLE; j++) begin
-                if (instr_i.valid[j]) branch_is_last = 1'b0;
+          if (|instr_i.consumed) begin
+            for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
+              if (instr_i.valid[i] && instr_i.is_branch[i] && instr_i.taken[i] && !found_taken) begin
+                found_taken    = 1'b1;
+                branch_slot    = CHUNK_PTR_W'(i);
+                // check if the taken branch is the very last valid slot
+                branch_is_last = 1'b1;
+                for (int j = i + 1; j < SLOTS_PER_CYCLE; j++) begin
+                  if (instr_i.valid[j]) branch_is_last = 1'b0;
+                end
               end
             end
-          end
 
-          if (found_taken && !branch_is_last) begin
-            trace_start_ghr_d = ghr_i;
-            temp_chunk_ptr    = '0;
-            temp_br_cnt       = '0;
-            chunk_ptr_d       = '0;
-            br_cnt_d          = '0;
-            trace_d           = '0;
+            if (found_taken) begin
+              // Record all instructions from slot 0 up to and including the
+              // taken branch. Whether the branch is last or not we still start
+              // the trace ? we always need at least this window recorded.
+              trace_start_ghr_d = ghr_i;
+              temp_chunk_ptr    = '0;
+              temp_br_cnt       = '0;
+              chunk_ptr_d       = '0;
+              br_cnt_d          = '0;
+              trace_d           = '0;
+
+              for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
+                if (instr_i.valid[i] && (CHUNK_PTR_W'(i) <= branch_slot)) begin
+                  is_compressed = (instr_i.inst[i][1:0] != 2'b11);
+
+                  if (i == 0)
+                    trace_d.base_pc = instr_i.pc[i];
+
+                  if (!is_compressed) begin
+                    trace_d.chunks[temp_chunk_ptr]         = instr_i.inst[i][15:0];
+                    trace_d.chunks[temp_chunk_ptr+1]       = instr_i.inst[i][31:16];
+                    trace_d.valid_chunks[temp_chunk_ptr]   = 1'b1;
+                    trace_d.valid_chunks[temp_chunk_ptr+1] = 1'b0;
+                    temp_chunk_ptr = temp_chunk_ptr + 2;
+                  end else begin
+                    trace_d.chunks[temp_chunk_ptr]       = instr_i.inst[i][15:0];
+                    trace_d.valid_chunks[temp_chunk_ptr] = 1'b1;
+                    temp_chunk_ptr = temp_chunk_ptr + 1;
+                  end
+
+                  if (instr_i.is_branch[i]) begin
+                    if (temp_br_cnt < CHUNKS_PER_TRACE) begin
+                      trace_d.branch_flags[temp_br_cnt] = instr_i.taken[i];
+                      if (instr_i.taken[i])
+                        last_branch_target_d = instr_i.target[i];
+                    end
+                    temp_br_cnt = temp_br_cnt + 1;
+                  end
+                end
+              end
+
+              chunk_ptr_d    = temp_chunk_ptr;
+              br_cnt_d       = temp_br_cnt;
+              sram_wr_addr_d = instr_i.pc[0][TRACE_ADDRW+1:2];
+
+              // Only go to ACCUM if there are valid instructions after the
+              // taken branch in this same window. If the taken branch is the
+              // last slot there is nothing to accumulate yet ? stay IDLE and
+              // wait for the next window (the branch target) to start a trace.
+              if (!branch_is_last)
+                state_d = ACCUM;
+            end
+          end
+        end
+
+        // -------------------------------------------------
+        // ACCUM: keep filling the trace across fetch windows.
+        // Only process genuinely new windows (|instr_i.consumed).
+        //
+        // Exit conditions:
+        //   - Another taken branch found    ? commit (trace end = taken branch)
+        //   - Trace full (no chunk space)   ? commit
+        //   Otherwise stay in ACCUM.
+        // -------------------------------------------------
+        ACCUM: begin
+          if (|instr_i.consumed) begin
+            temp_chunk_ptr     = chunk_ptr_q;
+            temp_br_cnt        = br_cnt_q;
+            hit_taken_in_accum = 1'b0;
+            trace_full         = 1'b0;
 
             for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
-              if (instr_i.valid[i] && (CHUNK_PTR_W'(i) <= branch_slot)) begin
-                is_compressed = (instr_i.inst[i][1:0] != 2'b11);
+              is_compressed = (instr_i.inst[i][1:0] != 2'b11);
 
-                if (i == 0)
-                  trace_d.base_pc = instr_i.pc[i];
+              has_space = is_compressed ?
+                          (temp_chunk_ptr + 1 <= CHUNKS_PER_TRACE) :
+                          (temp_chunk_ptr + 2 <= CHUNKS_PER_TRACE);
+
+              if (instr_i.valid[i] && has_space && !hit_taken_in_accum) begin
 
                 if (!is_compressed) begin
                   trace_d.chunks[temp_chunk_ptr]         = instr_i.inst[i][15:0];
@@ -165,94 +248,49 @@ module trace_builder (
                       last_branch_target_d = instr_i.target[i];
                   end
                   temp_br_cnt = temp_br_cnt + 1;
-                end
-              end
-            end
 
-            chunk_ptr_d    = temp_chunk_ptr;
-            br_cnt_d       = temp_br_cnt;
-            sram_wr_addr_d = instr_i.pc[0][TRACE_ADDRW+1:2];
-            state_d        = ACCUM;
-          end
-        end
-
-        // -------------------------------------------------
-        // ACCUM: keep filling the trace across fetch windows.
-        // Stay here until the trace is truly full (no chunk space left).
-        // - No taken branch + space remaining  ? stay ACCUM, keep filling next window
-        // - Taken branch + space remaining     ? stay ACCUM, chain to next target window
-        // - No space left for next instruction ? commit now
-        // -------------------------------------------------
-        ACCUM: begin
-          temp_chunk_ptr     = chunk_ptr_q;
-          temp_br_cnt        = br_cnt_q;
-          hit_taken_in_accum = 1'b0;
-          trace_full         = 1'b0;
-
-          for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
-            is_compressed = (instr_i.inst[i][1:0] != 2'b11);
-
-            has_space = is_compressed ?
-                        (temp_chunk_ptr + 1 <= CHUNKS_PER_TRACE) :
-                        (temp_chunk_ptr + 2 <= CHUNKS_PER_TRACE);
-
-            if (instr_i.valid[i] && has_space && !hit_taken_in_accum) begin
-
-              if (!is_compressed) begin
-                trace_d.chunks[temp_chunk_ptr]         = instr_i.inst[i][15:0];
-                trace_d.chunks[temp_chunk_ptr+1]       = instr_i.inst[i][31:16];
-                trace_d.valid_chunks[temp_chunk_ptr]   = 1'b1;
-                trace_d.valid_chunks[temp_chunk_ptr+1] = 1'b0;
-                temp_chunk_ptr = temp_chunk_ptr + 2;
-              end else begin
-                trace_d.chunks[temp_chunk_ptr]       = instr_i.inst[i][15:0];
-                trace_d.valid_chunks[temp_chunk_ptr] = 1'b1;
-                temp_chunk_ptr = temp_chunk_ptr + 1;
-              end
-
-              if (instr_i.is_branch[i]) begin
-                if (temp_br_cnt < CHUNKS_PER_TRACE) begin
-                  trace_d.branch_flags[temp_br_cnt] = instr_i.taken[i];
+                  // Taken branch ends the trace ? stop adding instructions
                   if (instr_i.taken[i])
-                    last_branch_target_d = instr_i.target[i];
+                    hit_taken_in_accum = 1'b1;
                 end
-                temp_br_cnt = temp_br_cnt + 1;
 
-                if (instr_i.taken[i])
-                  hit_taken_in_accum = 1'b1;
+              end else if (instr_i.valid[i] && !has_space) begin
+                // There is a valid instruction but no room ? trace is full
+                trace_full = 1'b1;
               end
-
-            end else if (instr_i.valid[i] && !has_space) begin
-              // There is a valid instruction but no room ? trace is full
-              trace_full = 1'b1;
             end
+
+            chunk_ptr_d = temp_chunk_ptr;
+            br_cnt_d    = temp_br_cnt;
+
+            // Commit only when the trace is full (no chunk space left).
+            // hit_taken_in_accum is used only as a loop guard above to stop
+            // adding instructions within this window after a taken branch ?
+            // it does NOT end the trace. The pipeline will naturally continue
+            // fetching from the branch target on the next window.
+            if (trace_full) begin
+              commit_chunk_ptr_d   = temp_chunk_ptr;
+              trace_d.valid        = 1'b1;
+              trace_d.target_addr  = last_branch_target_d;
+              trace_d.num_branches = BR_CNT_W'(temp_br_cnt);
+              commit_valid_d       = 1'b1;
+              commit_data_d        = trace_d;
+              state_d              = IDLE;
+              chunk_ptr_d          = '0;
+              br_cnt_d             = '0;
+              trace_d              = '0;
+            end
+            // else: stay in ACCUM, wait for next window
           end
-
-          chunk_ptr_d = temp_chunk_ptr;
-          br_cnt_d    = temp_br_cnt;
-
-          // Only commit when truly full ? otherwise keep accumulating
-          if (trace_full)
-            state_d = COMMIT;
-          else
-            state_d = ACCUM;
         end
 
         // -------------------------------------------------
-        // COMMIT
+        // COMMIT state is no longer used ? commit is now done
+        // inline in IDLE (branch_is_last) and ACCUM.
+        // Kept as a safe catch-all that redirects to IDLE.
         // -------------------------------------------------
         COMMIT: begin
-          trace_d.valid        = 1'b1;
-          trace_d.target_addr  = last_branch_target_q;
-          trace_d.num_branches = BR_CNT_W'(br_cnt_q);
-
-          commit_valid_d = 1'b1;
-          commit_data_d  = trace_d;
-
-          state_d     = IDLE;
-          chunk_ptr_d = '0;
-          br_cnt_d    = '0;
-          trace_d     = '0;
+          state_d = IDLE;
         end
 
       endcase
@@ -270,7 +308,7 @@ module trace_builder (
       $display("[TC-BUILDER]   target     = 0x%h", dbg.target_addr);
       $display("[TC-BUILDER]   #branches  = %0d", dbg.num_branches);
       $display("[TC-BUILDER]   br_flags   = %b", dbg.branch_flags);
-      $display("[TC-BUILDER]   chunks used= %0d", chunk_ptr_q);
+      $display("[TC-BUILDER]   chunks used= %0d", commit_chunk_ptr_q);
       for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
         if (dbg.valid_chunks[i])
           $display("[TC-BUILDER]   chunk[%0d]  = 0x%h (instr start)", i, dbg.chunks[i]);
