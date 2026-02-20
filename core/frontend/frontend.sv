@@ -599,7 +599,7 @@ logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_pc;
 logic [SLOTS_PER_CYCLE-1:0]               tc_is_branch;
 logic [SLOTS_PER_CYCLE-1:0]               tc_taken;
 logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
-logic [MAX_BRANCHES-1:0]                  tc_branch_predictions;
+logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
 
 for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
   assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
