@@ -643,7 +643,7 @@ always_comb begin
   integer br_idx;
   tc_branch_predictions = '0;
   br_idx = 0;
-  for (int i = 0; i < SLOTS_PER_CYCLE && br_idx < MAX_BRANCHES; i++) begin
+  for (int i = 0; i < SLOTS_PER_CYCLE && br_idx < CHUNKS_PER_TRACE; i++) begin
     if (is_branch[i]) begin
       tc_branch_predictions[br_idx] = bht_prediction_shifted[i].valid ?
                                       bht_prediction_shifted[i].taken :
