@@ -754,13 +754,21 @@ always_ff @(posedge clk_i or negedge rst_ni) begin
   end
 end
 
-// Always print hit/miss at end of simulation regardless of CoreMark gating
-final begin
-  $display("\n[TC-STATS] trace cache hits   = %0d", tc_hits);
-  $display("[TC-STATS] trace cache misses = %0d", tc_misses);
-  if (tc_hits + tc_misses > 0)
-    $display("[TC-STATS] hit rate           = %0d%%",
-             (tc_hits * 100) / (tc_hits + tc_misses));
+always_ff @(posedge clk_i or negedge rst_ni) begin
+  if (!rst_ni) begin
+    tc_hits   <= 0;
+    tc_misses <= 0;
+  end else begin
+    if (i_trace_cache_top.trace_hit_o)
+      tc_hits <= tc_hits + 1;
+    else if (i_trace_cache_top.i_trace_sram.req_i[0] && !i_trace_cache_top.i_trace_sram.we_i[0])
+      tc_misses <= tc_misses + 1;
+
+    // print every time a new trace is committed so we see progress
+    if (i_trace_cache_top.i_trace_builder.commit_valid_q) begin
+      $display("[TC-STATS] running: hits=%0d misses=%0d", tc_hits, tc_misses);
+    end
+  end
 end
 // pragma translate_on
 endmodule
