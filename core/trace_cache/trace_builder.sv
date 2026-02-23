@@ -133,26 +133,22 @@ module trace_builder (
 
         // -------------------------------------------------
         // IDLE: wait for a taken branch in the fetch window.
-        // When found, record from slot 0 up to (and including)
+        // When found, record from slot 0 up to and including
         // the taken branch, then move to ACCUM.
-        // Skip the window if the taken branch is the last slot
-        // (nothing left to stitch after it in this window).
+        // If the taken branch is the last valid slot, we still
+        // start recording - ACCUM will fill from the target window.
         // -------------------------------------------------
         IDLE: begin
           if (|instr_i.consumed) begin
             // find the first taken branch in this window
             for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
               if (instr_i.valid[i] && instr_i.is_branch[i] && instr_i.taken[i] && !found_taken) begin
-                found_taken  = 1'b1;
-                branch_slot  = CHUNK_PTR_W'(i);
-                branch_is_last = 1'b1;
-                for (int j = i + 1; j < SLOTS_PER_CYCLE; j++) begin
-                  if (instr_i.valid[j]) branch_is_last = 1'b0;
-                end
+                found_taken = 1'b1;
+                branch_slot = CHUNK_PTR_W'(i);
               end
             end
 
-            if (found_taken && !branch_is_last) begin
+            if (found_taken) begin
               trace_start_ghr_d = ghr_i;
               temp_chunk_ptr    = '0;
               temp_br_cnt       = '0;
@@ -182,7 +178,6 @@ module trace_builder (
                     temp_chunk_ptr = temp_chunk_ptr + 1;
                   end
 
-                  // record branch flag (T/NT) for every branch seen
                   if (instr_i.is_branch[i]) begin
                     if (temp_br_cnt < CHUNKS_PER_TRACE) begin
                       trace_d.branch_flags[temp_br_cnt] = instr_i.taken[i];
@@ -203,12 +198,10 @@ module trace_builder (
 
         // -------------------------------------------------
         // ACCUM: keep adding instructions from following windows.
-        // Behavior mirrors IDLE per-window:
-        //   - record instructions in order
-        //   - record each branch's T/NT flag
+        //   - record instructions and branch T/NT flags in order
         //   - on a taken branch: stop adding from this window
-        //     (pipeline will redirect; next window comes from target)
-        // Commit when the trace is full (no chunk space left).
+        //     (pipeline redirects; next window comes from target)
+        // Commit when the chunk buffer is full.
         // -------------------------------------------------
         ACCUM: begin
           if (|instr_i.consumed) begin
@@ -236,7 +229,6 @@ module trace_builder (
                   temp_chunk_ptr = temp_chunk_ptr + 1;
                 end
 
-                // record branch T/NT flag - same as IDLE
                 if (instr_i.is_branch[i]) begin
                   if (temp_br_cnt < CHUNKS_PER_TRACE) begin
                     trace_d.branch_flags[temp_br_cnt] = instr_i.taken[i];
@@ -245,7 +237,7 @@ module trace_builder (
                   end
                   temp_br_cnt = temp_br_cnt + 1;
                   if (instr_i.taken[i])
-                    hit_taken = 1'b1; // stop adding from this window
+                    hit_taken = 1'b1; // stop adding from this window, pipeline will redirect
                 end
 
               end else if (instr_i.valid[i] && !has_space) begin
@@ -256,12 +248,14 @@ module trace_builder (
             chunk_ptr_d = temp_chunk_ptr;
             br_cnt_d    = temp_br_cnt;
 
-            if (trace_full) begin
+            // Commit if full. Also commit if a taken branch just filled the
+            // last available chunk (hit_taken and no space left).
+            if (trace_full || (hit_taken && temp_chunk_ptr >= CHUNKS_PER_TRACE)) begin
               commit_chunk_ptr_d   = temp_chunk_ptr;
               trace_d.valid        = 1'b1;
               trace_d.target_addr  = last_branch_target_d;
               trace_d.num_branches = BR_CNT_W'(temp_br_cnt);
-              sram_wr_addr_d       = tc_index(trace_d.base_pc, trace_d.branch_flags);
+              sram_wr_addr_d       = tc_index(trace_d.base_pc, '0);
               commit_valid_d       = 1'b1;
               commit_data_d        = trace_d;
               state_d              = IDLE;

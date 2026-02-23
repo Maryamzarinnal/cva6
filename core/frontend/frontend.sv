@@ -590,7 +590,6 @@ module frontend
       .fetch_entry_valid_o(fetch_entry_valid_o),   // to back-end
       .fetch_entry_ready_i(fetch_entry_ready_i)    // to back-end
   );
-
 // trace cache integration - passive recording
 
 logic [SLOTS_PER_CYCLE-1:0]               tc_instr_valid;
@@ -605,6 +604,7 @@ for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
   assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
   assign tc_pc[i]          = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, addr[i]};
   assign tc_instr[i]       = instr[i];
+  // treat all control flow types as "branches" for trace cache purposes
   assign tc_is_branch[i]   = is_branch[i] | is_jump[i] | is_jalr[i] | is_return[i] | is_call[i];
 
   always_comb begin
@@ -622,14 +622,19 @@ for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
   end
 end
 
-// mask tc_taken after first taken branch in window
+// Zero tc_taken for all slots after the first taken control flow in the window.
+// This mirrors what the frontend actually does: only one redirect per cycle.
 always_comb begin
   logic found_taken;
   found_taken = 1'b0;
   for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
     automatic logic raw_taken;
-    raw_taken = (taken_rvi_cf[i] | taken_rvc_cf[i]) |
-                is_jump[i] | is_jalr[i] | is_return[i];
+    raw_taken = (taken_rvi_cf[i] | taken_rvc_cf[i])      // predicted-taken conditional branch or jump
+              | is_jump[i]                                 // unconditional direct jump - always taken
+              | is_call[i]                                 // call - always taken
+              | (is_jalr[i] & btb_prediction_shifted[i].valid)   // indirect jump - only if BTB has target
+              | (is_return[i] & ras_predict.valid);        // return - only if RAS has valid address
+
     if (found_taken) begin
       tc_taken[i] = 1'b0;
     end else begin
@@ -639,44 +644,55 @@ always_comb begin
   end
 end
 
+// Build branch predictions vector for lookup tag comparison.
+// Must mirror tc_is_branch exactly: one entry per control flow instruction,
+// in slot order, using the same prediction sources as tc_taken.
 always_comb begin
   integer br_idx;
   tc_branch_predictions = '0;
   br_idx = 0;
   for (int i = 0; i < SLOTS_PER_CYCLE && br_idx < CHUNKS_PER_TRACE; i++) begin
-    if (is_branch[i]) begin
-      tc_branch_predictions[br_idx] = bht_prediction_shifted[i].valid ?
-                                      bht_prediction_shifted[i].taken :
-                                      1'b0;
+    if (tc_is_branch[i] && instruction_valid[i]) begin
+      if (is_jump[i] || is_call[i])
+        // unconditional - always taken
+        tc_branch_predictions[br_idx] = 1'b1;
+      else if (is_return[i])
+        tc_branch_predictions[br_idx] = ras_predict.valid;
+      else if (is_jalr[i])
+        tc_branch_predictions[br_idx] = btb_prediction_shifted[i].valid;
+      else
+        // conditional branch - use BHT prediction
+        tc_branch_predictions[br_idx] = bht_prediction_shifted[i].valid ?
+                                        bht_prediction_shifted[i].taken : 1'b0;
       br_idx = br_idx + 1;
     end
   end
 end
 
 trace_cache_top i_trace_cache_top (
-  .clk_i              (clk_i),
-  .rst_ni             (rst_ni),
+  .clk_i                  (clk_i),
+  .rst_ni                 (rst_ni),
 
-  .instr_valid_i      (tc_instr_valid),
-  .instr_i            (tc_instr),
-  .pc_i               (tc_pc),
-  .is_branch_i        (tc_is_branch),
-  .branch_taken_i     (tc_taken),
-  .branch_target_i    (tc_target),
+  .instr_valid_i          (tc_instr_valid),
+  .instr_i                (tc_instr),
+  .pc_i                   (tc_pc),
+  .is_branch_i            (tc_is_branch),
+  .branch_taken_i         (tc_taken),
+  .branch_target_i        (tc_target),
 
-  .flush_i            (flush_i),
-  .instr_queue_ready_i(instr_queue_ready),
-  .instr_queue_consumed_i(instr_queue_consumed),
+  .flush_i                (flush_i),
+  .instr_queue_ready_i    (instr_queue_ready),
+  .instr_queue_consumed_i (instr_queue_consumed),
 
-  .branch_predictions_i(tc_branch_predictions),
+  .branch_predictions_i   (tc_branch_predictions),
 
-  .lookup_valid_i     (1'b0),
-  .lookup_pc_i        ('0),
+  .lookup_valid_i         (1'b0),
+  .lookup_pc_i            ('0),
 
-  .trace_hit_o        (),
-  .trace_instructions_o(),
-  .trace_length_o     (),
-  .trace_next_pc_o    ()
+  .trace_hit_o            (),
+  .trace_instructions_o   (),
+  .trace_length_o         (),
+  .trace_next_pc_o        ()
 );
 
 // pragma translate_off
