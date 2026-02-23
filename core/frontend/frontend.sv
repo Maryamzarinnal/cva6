@@ -686,8 +686,8 @@ trace_cache_top i_trace_cache_top (
 
   .branch_predictions_i   (tc_branch_predictions),
 
-  .lookup_valid_i         (1'b0),
-  .lookup_pc_i            ('0),
+  .lookup_valid_i         (icache_valid_q),
+  .lookup_pc_i            ({{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, icache_vaddr_q}),
 
   .trace_hit_o            (),
   .trace_instructions_o   (),
@@ -752,6 +752,18 @@ always_ff @(posedge clk_i or negedge rst_ni) begin
       total_branch_hist[total_branch_count] <= total_branch_hist[total_branch_count] + 1;
       window_count <= window_count + 1;
     end
+  end
+end
+int unsigned tc_hits, tc_misses;
+always_ff @(posedge clk_i or negedge rst_ni) begin
+  if (!rst_ni) begin
+    tc_hits   <= 0;
+    tc_misses <= 0;
+  end else if (counting_active) begin
+    if (i_trace_cache_top.trace_hit_o)
+      tc_hits <= tc_hits + 1;
+    else
+      tc_misses <= tc_misses + 1;
   end
 end
 // pragma translate_on
