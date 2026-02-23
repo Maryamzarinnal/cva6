@@ -84,6 +84,19 @@ module trace_cache_top (
   logic                   mem_req;
   logic                   mem_we;
   logic [TRACE_ADDRW-1:0] mem_addr;
+
+  // Lookup pipeline (SRAM latency = 1).
+  logic                   lookup_fire;
+  logic                   lookup_valid_q;
+  logic [PC_WIDTH-1:0]    lookup_pc_q;
+  logic [CHUNKS_PER_TRACE-1:0] branch_predictions_q;
+
+  // Trace builder write-side signals (single-port SRAM arbitration).
+  logic                   mem_req_builder;
+  logic                   mem_we_builder;
+  logic [TRACE_ADDRW-1:0] mem_addr_builder;
+  logic [TRACE_WIDTH-1:0] mem_wdata_builder;
+  logic [BE_WIDTH-1:0]    mem_be_builder;
   logic [TRACE_WIDTH-1:0] mem_wdata;
   logic [BE_WIDTH-1:0]    mem_be;
   logic [TRACE_WIDTH-1:0] mem_rdata;
@@ -101,14 +114,56 @@ module trace_cache_top (
     .trace_valid_o   (),   // not used at top level for now
     .trace_data_o    (),   // not used at top level for now
 
-    .mem_req_o       (mem_req),
-    .mem_we_o        (mem_we),
-    .mem_addr_o      (mem_addr),
-    .mem_wdata_o     (mem_wdata),
-    .mem_be_o        (mem_be)
+    .mem_req_o       (mem_req_builder),
+    .mem_we_o        (mem_we_builder),
+    .mem_addr_o      (mem_addr_builder),
+    .mem_wdata_o      (mem_wdata_builder),
+    .mem_be_o         (mem_be_builder)
   );
 
-  // ---------------------------------------------------------
+  
+
+  // Builder commits have priority. If a commit happens, we skip lookup that cycle.
+  assign lookup_fire = lookup_valid_i && !mem_req_builder;
+
+  // Single-port SRAM arbitration:
+  // - write when builder commits a trace
+  // - otherwise do a read for lookup
+  always_comb begin
+    mem_req   = 1'b0;
+    mem_we    = 1'b0;
+    mem_addr  = '0;
+    mem_wdata = '0;
+    mem_be    = {BE_WIDTH{1'b1}};
+
+    if (mem_req_builder) begin
+      mem_req   = mem_req_builder;
+      mem_we    = mem_we_builder;
+      mem_addr  = mem_addr_builder;
+      mem_wdata = mem_wdata_builder;
+      mem_be    = mem_be_builder;
+    end else if (lookup_fire) begin
+      mem_req   = 1'b1;
+      mem_we    = 1'b0;
+      mem_addr  = tc_index(lookup_pc_i, branch_predictions_i);
+      mem_wdata = '0;
+      mem_be    = {BE_WIDTH{1'b1}};
+    end
+  end
+
+  // Pipeline lookup inputs to line up with SRAM latency (=1 cycle).
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      lookup_valid_q       <= 1'b0;
+      lookup_pc_q          <= '0;
+      branch_predictions_q <= '0;
+    end else begin
+      lookup_valid_q       <= lookup_fire;
+      lookup_pc_q          <= lookup_pc_i;
+      branch_predictions_q <= branch_predictions_i;
+    end
+  end
+// ---------------------------------------------------------
   // SRAM ? 64 entries, one trace per entry.
   // Latency = 1 cycle (read data appears one cycle after request).
   // ---------------------------------------------------------
@@ -143,7 +198,7 @@ module trace_cache_top (
 
   // Step 1: does the stored base_pc match what we looked up?
   logic pc_match;
-  assign pc_match = (trace_read.base_pc == lookup_pc_i);
+  assign pc_match = (trace_read.base_pc == lookup_pc_q);
 
   // Step 2: do the branch predictions match the stored branch flags?
   // We only compare the first num_branches bits ? the rest are don't-cares.
@@ -152,7 +207,7 @@ module trace_cache_top (
     branch_flags_match = 1'b1;
     for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
       if (i < int'(trace_read.num_branches)) begin
-        if (branch_predictions_i[i] != trace_read.branch_flags[i])
+        if (branch_predictions_q[i] != trace_read.branch_flags[i])
           branch_flags_match = 1'b0;
       end
     end
@@ -160,7 +215,7 @@ module trace_cache_top (
 
   // Hit = entry is valid + PC matches + branch history matches
   logic trace_hit;
-  assign trace_hit = trace_read.valid && pc_match && branch_flags_match && lookup_valid_i;
+  assign trace_hit = trace_read.valid && pc_match && branch_flags_match && lookup_valid_q;
 
   assign trace_hit_o     = trace_hit;
   assign trace_next_pc_o = trace_read.target_addr;
