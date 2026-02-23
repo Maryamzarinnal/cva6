@@ -604,7 +604,6 @@ for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
   assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
   assign tc_pc[i]          = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, addr[i]};
   assign tc_instr[i]       = instr[i];
-  // treat all control flow types as "branches" for trace cache purposes
   assign tc_is_branch[i]   = is_branch[i] | is_jump[i] | is_jalr[i] | is_return[i] | is_call[i];
 
   always_comb begin
@@ -622,19 +621,18 @@ for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
   end
 end
 
-// Zero tc_taken for all slots after the first taken control flow in the window.
-// This mirrors what the frontend actually does: only one redirect per cycle.
+// Mask tc_taken after the first taken control flow in the window.
+// Mirrors the frontend: only one redirect per cycle is possible.
 always_comb begin
   logic found_taken;
   found_taken = 1'b0;
   for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
     automatic logic raw_taken;
-    raw_taken = (taken_rvi_cf[i] | taken_rvc_cf[i])      // predicted-taken conditional branch or jump
-              | is_jump[i]                                 // unconditional direct jump - always taken
-              | is_call[i]                                 // call - always taken
-              | (is_jalr[i] & btb_prediction_shifted[i].valid)   // indirect jump - only if BTB has target
-              | (is_return[i] & ras_predict.valid);        // return - only if RAS has valid address
-
+    raw_taken = (taken_rvi_cf[i] | taken_rvc_cf[i])
+              | is_jump[i]
+              | is_call[i]
+              | (is_jalr[i]  & btb_prediction_shifted[i].valid)
+              | (is_return[i] & ras_predict.valid);
     if (found_taken) begin
       tc_taken[i] = 1'b0;
     end else begin
@@ -644,9 +642,8 @@ always_comb begin
   end
 end
 
-// Build branch predictions vector for lookup tag comparison.
-// Must mirror tc_is_branch exactly: one entry per control flow instruction,
-// in slot order, using the same prediction sources as tc_taken.
+// Branch prediction vector for lookup tag comparison.
+// One entry per control flow instruction, same order and same sources as tc_taken.
 always_comb begin
   integer br_idx;
   tc_branch_predictions = '0;
@@ -654,14 +651,12 @@ always_comb begin
   for (int i = 0; i < SLOTS_PER_CYCLE && br_idx < CHUNKS_PER_TRACE; i++) begin
     if (tc_is_branch[i] && instruction_valid[i]) begin
       if (is_jump[i] || is_call[i])
-        // unconditional - always taken
         tc_branch_predictions[br_idx] = 1'b1;
       else if (is_return[i])
         tc_branch_predictions[br_idx] = ras_predict.valid;
       else if (is_jalr[i])
         tc_branch_predictions[br_idx] = btb_prediction_shifted[i].valid;
       else
-        // conditional branch - use BHT prediction
         tc_branch_predictions[br_idx] = bht_prediction_shifted[i].valid ?
                                         bht_prediction_shifted[i].taken : 1'b0;
       br_idx = br_idx + 1;
@@ -672,23 +667,18 @@ end
 trace_cache_top i_trace_cache_top (
   .clk_i                  (clk_i),
   .rst_ni                 (rst_ni),
-
   .instr_valid_i          (tc_instr_valid),
   .instr_i                (tc_instr),
   .pc_i                   (tc_pc),
   .is_branch_i            (tc_is_branch),
   .branch_taken_i         (tc_taken),
   .branch_target_i        (tc_target),
-
   .flush_i                (flush_i),
   .instr_queue_ready_i    (instr_queue_ready),
   .instr_queue_consumed_i (instr_queue_consumed),
-
   .branch_predictions_i   (tc_branch_predictions),
-
   .lookup_valid_i         (icache_valid_q),
   .lookup_pc_i            ({{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, icache_vaddr_q}),
-
   .trace_hit_o            (),
   .trace_instructions_o   (),
   .trace_length_o         (),
@@ -702,23 +692,27 @@ int unsigned taken_hist[SLOTS_PER_CYCLE+1];
 int unsigned not_taken_hist[SLOTS_PER_CYCLE+1];
 int unsigned total_branch_hist[SLOTS_PER_CYCLE+1];
 int unsigned window_count;
+int unsigned tc_hits;
+int unsigned tc_misses;
 
 always_ff @(posedge clk_i or negedge rst_ni) begin
   if (!rst_ni) begin
     counting_active <= 1'b0;
     stats_printed   <= 1'b0;
     for (int i = 0; i <= SLOTS_PER_CYCLE; i++) begin
-      taken_hist[i] <= 0;
-      not_taken_hist[i] <= 0;
+      taken_hist[i]       <= 0;
+      not_taken_hist[i]   <= 0;
       total_branch_hist[i] <= 0;
     end
     window_count <= 0;
+    tc_hits      <= 0;
+    tc_misses    <= 0;
   end else begin
+    // CoreMark gating: count only between start_time and stop_time
     if (pc_commit_i == 64'h80001568) begin
       counting_active <= 1'b1;
       stats_printed   <= 1'b0;
     end
-    
     if (pc_commit_i == 64'h80001576 && !stats_printed) begin
       counting_active <= 1'b0;
       stats_printed   <= 1'b1;
@@ -733,39 +727,40 @@ always_ff @(posedge clk_i or negedge rst_ni) begin
       for (int i = 0; i <= SLOTS_PER_CYCLE; i++)
         $display("[BENCH-STATS]   %0d total: %0d", i, total_branch_hist[i]);
     end
-    
+
+    // Branch histogram (CoreMark-gated)
     if (counting_active && |tc_instr_valid) begin
-      automatic int unsigned taken_count = 0;
-      automatic int unsigned not_taken_count = 0;
+      automatic int unsigned taken_count       = 0;
+      automatic int unsigned not_taken_count   = 0;
       automatic int unsigned total_branch_count = 0;
       for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
         if (tc_instr_valid[i] && tc_is_branch[i]) begin
           total_branch_count++;
-          if (tc_taken[i]) 
-            taken_count++;
-          else 
-            not_taken_count++;
+          if (tc_taken[i]) taken_count++;
+          else             not_taken_count++;
         end
       end
-      taken_hist[taken_count] <= taken_hist[taken_count] + 1;
-      not_taken_hist[not_taken_count] <= not_taken_hist[not_taken_count] + 1;
+      taken_hist[taken_count]             <= taken_hist[taken_count] + 1;
+      not_taken_hist[not_taken_count]     <= not_taken_hist[not_taken_count] + 1;
       total_branch_hist[total_branch_count] <= total_branch_hist[total_branch_count] + 1;
       window_count <= window_count + 1;
     end
-  end
-end
-int unsigned tc_hits, tc_misses;
-always_ff @(posedge clk_i or negedge rst_ni) begin
-  if (!rst_ni) begin
-    tc_hits   <= 0;
-    tc_misses <= 0;
-  end else if (counting_active) begin
+
+    // Hit/miss counters - always active, not gated
     if (i_trace_cache_top.trace_hit_o)
       tc_hits <= tc_hits + 1;
-    else
+    else if (i_trace_cache_top.i_trace_sram.req_i[0] && !i_trace_cache_top.i_trace_sram.we_i[0])
       tc_misses <= tc_misses + 1;
   end
 end
-// pragma translate_on
 
+// Always print hit/miss at end of simulation regardless of CoreMark gating
+final begin
+  $display("\n[TC-STATS] trace cache hits   = %0d", tc_hits);
+  $display("[TC-STATS] trace cache misses = %0d", tc_misses);
+  if (tc_hits + tc_misses > 0)
+    $display("[TC-STATS] hit rate           = %0d%%",
+             (tc_hits * 100) / (tc_hits + tc_misses));
+end
+// pragma translate_on
 endmodule
