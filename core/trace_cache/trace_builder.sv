@@ -1,16 +1,12 @@
 `timescale 1ns/1ps
 import trace_cache_pkg::*;
 
-// Watches the CVA6 fetch stream and builds traces.
-//
-// A trace starts after a taken branch and ends when the instruction buffer
-// is full (CHUNKS_PER_TRACE chunks). Branch T/NT outcomes are recorded
-// across all windows in the trace and used as the lookup tag.
-//
+
 // States:
 //   IDLE   - watching for a taken branch
 //   ACCUM  - filling the trace across fetch windows
 //   COMMIT - unused, kept as safe fallback
+
 module trace_builder (
     input  logic clk_i,
     input  logic rst_ni,
@@ -135,8 +131,6 @@ module trace_builder (
         // IDLE: wait for a taken branch in the fetch window.
         // When found, record from slot 0 up to and including
         // the taken branch, then move to ACCUM.
-        // If the taken branch is the last valid slot, we still
-        // start recording - ACCUM will fill from the target window.
         // -------------------------------------------------
         IDLE: begin
           if (|instr_i.consumed) begin
@@ -198,9 +192,6 @@ module trace_builder (
 
         // -------------------------------------------------
         // ACCUM: keep adding instructions from following windows.
-        //   - record instructions and branch T/NT flags in order
-        //   - on a taken branch: stop adding from this window
-        //     (pipeline redirects; next window comes from target)
         // Commit when the chunk buffer is full.
         // -------------------------------------------------
         ACCUM: begin
@@ -230,11 +221,10 @@ module trace_builder (
                 end
 
                 if (instr_i.is_branch[i]) begin
-                  if (temp_br_cnt < CHUNKS_PER_TRACE) begin
-                    trace_d.branch_flags[temp_br_cnt] = instr_i.taken[i];
-                    if (instr_i.taken[i])
-                      last_branch_target_d = instr_i.target[i];
-                  end
+                  // ACCUM branches: count for num_branches and track target,
+                  // but do NOT update branch_flags (tag uses base-window branches only).
+                  if (instr_i.taken[i])
+                    last_branch_target_d = instr_i.target[i];
                   temp_br_cnt = temp_br_cnt + 1;
                   if (instr_i.taken[i])
                     hit_taken = 1'b1; // stop adding from this window, pipeline will redirect
@@ -266,7 +256,7 @@ module trace_builder (
           end
         end
 
-        // Safe fallback - should never be reached
+        // Safe fallback 
         COMMIT: begin
           state_d = IDLE;
         end
