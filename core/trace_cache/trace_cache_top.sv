@@ -256,5 +256,17 @@ module trace_cache_top (
       end
     end
   end
-
+`ifndef SYNTHESIS
+  always_ff @(posedge clk_i) begin
+    if (lookup_valid_q && trace_read.valid) begin
+      if (!pc_match)
+        $display("[TC-LOOKUP] PC MISS: stored=0x%h lookup=0x%h", trace_read.base_pc, lookup_pc_q);
+      else if (!branch_flags_match)
+        $display("[TC-LOOKUP] BR MISS at 0x%h: stored=%b lookup=%b num=%0d",
+                 lookup_pc_q, trace_read.branch_flags, branch_predictions_q, trace_read.num_branches);
+      else
+        $display("[TC-LOOKUP] HIT at 0x%h", lookup_pc_q);
+    end
+  end
+`endif
 endmodule
