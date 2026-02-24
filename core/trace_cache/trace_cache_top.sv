@@ -17,11 +17,10 @@ import trace_cache_pkg::*;
 //   4. If both match and entry is valid ? HIT ? deliver trace instructions
 //      and target_addr directly, bypassing icache fetch latency
 //
-// WHY WE MASK PCs FOR COMPARISON:
-//   base_pc is stored as the exact instruction PC of the taken branch
-//   (e.g. 0x80000318). The lookup PC is fetch-aligned (e.g. 0x80000310).
-//   Both are in the same 16-byte fetch window, so masking to 16-byte
-//   boundary makes them equal: 0x80000310 == 0x80000310.
+// WHY LOOKUP PC IS ALIGNED:
+//   base_pc is stored fetch-aligned (builder masks pc[0] to 16-byte boundary).
+//   lookup_pc_i (icache_vaddr_q) may be halfword-aligned due to RVC, so we
+//   derive lookup_base = lookup_pc_i & ~0xF before indexing SRAM and comparing.
 
 module trace_cache_top (
   input  logic clk_i,
@@ -124,6 +123,13 @@ module trace_cache_top (
   // Builder writes take priority over lookups (never stall the record path)
   assign lookup_fire = lookup_valid_i && !mem_req_builder;
 
+  // Align lookup PC to 16-byte fetch window boundary.
+  // icache_vaddr_q can be halfword-aligned (e.g. 0x...16) due to RVC.
+  // builder always stores base_pc fetch-aligned, so we must align lookup
+  // to the same boundary for both SRAM index and tag compare to match.
+  logic [PC_WIDTH-1:0] lookup_base;
+  assign lookup_base = lookup_pc_i & {{(PC_WIDTH-4){1'b1}}, 4'b0000};
+
   // Single-port SRAM arbitration: write when builder commits, else read for lookup
   always_comb begin
     mem_req   = 1'b0;
@@ -140,16 +146,16 @@ module trace_cache_top (
       mem_wdata = mem_wdata_builder;
       mem_be    = mem_be_builder;
     end else if (lookup_fire) begin
-      // No write this cycle - do a lookup read
-      // Index = PC bits [TRACE_ADDRW+1:2], same bits used when writing
+      // No write this cycle - do a lookup read using aligned base address
       mem_req  = 1'b1;
       mem_we   = 1'b0;
-      mem_addr = lookup_pc_i[TRACE_ADDRW+1:2];
+      mem_addr = lookup_base[TRACE_ADDRW+1:2];
       mem_be   = {BE_WIDTH{1'b1}};
     end
   end
 
-  // Pipeline lookup inputs to align with 1-cycle SRAM read latency
+  // Pipeline lookup inputs to align with 1-cycle SRAM read latency.
+  // We pipeline lookup_base (aligned), not raw lookup_pc_i.
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       lookup_valid_q       <= 1'b0;
@@ -157,7 +163,7 @@ module trace_cache_top (
       branch_predictions_q <= '0;
     end else begin
       lookup_valid_q       <= lookup_fire;
-      lookup_pc_q          <= lookup_pc_i;
+      lookup_pc_q          <= lookup_base;
       branch_predictions_q <= branch_predictions_i;
     end
   end
@@ -183,9 +189,9 @@ module trace_cache_top (
   assign trace_read = mem_rdata;
 
   // Tag check: PC match
-  // base_pc is stored as fetch-aligned (masked to 16-byte boundary in builder).
-  // lookup_pc_q (icache_vaddr_q) is also always fetch-aligned.
-  // Direct compare is sufficient - no masking needed here.
+  // Both base_pc (stored by builder) and lookup_pc_q are fetch-aligned to
+  // 16-byte boundary. base_pc is masked in builder; lookup_pc_q is lookup_base
+  // pipelined above. Direct compare is correct.
   logic pc_match;
   assign pc_match = (trace_read.base_pc == lookup_pc_q);
 
