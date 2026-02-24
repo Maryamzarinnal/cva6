@@ -141,9 +141,8 @@ module trace_builder (
         // When found, record from slot 0 up to and including
         // the taken branch, then move to ACCUM.
         //
-        // base_pc = pc[0] (fetch-aligned window address) so that
-        // it matches icache_vaddr_q at lookup time. pc[0] is always
-        // the fetch-aligned address regardless of slot validity.
+        // base_pc = fetch-aligned window address, matching icache_vaddr_q
+        // at lookup time. pc[0] masked to 16-byte boundary (4 slots x 4B).
         // -------------------------------------------------
         IDLE: begin
           if (|instr_i.consumed) begin
@@ -165,8 +164,9 @@ module trace_builder (
               last_instr_pc_d         = '0;
               last_instr_compressed_d = 1'b0;
 
-              // base_pc = fetch-aligned window start (pc[0]), matches icache_vaddr_q at lookup
-              trace_d.base_pc = instr_i.pc[0];
+              // base_pc = fetch-aligned window start, matches icache_vaddr_q at lookup.
+              // Mask bottom 4 bits: fetch window = 4 slots x 4 bytes = 16 bytes.
+              trace_d.base_pc = instr_i.pc[0] & {{(PC_WIDTH-4){1'b1}}, 4'b0000};
 
               // record slots 0..branch_slot
               for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
