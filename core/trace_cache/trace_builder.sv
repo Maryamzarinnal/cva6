@@ -45,6 +45,9 @@ module trace_builder (
   logic [TRACE_WIDTH-1:0] commit_data_q,  commit_data_d;
   logic [GHR_WIDTH-1:0]   trace_start_ghr_q, trace_start_ghr_d;
   logic [CHUNK_PTR_W-1:0] commit_chunk_ptr_q, commit_chunk_ptr_d;
+  // Track last instruction PC and size for fall-through target computation
+  logic [PC_WIDTH-1:0]    last_instr_pc_q, last_instr_pc_d;
+  logic                   last_instr_compressed_q, last_instr_compressed_d;
 
   assign instr_i.ready = 1'b1;
   assign mem_req_o     = commit_valid_q;
@@ -57,27 +60,31 @@ module trace_builder (
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      state_q              <= IDLE;
-      trace_q              <= '0;
-      chunk_ptr_q          <= '0;
-      br_cnt_q             <= '0;
-      last_branch_target_q <= '0;
-      sram_wr_addr_q       <= '0;
-      commit_valid_q       <= 1'b0;
-      commit_data_q        <= '0;
-      trace_start_ghr_q    <= '0;
-      commit_chunk_ptr_q   <= '0;
+      state_q                  <= IDLE;
+      trace_q                  <= '0;
+      chunk_ptr_q              <= '0;
+      br_cnt_q                 <= '0;
+      last_branch_target_q     <= '0;
+      sram_wr_addr_q           <= '0;
+      commit_valid_q           <= 1'b0;
+      commit_data_q            <= '0;
+      trace_start_ghr_q        <= '0;
+      commit_chunk_ptr_q       <= '0;
+      last_instr_pc_q          <= '0;
+      last_instr_compressed_q  <= 1'b0;
     end else begin
-      state_q              <= state_d;
-      trace_q              <= trace_d;
-      chunk_ptr_q          <= chunk_ptr_d;
-      br_cnt_q             <= br_cnt_d;
-      last_branch_target_q <= last_branch_target_d;
-      sram_wr_addr_q       <= sram_wr_addr_d;
-      commit_valid_q       <= commit_valid_d;
-      commit_data_q        <= commit_data_d;
-      trace_start_ghr_q    <= trace_start_ghr_d;
-      commit_chunk_ptr_q   <= commit_chunk_ptr_d;
+      state_q                  <= state_d;
+      trace_q                  <= trace_d;
+      chunk_ptr_q              <= chunk_ptr_d;
+      br_cnt_q                 <= br_cnt_d;
+      last_branch_target_q     <= last_branch_target_d;
+      sram_wr_addr_q           <= sram_wr_addr_d;
+      commit_valid_q           <= commit_valid_d;
+      commit_data_q            <= commit_data_d;
+      trace_start_ghr_q        <= trace_start_ghr_d;
+      commit_chunk_ptr_q       <= commit_chunk_ptr_d;
+      last_instr_pc_q          <= last_instr_pc_d;
+      last_instr_compressed_q  <= last_instr_compressed_d;
     end
   end
 
@@ -92,23 +99,23 @@ module trace_builder (
     logic [CHUNK_PTR_W-1:0] branch_slot;
     logic                   hit_taken;
     logic                   trace_full;
-    logic                   first_valid_seen;
 
     // defaults: hold state
-    state_d              = state_q;
-    trace_d              = trace_q;
-    chunk_ptr_d          = chunk_ptr_q;
-    br_cnt_d             = br_cnt_q;
-    last_branch_target_d = last_branch_target_q;
-    sram_wr_addr_d       = sram_wr_addr_q;
-    commit_valid_d       = 1'b0;
-    commit_data_d        = commit_data_q;
-    trace_start_ghr_d    = trace_start_ghr_q;
-    commit_chunk_ptr_d   = commit_chunk_ptr_q;
+    state_d                  = state_q;
+    trace_d                  = trace_q;
+    chunk_ptr_d              = chunk_ptr_q;
+    br_cnt_d                 = br_cnt_q;
+    last_branch_target_d     = last_branch_target_q;
+    sram_wr_addr_d           = sram_wr_addr_q;
+    commit_valid_d           = 1'b0;
+    commit_data_d            = commit_data_q;
+    trace_start_ghr_d        = trace_start_ghr_q;
+    commit_chunk_ptr_d       = commit_chunk_ptr_q;
+    last_instr_pc_d          = last_instr_pc_q;
+    last_instr_compressed_d  = last_instr_compressed_q;
 
     temp_chunk_ptr   = '0;
     temp_br_cnt      = '0;
-    first_valid_seen = 1'b0;
     is_compressed    = 1'b0;
     has_space        = 1'b0;
     found_taken      = 1'b0;
@@ -118,10 +125,12 @@ module trace_builder (
     trace_full       = 1'b0;
 
     if (flush_i) begin
-      state_d     = IDLE;
-      chunk_ptr_d = '0;
-      br_cnt_d    = '0;
-      trace_d     = '0;
+      state_d                 = IDLE;
+      chunk_ptr_d             = '0;
+      br_cnt_d                = '0;
+      trace_d                 = '0;
+      last_instr_pc_d         = '0;
+      last_instr_compressed_d = 1'b0;
 
     end else begin
 
@@ -131,6 +140,10 @@ module trace_builder (
         // IDLE: wait for a taken branch in the fetch window.
         // When found, record from slot 0 up to and including
         // the taken branch, then move to ACCUM.
+        //
+        // base_pc = pc[0] (fetch-aligned window address) so that
+        // it matches icache_vaddr_q at lookup time. pc[0] is always
+        // the fetch-aligned address regardless of slot validity.
         // -------------------------------------------------
         IDLE: begin
           if (|instr_i.consumed) begin
@@ -143,22 +156,26 @@ module trace_builder (
             end
 
             if (found_taken) begin
-              trace_start_ghr_d = ghr_i;
-              temp_chunk_ptr    = '0;
-              temp_br_cnt       = '0;
-              chunk_ptr_d       = '0;
-              br_cnt_d          = '0;
-              trace_d           = '0;
+              trace_start_ghr_d       = ghr_i;
+              temp_chunk_ptr          = '0;
+              temp_br_cnt             = '0;
+              chunk_ptr_d             = '0;
+              br_cnt_d                = '0;
+              trace_d                 = '0;
+              last_instr_pc_d         = '0;
+              last_instr_compressed_d = 1'b0;
+
+              // base_pc = fetch-aligned window start (pc[0]), matches icache_vaddr_q at lookup
+              trace_d.base_pc = instr_i.pc[0];
 
               // record slots 0..branch_slot
               for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
                 if (instr_i.valid[i] && (CHUNK_PTR_W'(i) <= branch_slot)) begin
                   is_compressed = (instr_i.inst[i][1:0] != 2'b11);
 
-                  if (!first_valid_seen) begin
-                    trace_d.base_pc  = instr_i.pc[i];
-                    first_valid_seen = 1'b1;
-                  end
+                  // Track last instruction added
+                  last_instr_pc_d         = instr_i.pc[i];
+                  last_instr_compressed_d = is_compressed;
 
                   if (!is_compressed) begin
                     trace_d.chunks[temp_chunk_ptr]         = instr_i.inst[i][15:0];
@@ -208,6 +225,10 @@ module trace_builder (
                           (temp_chunk_ptr + 2 <= CHUNKS_PER_TRACE);
 
               if (instr_i.valid[i] && has_space && !hit_taken) begin
+                // Track last instruction added
+                last_instr_pc_d         = instr_i.pc[i];
+                last_instr_compressed_d = is_compressed;
+
                 if (!is_compressed) begin
                   trace_d.chunks[temp_chunk_ptr]         = instr_i.inst[i][15:0];
                   trace_d.chunks[temp_chunk_ptr+1]       = instr_i.inst[i][31:16];
@@ -238,12 +259,15 @@ module trace_builder (
             chunk_ptr_d = temp_chunk_ptr;
             br_cnt_d    = temp_br_cnt;
 
-            // Commit if full. Also commit if a taken branch just filled the
-            // last available chunk (hit_taken and no space left).
+            // Commit if full or if a taken branch just filled the last chunk.
             if (trace_full || (hit_taken && temp_chunk_ptr >= CHUNKS_PER_TRACE)) begin
               commit_chunk_ptr_d   = temp_chunk_ptr;
               trace_d.valid        = 1'b1;
-              trace_d.target_addr  = last_branch_target_d;
+              // If trace ended on a taken branch, use branch target.
+              // If trace ended because buffer is full (no final taken branch),
+              // compute fall-through: last instruction PC + 2 (RVC) or + 4 (RVI).
+              trace_d.target_addr  = hit_taken ? last_branch_target_d
+                                               : last_instr_pc_d + (last_instr_compressed_d ? 64'h2 : 64'h4);
               trace_d.num_branches = BR_CNT_W'(temp_br_cnt);
               sram_wr_addr_d       = tc_index(trace_d.base_pc, '0);
               commit_valid_d       = 1'b1;
@@ -256,7 +280,7 @@ module trace_builder (
           end
         end
 
-        // Safe fallback 
+        // Safe fallback
         COMMIT: begin
           state_d = IDLE;
         end
