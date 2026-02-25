@@ -607,6 +607,16 @@ module frontend
 
     end
   end
+always_ff @(posedge clk_i) begin
+  if (icache_valid_q && icache_vaddr_q == 'h80000310) begin
+    $display("[TC-DEBUG] fetch=0x%h valid=%b is_branch=%b taken=%b pred=%b",
+             icache_vaddr_q,
+             instruction_valid,
+             tc_is_branch,
+             tc_taken,
+             tc_branch_predictions);
+  end
+end
 // pragma translate_on
 
 endmodule
