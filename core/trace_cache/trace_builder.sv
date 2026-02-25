@@ -190,7 +190,10 @@ module trace_builder (
         // Then we move to ACCUM to keep filling from the next windows.
         // -----------------------------------------------------------------
         IDLE: begin
-          if (|instr_i.consumed) begin
+          // Do not start a new base window while instr_realign is still
+          // stitching an unaligned instruction across cache blocks. Wait
+          // until we see a fully aligned logical window.
+          if (|instr_i.consumed && !instr_i.serving_unaligned) begin
 
             // Find the first taken branch in this window
             for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin

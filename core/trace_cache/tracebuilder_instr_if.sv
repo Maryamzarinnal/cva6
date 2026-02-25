@@ -21,6 +21,12 @@ interface tracebuilder_instr_if (
   logic [SLOTS_PER_CYCLE-1:0]               taken;      // was this branch taken?
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] target;     // branch target address
 
+  // Indicates that instr_realign is currently serving an unaligned instruction
+  // (i.e., the logical fetch window spans multiple cache blocks). The trace
+  // builder uses this to avoid starting a new base window in the middle of
+  // such a split window.
+  logic                                     serving_unaligned;
+
   // consumed ? driven by instr_queue: one bit per slot, high when that slot
   // is actually consumed by the instruction queue this cycle. The trace_builder
   // uses |consumed as a "new window" indicator to avoid re-processing the same
@@ -32,13 +38,13 @@ interface tracebuilder_instr_if (
 
   // Frontend drives instructions, reads ready
   modport producer (
-    output valid, inst, pc, is_branch, taken, target, consumed,
+    output valid, inst, pc, is_branch, taken, target, consumed, serving_unaligned,
     input  ready
   );
 
   // trace_builder reads instructions, drives ready
   modport consumer (
-    input  valid, inst, pc, is_branch, taken, target, consumed,
+    input  valid, inst, pc, is_branch, taken, target, consumed, serving_unaligned,
     output ready
   );
 

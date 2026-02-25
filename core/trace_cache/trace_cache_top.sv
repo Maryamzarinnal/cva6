@@ -33,6 +33,9 @@ module trace_cache_top (
   input  logic [SLOTS_PER_CYCLE-1:0]               is_branch_i,
   input  logic [SLOTS_PER_CYCLE-1:0]               branch_taken_i,
   input  logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] branch_target_i,
+  // From instr_realign: 1 when current window spans blocks / is still being
+  // stitched, so the trace builder should not start a new base window.
+  input  logic                        serving_unaligned_i,
 
   input  logic                        flush_i,
   input  logic                        instr_queue_ready_i,
@@ -69,6 +72,7 @@ module trace_cache_top (
   assign instr_if.taken     = branch_taken_i;
   assign instr_if.target    = branch_target_i;
   assign instr_if.consumed  = instr_queue_consumed_i & {SLOTS_PER_CYCLE{~flush_i}};
+  assign instr_if.serving_unaligned = serving_unaligned_i;
 
   // GHR - tracked for potential future use, not used in current tag matching
   logic [GHR_WIDTH-1:0] ghr;

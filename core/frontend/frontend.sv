@@ -519,6 +519,7 @@ module frontend
     .is_branch_i            (tc_is_branch),
     .branch_taken_i         (tc_taken),
     .branch_target_i        (tc_target),
+    .serving_unaligned_i    (serving_unaligned),
     .flush_i                (flush_i),
     .instr_queue_ready_i    (instr_queue_ready),
     .instr_queue_consumed_i (instr_queue_consumed),
