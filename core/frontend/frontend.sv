@@ -504,7 +504,8 @@ module frontend
           tc_branch_predictions[br_idx] = btb_prediction_shifted[i].valid;
         else
           tc_branch_predictions[br_idx] = bht_prediction_shifted[i].valid ?
-                                          bht_prediction_shifted[i].taken : 1'b0;
+                                          bht_prediction_shifted[i].taken :
+                                          (rvi_branch[i] ? rvi_imm[i][CVA6Cfg.VLEN-1] : rvc_imm[i][CVA6Cfg.VLEN-1]);
         br_idx = br_idx + 1;
       end
     end
@@ -524,8 +525,8 @@ module frontend
     .instr_queue_ready_i    (instr_queue_ready),
     .instr_queue_consumed_i (instr_queue_consumed),
     .branch_predictions_i   (tc_branch_predictions),
-    .lookup_valid_i         (icache_valid_q),
-    .lookup_pc_i            ({{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, icache_vaddr_q}),
+    .lookup_valid_i         (|instr_queue_consumed),
+    .lookup_pc_i            (tc_pc[0]),
     .trace_hit_o            (),
     .trace_instructions_o   (),
     .trace_length_o         (),

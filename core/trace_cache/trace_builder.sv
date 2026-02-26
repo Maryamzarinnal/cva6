@@ -335,11 +335,10 @@ module trace_builder (
             br_cnt_d    = temp_br_cnt;
 
             // Commit only when the chunk buffer is full.
-            // hitting a taken branch in ACCUM does NOT end the trace - we stitch
-            // across redirects. hit_taken just stops adding slots from the current
-            // window (since the next instructions are at the branch target, not the
-            // next slots). ACCUM continues filling from the target window next cycle.
-            if (trace_full) begin
+            // Commit when buffer is full OR when we hit a taken branch in ACCUM.
+            // hit_taken means the current path ends here naturally (next instructions
+            // are at the branch target, not the next sequential slots).
+            if (trace_full || (hit_taken && temp_chunk_ptr > 0)) begin
               commit_chunk_ptr_d  = temp_chunk_ptr;
               trace_d.valid       = 1'b1;
 
