@@ -272,5 +272,27 @@ module trace_cache_top (
         $display("[TC-LOOKUP] HIT at 0x%h", lookup_pc_q);
     end
   end
+
+  // Useful hit rate: only counts lookups where the SRAM slot is occupied,
+  // so empty-slot PC misses (sequential windows with no stored trace) are excluded.
+  int unsigned tc_valid_lookups;
+  int unsigned tc_useful_hits;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      tc_valid_lookups <= 0;
+      tc_useful_hits   <= 0;
+    end else if (lookup_valid_q && trace_read.valid) begin
+      tc_valid_lookups <= tc_valid_lookups + 1;
+      if (trace_hit)
+        tc_useful_hits <= tc_useful_hits + 1;
+    end
+  end
+
+  final begin
+    $display("[TC-USEFUL] valid_lookups=%0d hits=%0d rate=%0d%%",
+             tc_valid_lookups, tc_useful_hits,
+             tc_valid_lookups > 0 ? (tc_useful_hits * 100) / tc_valid_lookups : 0);
+  end
 `endif
 endmodule

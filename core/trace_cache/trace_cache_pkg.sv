@@ -7,8 +7,8 @@ package trace_cache_pkg;
   // Max instructions per trace
   localparam int unsigned TRACE_LEN = 4;
 
-  // SRAM address width -> 64 entries, direct-mapped
-  localparam int unsigned TRACE_ADDRW = 10;
+  // SRAM address width -> 256 entries, direct-mapped
+  localparam int unsigned TRACE_ADDRW = 8;
 
   // Global history register width
   localparam int unsigned GHR_WIDTH = 8;
