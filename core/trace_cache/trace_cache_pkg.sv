@@ -53,7 +53,11 @@ package trace_cache_pkg;
     input logic [PC_WIDTH-1:0]         pc,
     input logic [CHUNKS_PER_TRACE-1:0] path_id
   );
-    tc_index = pc[TRACE_ADDRW+1:2] ^ path_id[TRACE_ADDRW-1:0];
+    // Zero-extend path_id to TRACE_ADDRW bits to avoid out-of-range
+    // bit access when TRACE_ADDRW > CHUNKS_PER_TRACE.
+    logic [TRACE_ADDRW-1:0] path_ext;
+    path_ext = TRACE_ADDRW'(path_id);
+    tc_index = pc[TRACE_ADDRW+1:2] ^ path_ext;
   endfunction
 
 endpackage : trace_cache_pkg
