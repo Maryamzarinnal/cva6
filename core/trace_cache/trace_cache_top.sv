@@ -153,7 +153,7 @@ module trace_cache_top (
       // No write this cycle - do a lookup read using aligned base address
       mem_req  = 1'b1;
       mem_we   = 1'b0;
-      mem_addr = lookup_base[TRACE_ADDRW+1:2];
+      mem_addr = tc_index(lookup_base, '0);
       mem_be   = {BE_WIDTH{1'b1}};
     end
   end

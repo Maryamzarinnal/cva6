@@ -48,16 +48,18 @@ package trace_cache_pkg;
     logic [CHUNKS_PER_TRACE-1:0]       valid_chunks;   // 1 = start of instruction
   } trace_data_t;
 
-  // Direct-mapped SRAM index: XOR of PC bits and branch path
+  // Direct-mapped SRAM index: XOR-folded PC hash + branch path
+  // Folds upper PC bits into the index to break systematic aliasing
+  // between code regions that share lower address bits.
   function automatic logic [TRACE_ADDRW-1:0] tc_index(
     input logic [PC_WIDTH-1:0]         pc,
     input logic [CHUNKS_PER_TRACE-1:0] path_id
   );
-    // Zero-extend path_id to TRACE_ADDRW bits to avoid out-of-range
-    // bit access when TRACE_ADDRW > CHUNKS_PER_TRACE.
     logic [TRACE_ADDRW-1:0] path_ext;
     path_ext = TRACE_ADDRW'(path_id);
-    tc_index = pc[TRACE_ADDRW+1:2] ^ path_ext;
+    tc_index = pc[TRACE_ADDRW+1:2]
+             ^ pc[2*TRACE_ADDRW+1:TRACE_ADDRW+2]
+             ^ path_ext;
   endfunction
 
 endpackage : trace_cache_pkg
