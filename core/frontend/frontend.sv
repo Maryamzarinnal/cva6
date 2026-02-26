@@ -542,19 +542,23 @@ module frontend
   int unsigned  window_count;
   int unsigned  tc_hits;
   int unsigned  tc_misses;
+  int unsigned  tc_taken_lookups;  // windows with a taken branch (active-mode denominator)
+  int unsigned  tc_taken_hits;     // hits among those windows
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      counting_active <= 1'b0;
-      stats_printed   <= 1'b0;
+      counting_active  <= 1'b0;
+      stats_printed    <= 1'b0;
       for (int i = 0; i <= SLOTS_PER_CYCLE; i++) begin
         taken_hist[i]        <= 0;
         not_taken_hist[i]    <= 0;
         total_branch_hist[i] <= 0;
       end
-      window_count <= 0;
-      tc_hits      <= 0;
-      tc_misses    <= 0;
+      window_count     <= 0;
+      tc_hits          <= 0;
+      tc_misses        <= 0;
+      tc_taken_lookups <= 0;
+      tc_taken_hits    <= 0;
     end else begin
 
       // CoreMark gating
@@ -603,6 +607,14 @@ module frontend
         tc_misses <= tc_misses + 1;
       end
 
+      // Taken-only counters: track hits among windows that have a taken branch.
+      // This is the realistic active-mode hit rate.
+      if (|tc_taken && |instr_queue_consumed && !flush_i) begin
+        tc_taken_lookups <= tc_taken_lookups + 1;
+        if (i_trace_cache_top.trace_hit_o)
+          tc_taken_hits <= tc_taken_hits + 1;
+      end
+
       // Print running totals on every trace commit
       if (i_trace_cache_top.i_trace_builder.commit_valid_q) begin
         $display("[TC-STATS] hits=%0d misses=%0d", tc_hits, tc_misses);
@@ -611,6 +623,9 @@ module frontend
                  i_trace_cache_top.tc_useful_hits,
                  i_trace_cache_top.tc_valid_lookups > 0 ?
                  (i_trace_cache_top.tc_useful_hits * 100) / i_trace_cache_top.tc_valid_lookups : 0);
+        $display("[TC-TAKEN] taken_lookups=%0d taken_hits=%0d rate=%0d%%",
+                 tc_taken_lookups, tc_taken_hits,
+                 tc_taken_lookups > 0 ? (tc_taken_hits * 100) / tc_taken_lookups : 0);
       end
 
     end
