@@ -604,8 +604,14 @@ module frontend
       end
 
       // Print running totals on every trace commit
-      if (i_trace_cache_top.i_trace_builder.commit_valid_q)
+      if (i_trace_cache_top.i_trace_builder.commit_valid_q) begin
         $display("[TC-STATS] hits=%0d misses=%0d", tc_hits, tc_misses);
+        $display("[TC-USEFUL] valid_lookups=%0d hits=%0d rate=%0d%%",
+                 i_trace_cache_top.tc_valid_lookups,
+                 i_trace_cache_top.tc_useful_hits,
+                 i_trace_cache_top.tc_valid_lookups > 0 ?
+                 (i_trace_cache_top.tc_useful_hits * 100) / i_trace_cache_top.tc_valid_lookups : 0);
+      end
 
     end
   end
