@@ -544,6 +544,7 @@ module frontend
   int unsigned  tc_misses;
   int unsigned  tc_taken_lookups;  // windows with a taken branch (active-mode denominator)
   int unsigned  tc_taken_hits;     // hits among those windows
+  logic         tc_had_taken_q;    // pipelined |tc_taken for alignment with trace_hit_o
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -559,6 +560,7 @@ module frontend
       tc_misses        <= 0;
       tc_taken_lookups <= 0;
       tc_taken_hits    <= 0;
+      tc_had_taken_q   <= 1'b0;
     end else begin
 
       // CoreMark gating
@@ -609,7 +611,10 @@ module frontend
 
       // Taken-only counters: track hits among windows that have a taken branch.
       // This is the realistic active-mode hit rate.
-      if (|tc_taken && |instr_queue_consumed && !flush_i) begin
+      // tc_taken must be pipelined by 1 cycle to align with trace_hit_o
+      // (SRAM read latency = 1 cycle).
+      tc_had_taken_q <= |tc_taken && |instr_queue_consumed && !flush_i;
+      if (tc_had_taken_q) begin
         tc_taken_lookups <= tc_taken_lookups + 1;
         if (i_trace_cache_top.trace_hit_o)
           tc_taken_hits <= tc_taken_hits + 1;
