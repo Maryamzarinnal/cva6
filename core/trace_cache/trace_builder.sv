@@ -370,7 +370,7 @@ module trace_builder (
               // num_branches was already set in IDLE (base window only).
               // Do NOT overwrite here - ACCUM branches are not part of the tag.
               // SRAM index = bits from base_pc (same bits used at lookup)
-              sram_wr_addr_d  = tc_index(trace_d.base_pc, trace_d.branch_flags);
+              sram_wr_addr_d  = tc_index(trace_d.base_pc, '0);
               commit_valid_d  = 1'b1;
               commit_data_d   = trace_d;
               state_d         = IDLE;
