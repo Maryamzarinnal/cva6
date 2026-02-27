@@ -80,6 +80,10 @@ module trace_builder (
   logic                   last_instr_compressed_q, last_instr_compressed_d;
   // Was the last appended instruction a taken control flow? Used for target_addr at commit.
   logic                   last_instr_was_taken_q, last_instr_was_taken_d;
+  // Total taken branches recorded across the entire trace (base + ACCUM windows).
+  // Commit when this reaches MAX_TAKEN (3), limiting trace to 3 control flow redirections.
+  localparam int unsigned MAX_TAKEN = 3;
+  logic [1:0] taken_cnt_q, taken_cnt_d;
 
   assign instr_i.ready = 1'b1;
   assign mem_req_o     = commit_valid_q;
@@ -105,6 +109,7 @@ module trace_builder (
       last_instr_pc_q          <= '0;
       last_instr_compressed_q  <= 1'b0;
       last_instr_was_taken_q   <= 1'b0;
+      taken_cnt_q              <= '0;
     end else begin
       state_q                  <= state_d;
       trace_q                  <= trace_d;
@@ -119,6 +124,7 @@ module trace_builder (
       last_instr_pc_q          <= last_instr_pc_d;
       last_instr_compressed_q  <= last_instr_compressed_d;
       last_instr_was_taken_q   <= last_instr_was_taken_d;
+      taken_cnt_q              <= taken_cnt_d;
     end
   end
 
@@ -148,6 +154,7 @@ module trace_builder (
     last_instr_pc_d          = last_instr_pc_q;
     last_instr_compressed_d  = last_instr_compressed_q;
     last_instr_was_taken_d   = last_instr_was_taken_q;
+    taken_cnt_d              = taken_cnt_q;
 
     temp_chunk_ptr   = '0;
     temp_br_cnt      = '0;
@@ -168,6 +175,7 @@ module trace_builder (
       last_instr_pc_d         = '0;
       last_instr_compressed_d = 1'b0;
       last_instr_was_taken_d  = 1'b0;
+      taken_cnt_d             = '0;
 
     end else begin
 
@@ -266,19 +274,25 @@ module trace_builder (
               // ACCUM branches are NOT counted here - they are not part of the tag.
               trace_d.num_branches = BR_CNT_W'(temp_br_cnt);
 
-              chunk_ptr_d = temp_chunk_ptr;
-              br_cnt_d    = temp_br_cnt;
-              state_d     = ACCUM;
+              chunk_ptr_d  = temp_chunk_ptr;
+              br_cnt_d     = temp_br_cnt;
+              taken_cnt_d  = 2'd1;   // first taken branch in the trace
+              state_d      = ACCUM;
             end
           end
         end
 
         // -----------------------------------------------------------------
         // ACCUM: keep adding instructions from following fetch windows.
+        // The trace chains across multiple taken branches (control flow
+        // redirections). When a taken branch is seen, the pipeline redirects
+        // and the next window arrives from the target ? the builder just
+        // keeps appending.
         //
         // We stop (and commit the trace) when:
-        //   - The chunk buffer is full (16 chunks = ~8 instructions max), OR
-        //   - We encounter another taken branch (natural end of this path segment)
+        //   - The chunk buffer is full (CHUNKS_PER_TRACE chunks), OR
+        //   - The trace has accumulated MAX_TAKEN (3) taken branches total
+        //     (counting the initial taken branch from the base window)
         //
         // Note: branches in ACCUM windows are counted for statistics
         // (num_branches in the committed trace includes them for $display)
@@ -319,11 +333,12 @@ module trace_builder (
                 if (instr_i.is_branch[i]) begin
                   // ACCUM branch: track target and count, but do NOT update
                   // branch_flags or num_branches (tag was already set in IDLE)
-                  if (instr_i.taken[i])
+                  if (instr_i.taken[i]) begin
                     last_branch_target_d = instr_i.target[i];
+                    taken_cnt_d = taken_cnt_q + 2'd1;
+                    hit_taken = 1'b1; // stop processing this window, next from target
+                  end
                   temp_br_cnt = temp_br_cnt + 1;
-                  if (instr_i.taken[i])
-                    hit_taken = 1'b1; // stop here, pipeline will redirect
                 end
 
               end else if (instr_i.valid[i] && !has_space) begin
@@ -334,11 +349,11 @@ module trace_builder (
             chunk_ptr_d = temp_chunk_ptr;
             br_cnt_d    = temp_br_cnt;
 
-            // Commit only when the chunk buffer is full.
-            // Commit when buffer is full OR when we hit a taken branch in ACCUM.
-            // hit_taken means the current path ends here naturally (next instructions
-            // are at the branch target, not the next sequential slots).
-            if (trace_full || (hit_taken && temp_chunk_ptr > 0)) begin
+            // Commit when buffer is full OR when we've chained through MAX_TAKEN
+            // taken branches (base window + ACCUM windows combined).
+            // The trace chains across multiple control flow redirections,
+            // unlike single-redirect where we'd commit at the first ACCUM taken branch.
+            if (trace_full || (taken_cnt_d >= MAX_TAKEN[1:0] && temp_chunk_ptr > 0)) begin
               commit_chunk_ptr_d  = temp_chunk_ptr;
               trace_d.valid       = 1'b1;
 
@@ -355,12 +370,13 @@ module trace_builder (
               // num_branches was already set in IDLE (base window only).
               // Do NOT overwrite here - ACCUM branches are not part of the tag.
               // SRAM index = bits from base_pc (same bits used at lookup)
-              sram_wr_addr_d  = tc_index(trace_d.base_pc, '0);
+              sram_wr_addr_d  = tc_index(trace_d.base_pc, trace_d.branch_flags);
               commit_valid_d  = 1'b1;
               commit_data_d   = trace_d;
               state_d         = IDLE;
               chunk_ptr_d     = '0;
               br_cnt_d        = '0;
+              taken_cnt_d     = '0;
               trace_d         = '0;
             end
           end
