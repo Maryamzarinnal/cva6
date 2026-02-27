@@ -51,14 +51,16 @@ package trace_cache_pkg;
   // Direct-mapped SRAM index: XOR-folded PC hash + branch path
   // Folds upper PC bits into the index to break systematic aliasing
   // between code regions that share lower address bits.
+  // NOTE: base_pc is fetch-aligned to 16 bytes (bits [3:0] = 0),
+  // so we start at bit 4 to avoid wasting index bits on constant zeros.
   function automatic logic [TRACE_ADDRW-1:0] tc_index(
     input logic [PC_WIDTH-1:0]         pc,
     input logic [CHUNKS_PER_TRACE-1:0] path_id
   );
     logic [TRACE_ADDRW-1:0] path_ext;
     path_ext = TRACE_ADDRW'(path_id);
-    tc_index = pc[TRACE_ADDRW+1:2]
-             ^ pc[2*TRACE_ADDRW+1:TRACE_ADDRW+2]
+    tc_index = pc[TRACE_ADDRW+3:4]
+             ^ pc[2*TRACE_ADDRW+3:TRACE_ADDRW+4]
              ^ path_ext;
   endfunction
 
