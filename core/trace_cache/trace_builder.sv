@@ -1,18 +1,12 @@
 `timescale 1ns/1ps
 import trace_cache_pkg::*;
-
-// trace_builder.sv
 //
-// Watches the CVA6 frontend fetch stream and builds traces for storage
-// in the trace cache SRAM.
 //
 // A "trace" in this design is: the sequence of instructions in the fetch
 // window that contains a taken branch, from slot 0 up to and including
 // that taken branch. It is tagged by:
 //   - base_pc:      the fetch-aligned address of that window
 //   - branch_flags: the PREDICTED outcomes of branches in that window
-//                   (NOT actual outcomes - because at lookup time we only
-//                    have predictions, so the tag must match predictions)
 //   - num_branches: how many branches are in the base window (tag width)
 //
 // Why predictions and not actual outcomes?
@@ -25,7 +19,7 @@ import trace_cache_pkg::*;
 // States:
 //   IDLE   - waiting for a taken branch in the current fetch window
 //   ACCUM  - collecting instructions from following windows to fill the trace
-//   COMMIT - unused, kept as safe fallback
+//   COMMIT - kept as safe fallback
 
 module trace_builder (
     input  logic clk_i,
@@ -34,14 +28,13 @@ module trace_builder (
     // Instruction window from frontend (4 slots)
     tracebuilder_instr_if.consumer instr_i,
 
-    // Global history register (tracked but not used in tag matching currently)
+    // Global history register (not used in tag matching currently)
     input  logic [GHR_WIDTH-1:0] ghr_i,
 
-    // Flush signal - abort any in-progress trace
+    // abort any in-progress trace
     input  logic flush_i,
 
     // Branch PREDICTIONS for the current fetch window.
-    // These come from BHT/BTB/RAS in frontend.sv.
     // We store these (not actual taken bits) as the trace tag so that
     // at lookup time the tag comparison can succeed using predictor outputs.
     input  logic [CHUNKS_PER_TRACE-1:0] branch_predictions_i,
@@ -129,7 +122,7 @@ module trace_builder (
   end
 
   always_comb begin
-    // Local temporaries - reset each combinational evaluation
+    // reset each combinational evaluation
     logic [CHUNK_PTR_W-1:0] temp_chunk_ptr;
     logic [BR_CNT_W-1:0]    temp_br_cnt;
     logic                   is_compressed;
@@ -140,7 +133,7 @@ module trace_builder (
     logic                   hit_taken;
     logic                   trace_full;
 
-    // Default: hold all registered state
+    // Default
     state_d                  = state_q;
     trace_d                  = trace_q;
     chunk_ptr_d              = chunk_ptr_q;
@@ -166,7 +159,7 @@ module trace_builder (
     hit_taken        = 1'b0;
     trace_full       = 1'b0;
 
-    // Flush overrides everything - abort any in-progress trace
+    // Flush overrides everything 
     if (flush_i) begin
       state_d                 = IDLE;
       chunk_ptr_d             = '0;
@@ -182,16 +175,14 @@ module trace_builder (
       case (state_q)
 
         // -----------------------------------------------------------------
-        // IDLE: scan the current fetch window for the first taken branch.
+        // IDLE: scan the current fetch window for the first taken branch
         //
         // When we find one, we start a new trace:
         //   - base_pc      = fetch-aligned address of this window (pc[0] & ~0xf)
         //                    Must match lookup_pc_i (icache_vaddr_q) which is also
         //                    fetch-aligned. Both SRAM index and tag compare use this.
         //   - branch_flags = PREDICTED outcomes from branch_predictions_i
-        //                    (NOT actual taken bits - see module header comment)
         //   - num_branches = number of branches in this base window only
-        //                    (ACCUM branches are NOT part of the tag)
         //   - chunks       = instructions from slot 0 up to and including
         //                    the taken branch slot
         //
@@ -225,12 +216,10 @@ module trace_builder (
 
               // base_pc = fetch-aligned address of this fetch window.
               // Mask pc[0] to 16-byte boundary (4 slots x 4 bytes).
-              // Must match icache_vaddr_q (lookup_pc_i) for SRAM index and tag.
               trace_d.base_pc = instr_i.pc[0] & {{(PC_WIDTH-4){1'b1}}, 4'b0000};
 
               // branch_flags = PREDICTED outcomes for this window.
-              // branch_predictions_i already has the right bit per branch
-              // in slot order (computed in frontend.sv tc_branch_predictions).
+              // in slot order (computed in frontend.sv tc_branch_predictions)
               // We store the whole vector; num_branches tells the lookup
               // how many bits are meaningful.
               trace_d.branch_flags = branch_predictions_i;
@@ -240,10 +229,10 @@ module trace_builder (
                 if (instr_i.valid[i] && (CHUNK_PTR_W'(i) <= branch_slot)) begin
                   is_compressed = (instr_i.inst[i][1:0] != 2'b11);
 
-                  // Track last instruction added (needed for target_addr at commit)
+                  // Track last instruction added
                   last_instr_pc_d         = instr_i.pc[i];
                   last_instr_compressed_d = is_compressed;
-                  // Track if this instruction is a taken CF (for target_addr decision)
+                  // Track if this instruction is a taken CF
                   last_instr_was_taken_d  = instr_i.is_branch[i] && instr_i.taken[i];
 
                   if (!is_compressed) begin
@@ -261,7 +250,7 @@ module trace_builder (
                   end
 
                   if (instr_i.is_branch[i]) begin
-                    // Track branch target for later use at commit
+                    // Track branch target
                     if (instr_i.taken[i])
                       last_branch_target_d = instr_i.target[i];
                     temp_br_cnt = temp_br_cnt + 1;
@@ -271,7 +260,6 @@ module trace_builder (
 
               // num_branches = branches in base window only.
               // This tells the lookup exactly how many branch_flags bits to compare.
-              // ACCUM branches are NOT counted here - they are not part of the tag.
               trace_d.num_branches = BR_CNT_W'(temp_br_cnt);
 
               chunk_ptr_d  = temp_chunk_ptr;
@@ -284,20 +272,11 @@ module trace_builder (
 
         // -----------------------------------------------------------------
         // ACCUM: keep adding instructions from following fetch windows.
-        // The trace chains across multiple taken branches (control flow
-        // redirections). When a taken branch is seen, the pipeline redirects
-        // and the next window arrives from the target ? the builder just
-        // keeps appending.
         //
-        // We stop (and commit the trace) when:
+        // We commit the trace when:
         //   - The chunk buffer is full (CHUNKS_PER_TRACE chunks), OR
         //   - The trace has accumulated MAX_TAKEN (3) taken branches total
-        //     (counting the initial taken branch from the base window)
-        //
-        // Note: branches in ACCUM windows are counted for statistics
-        // (num_branches in the committed trace includes them for $display)
-        // but they are NOT part of the tag comparison at lookup time.
-        // The tag only uses branches from the base window (set in IDLE above).
+        //     counting the initial taken branch from the base window
         // -----------------------------------------------------------------
         ACCUM: begin
           if (|instr_i.consumed) begin
@@ -331,8 +310,8 @@ module trace_builder (
                 end
 
                 if (instr_i.is_branch[i]) begin
-                  // ACCUM branch: track target and count, but do NOT update
-                  // branch_flags or num_branches (tag was already set in IDLE)
+                  // ACCUM branch: track target and count
+                  // branch_flags or num_branches
                   if (instr_i.taken[i]) begin
                     last_branch_target_d = instr_i.target[i];
                     taken_cnt_d = taken_cnt_q + 2'd1;
@@ -350,26 +329,19 @@ module trace_builder (
             br_cnt_d    = temp_br_cnt;
 
             // Commit when buffer is full OR when we've chained through MAX_TAKEN
-            // taken branches (base window + ACCUM windows combined).
-            // The trace chains across multiple control flow redirections,
-            // unlike single-redirect where we'd commit at the first ACCUM taken branch.
             if (trace_full || (taken_cnt_d >= MAX_TAKEN[1:0] && temp_chunk_ptr > 0)) begin
               commit_chunk_ptr_d  = temp_chunk_ptr;
               trace_d.valid       = 1'b1;
 
               // target_addr = where fetch continues after replaying this trace.
               // Depends on what the LAST APPENDED instruction was:
-              //   - if it was a taken CF ? use its target (redirect)
-              //   - otherwise ? fall-through of last instruction
+              //   - if it was a taken CF use its target (redirect)
+              //   - otherwise fall-through of last instruction
               // We use last_instr_was_taken_d (not hit_taken) because hit_taken
               // reflects the current window, not necessarily the last appended instr.
               trace_d.target_addr = last_instr_was_taken_d
                                     ? last_branch_target_d
                                     : last_instr_pc_d + (last_instr_compressed_d ? 64'h2 : 64'h4);
-
-              // num_branches was already set in IDLE (base window only).
-              // Do NOT overwrite here - ACCUM branches are not part of the tag.
-              // SRAM index = bits from base_pc (same bits used at lookup)
               sram_wr_addr_d  = tc_index(trace_d.base_pc, trace_d.branch_flags);
               commit_valid_d  = 1'b1;
               commit_data_d   = trace_d;
@@ -382,7 +354,7 @@ module trace_builder (
           end
         end
 
-        // Safe fallback - should never be reached
+        // Safe fallback
         COMMIT: begin
           state_d = IDLE;
         end
