@@ -79,10 +79,10 @@ module trace_builder (
 
   // Duplicate commit filter: skip writing the same trace to the same slot.
   // Tracks last committed (addr, base_pc, branch_flags) to detect redundant rebuilds.
-  logic [TRACE_ADDRW-1:0]       last_commit_addr_q;
-  logic [PC_WIDTH-1:0]          last_commit_pc_q;
-  logic [CHUNKS_PER_TRACE-1:0]  last_commit_flags_q;
-  logic                         last_commit_valid_q;
+  logic [TRACE_ADDRW-1:0]       last_commit_addr_q,  last_commit_addr_d;
+  logic [PC_WIDTH-1:0]          last_commit_pc_q,    last_commit_pc_d;
+  logic [CHUNKS_PER_TRACE-1:0]  last_commit_flags_q, last_commit_flags_d;
+  logic                         last_commit_valid_q, last_commit_valid_d;
   logic [1:0] taken_cnt_q, taken_cnt_d;
 
   assign instr_i.ready = 1'b1;
@@ -129,13 +129,10 @@ module trace_builder (
       last_instr_compressed_q  <= last_instr_compressed_d;
       last_instr_was_taken_q   <= last_instr_was_taken_d;
       taken_cnt_q              <= taken_cnt_d;
-      // Duplicate filter update: only update when an actual (non-duplicate) commit fires
-      if (commit_valid_d) begin
-        last_commit_addr_q  <= sram_wr_addr_d;
-        last_commit_pc_q    <= trace_d.base_pc;
-        last_commit_flags_q <= trace_d.branch_flags;
-        last_commit_valid_q <= 1'b1;
-      end
+      last_commit_addr_q       <= last_commit_addr_d;
+      last_commit_pc_q         <= last_commit_pc_d;
+      last_commit_flags_q      <= last_commit_flags_d;
+      last_commit_valid_q      <= last_commit_valid_d;
     end
   end
 
@@ -166,6 +163,10 @@ module trace_builder (
     last_instr_compressed_d  = last_instr_compressed_q;
     last_instr_was_taken_d   = last_instr_was_taken_q;
     taken_cnt_d              = taken_cnt_q;
+    last_commit_addr_d       = last_commit_addr_q;
+    last_commit_pc_d         = last_commit_pc_q;
+    last_commit_flags_d      = last_commit_flags_q;
+    last_commit_valid_d      = last_commit_valid_q;
 
     temp_chunk_ptr   = '0;
     temp_br_cnt      = '0;
@@ -374,9 +375,13 @@ module trace_builder (
                            && (trace_d.branch_flags == last_commit_flags_q);
 
               if (!is_duplicate) begin
-                sram_wr_addr_d  = candidate_addr;
-                commit_valid_d  = 1'b1;
-                commit_data_d   = trace_d;
+                sram_wr_addr_d       = candidate_addr;
+                commit_valid_d       = 1'b1;
+                commit_data_d        = trace_d;
+                last_commit_addr_d   = candidate_addr;
+                last_commit_pc_d     = trace_d.base_pc;
+                last_commit_flags_d  = trace_d.branch_flags;
+                last_commit_valid_d  = 1'b1;
               end
 
               state_d         = IDLE;
