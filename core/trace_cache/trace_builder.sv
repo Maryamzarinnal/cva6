@@ -395,9 +395,11 @@ module trace_builder (
       for (int i = 0; i < (1 << TRACE_ADDRW); i++)
         dup_valid[i] <= 1'b0;
     end else if (commit_valid_d) begin
+      trace_data_t dup_tmp;
+      dup_tmp = trace_data_t'(commit_data_d);
       dup_valid[sram_wr_addr_d] <= 1'b1;
-      dup_pc[sram_wr_addr_d]    <= trace_data_t'(commit_data_d).base_pc;
-      dup_flags[sram_wr_addr_d] <= trace_data_t'(commit_data_d).branch_flags;
+      dup_pc[sram_wr_addr_d]    <= dup_tmp.base_pc;
+      dup_flags[sram_wr_addr_d] <= dup_tmp.branch_flags;
     end
   end
 
