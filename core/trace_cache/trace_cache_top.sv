@@ -126,7 +126,7 @@ module trace_cache_top (
       lookup_valid_q       <= lookup_fire;
       lookup_pc_q          <= lookup_base;
       branch_predictions_q <= branch_predictions_i;
-      lookup_set_q         <= tc_index(lookup_base);
+      lookup_set_q         <= tc_index(lookup_base, branch_predictions_i);
     end
   end
 
@@ -164,7 +164,7 @@ module trace_cache_top (
       for (int w = 0; w < NUM_WAYS; w++) begin
         mem_req[w]  = 1'b1;
         mem_we[w]   = 1'b0;
-        mem_addr[w] = tc_index(lookup_base);
+        mem_addr[w] = tc_index(lookup_base, branch_predictions_i);
       end
     end
   end

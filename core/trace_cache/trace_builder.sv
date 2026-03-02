@@ -365,7 +365,7 @@ module trace_builder (
                                     ? last_branch_target_d
                                     : last_instr_pc_d + (last_instr_compressed_d ? 64'h2 : 64'h4);
 
-              candidate_addr = tc_index(trace_d.base_pc);
+              candidate_addr = tc_index(trace_d.base_pc, trace_d.branch_flags);
 
               // Duplicate filter: skip commit if this exact trace was just written
               // to the same SRAM slot. Avoids 100K+ redundant writes in hot loops.

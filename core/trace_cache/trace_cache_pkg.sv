@@ -8,11 +8,8 @@ package trace_cache_pkg;
   localparam int unsigned TRACE_LEN = 4;
 
   // ——— Associativity ———
-  // Number of ways per set. 1 = direct-mapped, 2 = 2-way, etc.
   localparam int unsigned NUM_WAYS = 2;
 
-  // SRAM set-index width: each way has 2^TRACE_ADDRW entries (sets).
-  // Total entries = NUM_WAYS × 2^TRACE_ADDRW.
   // With NUM_WAYS=2, TRACE_ADDRW=8: 2 × 256 = 512 total entries.
   localparam int unsigned TRACE_ADDRW = 8;
 
@@ -54,17 +51,18 @@ package trace_cache_pkg;
     logic [CHUNKS_PER_TRACE-1:0]       valid_chunks;   // 1 = start of instruction
   } trace_data_t;
 
-  // Set index: XOR-folded PC hash.
-  // branch_flags are NOT included to avoid index fragmentation from
-  // non-meaningful prediction bits. Different predictions for the same
-  // base_pc share the same set; associativity resolves conflicts.
-  // NOTE: base_pc is fetch-aligned to 16 bytes (bits [3:0] = 0),
-  // so we start at bit 4 to avoid wasting index bits on constant zeros.
+  // Set index: XOR-folded PC hash with masked branch predictions.
+  // Only the first TC_INDEX_FLAG_BITS of branch_flags are included
+  // to separate prediction paths without fragmentation from upper bits.
+  localparam int unsigned TC_INDEX_FLAG_BITS = 2;
+
   function automatic logic [TRACE_ADDRW-1:0] tc_index(
-    input logic [PC_WIDTH-1:0] pc
+    input logic [PC_WIDTH-1:0]         pc,
+    input logic [CHUNKS_PER_TRACE-1:0] flags
   );
     tc_index = pc[TRACE_ADDRW+3:4]
-             ^ pc[2*TRACE_ADDRW+3:TRACE_ADDRW+4];
+             ^ pc[2*TRACE_ADDRW+3:TRACE_ADDRW+4]
+             ^ TRACE_ADDRW'(flags[TC_INDEX_FLAG_BITS-1:0]);
   endfunction
 
 endpackage : trace_cache_pkg
