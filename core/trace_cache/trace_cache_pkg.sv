@@ -52,8 +52,8 @@ package trace_cache_pkg;
   } trace_data_t;
 
   // Set index: XOR-folded PC hash with masked branch predictions.
-  // Only the first TC_INDEX_FLAG_BITS of branch_flags are included
-  // to separate prediction paths without fragmentation from upper bits.
+  // Three folds of the PC (bits 4..27 for TRACE_ADDRW=8) plus the first
+  // TC_INDEX_FLAG_BITS of branch_flags to separate prediction paths.
   localparam int unsigned TC_INDEX_FLAG_BITS = 2;
 
   function automatic logic [TRACE_ADDRW-1:0] tc_index(
@@ -62,6 +62,7 @@ package trace_cache_pkg;
   );
     tc_index = pc[TRACE_ADDRW+3:4]
              ^ pc[2*TRACE_ADDRW+3:TRACE_ADDRW+4]
+             ^ pc[3*TRACE_ADDRW+3:2*TRACE_ADDRW+4]
              ^ TRACE_ADDRW'(flags[TC_INDEX_FLAG_BITS-1:0]);
   endfunction
 

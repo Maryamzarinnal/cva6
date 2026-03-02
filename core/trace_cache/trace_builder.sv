@@ -77,12 +77,12 @@ module trace_builder (
   // Commit when this reaches MAX_TAKEN (3), limiting trace to 3 control flow redirections.
   localparam int unsigned MAX_TAKEN = 3;
 
-  // Duplicate commit filter: skip writing the same trace to the same slot.
-  // Tracks last committed (addr, base_pc, branch_flags) to detect redundant rebuilds.
-  logic [TRACE_ADDRW-1:0]       last_commit_addr_q,  last_commit_addr_d;
-  logic [PC_WIDTH-1:0]          last_commit_pc_q,    last_commit_pc_d;
-  logic [CHUNKS_PER_TRACE-1:0]  last_commit_flags_q, last_commit_flags_d;
-  logic                         last_commit_valid_q, last_commit_valid_d;
+  // Per-set duplicate filter: remembers the last committed (pc, flags) for each
+  // set index. Catches the interleaving pattern (A→B→A→B) that a single-entry
+  // filter misses, eliminating thousands of redundant SRAM writes.
+  logic                        dup_valid [(1 << TRACE_ADDRW)];
+  logic [PC_WIDTH-1:0]         dup_pc    [(1 << TRACE_ADDRW)];
+  logic [CHUNKS_PER_TRACE-1:0] dup_flags [(1 << TRACE_ADDRW)];
   logic [1:0] taken_cnt_q, taken_cnt_d;
 
   assign instr_i.ready = 1'b1;
@@ -110,10 +110,7 @@ module trace_builder (
       last_instr_compressed_q  <= 1'b0;
       last_instr_was_taken_q   <= 1'b0;
       taken_cnt_q              <= '0;
-      last_commit_addr_q       <= '0;
-      last_commit_pc_q         <= '0;
-      last_commit_flags_q      <= '0;
-      last_commit_valid_q      <= 1'b0;
+
     end else begin
       state_q                  <= state_d;
       trace_q                  <= trace_d;
@@ -129,10 +126,7 @@ module trace_builder (
       last_instr_compressed_q  <= last_instr_compressed_d;
       last_instr_was_taken_q   <= last_instr_was_taken_d;
       taken_cnt_q              <= taken_cnt_d;
-      last_commit_addr_q       <= last_commit_addr_d;
-      last_commit_pc_q         <= last_commit_pc_d;
-      last_commit_flags_q      <= last_commit_flags_d;
-      last_commit_valid_q      <= last_commit_valid_d;
+
     end
   end
 
@@ -163,10 +157,7 @@ module trace_builder (
     last_instr_compressed_d  = last_instr_compressed_q;
     last_instr_was_taken_d   = last_instr_was_taken_q;
     taken_cnt_d              = taken_cnt_q;
-    last_commit_addr_d       = last_commit_addr_q;
-    last_commit_pc_d         = last_commit_pc_q;
-    last_commit_flags_d      = last_commit_flags_q;
-    last_commit_valid_d      = last_commit_valid_q;
+
 
     temp_chunk_ptr   = '0;
     temp_br_cnt      = '0;
@@ -367,21 +358,16 @@ module trace_builder (
 
               candidate_addr = tc_index(trace_d.base_pc, trace_d.branch_flags);
 
-              // Duplicate filter: skip commit if this exact trace was just written
-              // to the same SRAM slot. Avoids 100K+ redundant writes in hot loops.
-              is_duplicate = last_commit_valid_q
-                           && (candidate_addr    == last_commit_addr_q)
-                           && (trace_d.base_pc   == last_commit_pc_q)
-                           && (trace_d.branch_flags == last_commit_flags_q);
+              // Per-set duplicate filter: skip commit if this set already holds
+              // the same (pc, flags) trace. Eliminates interleaving re-commits.
+              is_duplicate = dup_valid[candidate_addr]
+                           && (trace_d.base_pc      == dup_pc[candidate_addr])
+                           && (trace_d.branch_flags == dup_flags[candidate_addr]);
 
               if (!is_duplicate) begin
                 sram_wr_addr_d       = candidate_addr;
                 commit_valid_d       = 1'b1;
                 commit_data_d        = trace_d;
-                last_commit_addr_d   = candidate_addr;
-                last_commit_pc_d     = trace_d.base_pc;
-                last_commit_flags_d  = trace_d.branch_flags;
-                last_commit_valid_d  = 1'b1;
               end
 
               state_d         = IDLE;
@@ -402,6 +388,19 @@ module trace_builder (
     end
   end
 
+  // Per-set duplicate filter update: register the committed trace's identity
+  // so future builds to the same set are suppressed.
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      for (int i = 0; i < (1 << TRACE_ADDRW); i++)
+        dup_valid[i] <= 1'b0;
+    end else if (commit_valid_d) begin
+      dup_valid[sram_wr_addr_d] <= 1'b1;
+      dup_pc[sram_wr_addr_d]    <= trace_data_t'(commit_data_d).base_pc;
+      dup_flags[sram_wr_addr_d] <= trace_data_t'(commit_data_d).branch_flags;
+    end
+  end
+
 `ifndef SYNTHESIS
   always_ff @(posedge clk_i) begin
     if (commit_valid_q) begin
@@ -410,11 +409,14 @@ module trace_builder (
       $display("[TC-BUILDER] ---- TRACE COMMITTED (non-duplicate) ----");
       $display("[TC-BUILDER]   SRAM addr  = %0d", sram_wr_addr_q);
       $display("[TC-BUILDER]   base_pc    = 0x%h", dbg.base_pc);
-      $display("[TC-BUILDER]   HASH: pc[%0d:4]=0x%h ^ pc[%0d:%0d]=0x%h => set=%0d",
+      $display("[TC-BUILDER]   HASH: pc[%0d:4]=0x%h ^ pc[%0d:%0d]=0x%h ^ pc[%0d:%0d]=0x%h ^ flags[1:0]=%b => set=%0d",
                TRACE_ADDRW+3,
                dbg.base_pc[TRACE_ADDRW+3:4],
                2*TRACE_ADDRW+3, TRACE_ADDRW+4,
                dbg.base_pc[2*TRACE_ADDRW+3:TRACE_ADDRW+4],
+               3*TRACE_ADDRW+3, 2*TRACE_ADDRW+4,
+               dbg.base_pc[3*TRACE_ADDRW+3:2*TRACE_ADDRW+4],
+               dbg.branch_flags[TC_INDEX_FLAG_BITS-1:0],
                sram_wr_addr_q);
       $display("[TC-BUILDER]   target     = 0x%h", dbg.target_addr);
       $display("[TC-BUILDER]   #branches  = %0d", dbg.num_branches);
