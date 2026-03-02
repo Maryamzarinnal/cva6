@@ -581,6 +581,15 @@ module frontend
         $display("[BENCH-STATS] Total branches per window:");
         for (int i = 0; i <= SLOTS_PER_CYCLE; i++)
           $display("[BENCH-STATS]   %0d total: %0d", i, total_branch_hist[i]);
+
+        // Benchmark-gated trace cache stats
+        $display("\n[BENCH-TC] === Trace Cache (CoreMark only) ===");
+        $display("[BENCH-TC] hits=%0d misses=%0d rate=%0d%%",
+                 tc_hits, tc_misses,
+                 (tc_hits + tc_misses) > 0 ? (tc_hits * 100) / (tc_hits + tc_misses) : 0);
+        $display("[BENCH-TC] taken_lookups=%0d taken_hits=%0d taken_rate=%0d%%",
+                 tc_taken_lookups, tc_taken_hits,
+                 tc_taken_lookups > 0 ? (tc_taken_hits * 100) / tc_taken_lookups : 0);
       end
 
       // Branch histogram (CoreMark-gated)
@@ -601,32 +610,27 @@ module frontend
         window_count <= window_count + 1;
       end
 
-      // Hit/miss counters - always active
-      if (i_trace_cache_top.trace_hit_o) begin
-        tc_hits <= tc_hits + 1;
-      end else if (i_trace_cache_top.lookup_valid_q) begin
-        tc_misses <= tc_misses + 1;
+      // Hit/miss counters — GATED by counting_active (CoreMark only)
+      if (counting_active) begin
+        if (i_trace_cache_top.trace_hit_o) begin
+          tc_hits <= tc_hits + 1;
+        end else if (i_trace_cache_top.lookup_valid_q) begin
+          tc_misses <= tc_misses + 1;
+        end
+
+        // Taken-only counters: track hits among windows that have a taken branch.
+        // tc_taken must be pipelined by 1 cycle to align with trace_hit_o
+        tc_had_taken_q <= |tc_taken && |instr_queue_consumed && !flush_i;
+        if (tc_had_taken_q) begin
+          tc_taken_lookups <= tc_taken_lookups + 1;
+          if (i_trace_cache_top.trace_hit_o)
+            tc_taken_hits <= tc_taken_hits + 1;
+        end
       end
 
-      // Taken-only counters: track hits among windows that have a taken branch.
-      // This is the realistic active-mode hit rate.
-      // tc_taken must be pipelined by 1 cycle to align with trace_hit_o
-      // (SRAM read latency = 1 cycle).
-      tc_had_taken_q <= |tc_taken && |instr_queue_consumed && !flush_i;
-      if (tc_had_taken_q) begin
-        tc_taken_lookups <= tc_taken_lookups + 1;
-        if (i_trace_cache_top.trace_hit_o)
-          tc_taken_hits <= tc_taken_hits + 1;
-      end
-
-      // Print running totals on every trace commit
+      // Print running totals on every trace commit (ungated, for debug)
       if (i_trace_cache_top.i_trace_builder.commit_valid_q) begin
         $display("[TC-STATS] hits=%0d misses=%0d", tc_hits, tc_misses);
-        $display("[TC-USEFUL] valid_lookups=%0d hits=%0d rate=%0d%%",
-                 i_trace_cache_top.tc_valid_lookups,
-                 i_trace_cache_top.tc_useful_hits,
-                 i_trace_cache_top.tc_valid_lookups > 0 ?
-                 (i_trace_cache_top.tc_useful_hits * 100) / i_trace_cache_top.tc_valid_lookups : 0);
         $display("[TC-TAKEN] taken_lookups=%0d taken_hits=%0d rate=%0d%%",
                  tc_taken_lookups, tc_taken_hits,
                  tc_taken_lookups > 0 ? (tc_taken_hits * 100) / tc_taken_lookups : 0);
