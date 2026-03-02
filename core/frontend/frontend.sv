@@ -604,8 +604,7 @@ module frontend
       // Hit/miss counters - always active
       if (i_trace_cache_top.trace_hit_o) begin
         tc_hits <= tc_hits + 1;
-      end else if (i_trace_cache_top.i_trace_sram.req_i[0] &&
-                   !i_trace_cache_top.i_trace_sram.we_i[0]) begin
+      end else if (i_trace_cache_top.lookup_valid_q) begin
         tc_misses <= tc_misses + 1;
       end
 

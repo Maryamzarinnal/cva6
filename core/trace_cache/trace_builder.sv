@@ -365,7 +365,7 @@ module trace_builder (
                                     ? last_branch_target_d
                                     : last_instr_pc_d + (last_instr_compressed_d ? 64'h2 : 64'h4);
 
-              candidate_addr = tc_index(trace_d.base_pc, trace_d.branch_flags);
+              candidate_addr = tc_index(trace_d.base_pc);
 
               // Duplicate filter: skip commit if this exact trace was just written
               // to the same SRAM slot. Avoids 100K+ redundant writes in hot loops.
@@ -410,12 +410,11 @@ module trace_builder (
       $display("[TC-BUILDER] ---- TRACE COMMITTED (non-duplicate) ----");
       $display("[TC-BUILDER]   SRAM addr  = %0d", sram_wr_addr_q);
       $display("[TC-BUILDER]   base_pc    = 0x%h", dbg.base_pc);
-      $display("[TC-BUILDER]   HASH: pc[%0d:4]=0x%h ^ pc[%0d:%0d]=0x%h ^ flags=0x%h => idx=%0d",
+      $display("[TC-BUILDER]   HASH: pc[%0d:4]=0x%h ^ pc[%0d:%0d]=0x%h => set=%0d",
                TRACE_ADDRW+3,
                dbg.base_pc[TRACE_ADDRW+3:4],
                2*TRACE_ADDRW+3, TRACE_ADDRW+4,
                dbg.base_pc[2*TRACE_ADDRW+3:TRACE_ADDRW+4],
-               TRACE_ADDRW'(dbg.branch_flags),
                sram_wr_addr_q);
       $display("[TC-BUILDER]   target     = 0x%h", dbg.target_addr);
       $display("[TC-BUILDER]   #branches  = %0d", dbg.num_branches);
