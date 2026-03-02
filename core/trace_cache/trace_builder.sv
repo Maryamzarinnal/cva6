@@ -399,6 +399,13 @@ module trace_builder (
       $display("[TC-BUILDER] ---- TRACE COMMITTED ----");
       $display("[TC-BUILDER]   SRAM addr  = %0d", sram_wr_addr_q);
       $display("[TC-BUILDER]   base_pc    = 0x%h", dbg.base_pc);
+      $display("[TC-BUILDER]   HASH: pc[%0d:4]=0x%h ^ pc[%0d:%0d]=0x%h ^ flags=0x%h => idx=%0d",
+               TRACE_ADDRW+3,
+               dbg.base_pc[TRACE_ADDRW+3:4],
+               2*TRACE_ADDRW+3, TRACE_ADDRW+4,
+               dbg.base_pc[2*TRACE_ADDRW+3:TRACE_ADDRW+4],
+               TRACE_ADDRW'(dbg.branch_flags),
+               sram_wr_addr_q);
       $display("[TC-BUILDER]   target     = 0x%h", dbg.target_addr);
       $display("[TC-BUILDER]   #branches  = %0d", dbg.num_branches);
       $display("[TC-BUILDER]   br_flags   = %b", dbg.branch_flags);
