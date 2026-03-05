@@ -12,13 +12,13 @@ module trace_cache_top (
   input  logic rst_ni,
 
   // Instruction window from the frontend (4 slots per cycle)
-  input  logic [SLOTS_PER_CYCLE-1:0]               instr_valid_i,
-  input  logic [SLOTS_PER_CYCLE-1:0][31:0]         instr_i,
-  input  logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] pc_i,
-  input  logic [SLOTS_PER_CYCLE-1:0]               is_branch_i,
-  input  logic [SLOTS_PER_CYCLE-1:0]               branch_taken_i,
-  input  logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] branch_target_i,
-  input  logic                        serving_unaligned_i,
+  input  logic [SLOTS_PER_CYCLE-1:0]                  instr_valid_i,
+  input  logic [SLOTS_PER_CYCLE-1:0][INSTR_WIDTH-1:0] instr_i,
+  input  logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0]    pc_i,
+  input  logic [SLOTS_PER_CYCLE-1:0]                  is_branch_i,
+  input  logic [SLOTS_PER_CYCLE-1:0]                  branch_taken_i,
+  input  logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0]    branch_target_i,
+  input  logic                                        serving_unaligned_i,
 
   input  logic                        flush_i,
   input  logic                        instr_queue_ready_i,
@@ -31,32 +31,26 @@ module trace_cache_top (
   input  logic [PC_WIDTH-1:0] lookup_pc_i,
 
   // Lookup results
-  output logic                       trace_hit_o,
-  output logic [TRACE_LEN-1:0][31:0] trace_instructions_o,
-  output logic [4:0]                 trace_length_o,
-  output logic [PC_WIDTH-1:0]        trace_next_pc_o
+  output logic                                        trace_hit_o,
+  output logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]      trace_instructions_o,
+  output logic [TRACE_LEN_WIDTH-1:0]                 trace_length_o,
+  output logic [PC_WIDTH-1:0]                        trace_next_pc_o
 );
 
-  // ---------------------------------------------------------------
-  // Instruction interface bundling for trace_builder
-  // ---------------------------------------------------------------
   tracebuilder_instr_if instr_if (
     .clk_i (clk_i),
     .rst_ni(rst_ni)
   );
 
-  assign instr_if.valid     = instr_valid_i & {SLOTS_PER_CYCLE{instr_queue_ready_i & ~flush_i}};
-  assign instr_if.pc        = pc_i;
-  assign instr_if.inst      = instr_i;
-  assign instr_if.is_branch = is_branch_i;
-  assign instr_if.taken     = branch_taken_i;
-  assign instr_if.target    = branch_target_i;
-  assign instr_if.consumed  = instr_queue_consumed_i & {SLOTS_PER_CYCLE{~flush_i}};
+  assign instr_if.valid             = instr_valid_i & {SLOTS_PER_CYCLE{instr_queue_ready_i & ~flush_i}};
+  assign instr_if.pc                = pc_i;
+  assign instr_if.inst              = instr_i;
+  assign instr_if.is_branch         = is_branch_i;
+  assign instr_if.taken             = branch_taken_i;
+  assign instr_if.target            = branch_target_i;
+  assign instr_if.consumed          = instr_queue_consumed_i & {SLOTS_PER_CYCLE{~flush_i}};
   assign instr_if.serving_unaligned = serving_unaligned_i;
 
-  // ---------------------------------------------------------------
-  // GHR
-  // ---------------------------------------------------------------
   logic [GHR_WIDTH-1:0] ghr;
   tc_ghr i_tc_ghr (
     .clk_i,
@@ -67,9 +61,6 @@ module trace_cache_top (
     .ghr_o          (ghr)
   );
 
-  // ---------------------------------------------------------------
-  // Per-way SRAM signals
-  // ---------------------------------------------------------------
   logic                   mem_req   [NUM_WAYS];
   logic                   mem_we    [NUM_WAYS];
   logic [TRACE_ADDRW-1:0] mem_addr  [NUM_WAYS];
@@ -77,9 +68,6 @@ module trace_cache_top (
   logic [BE_WIDTH-1:0]    mem_be    [NUM_WAYS];
   logic [TRACE_WIDTH-1:0] mem_rdata [NUM_WAYS];
 
-  // ---------------------------------------------------------------
-  // Builder
-  // ---------------------------------------------------------------
   logic                   mem_req_builder;
   logic                   mem_we_builder;
   logic [TRACE_ADDRW-1:0] mem_addr_builder;
@@ -89,22 +77,19 @@ module trace_cache_top (
   trace_builder i_trace_builder (
     .clk_i,
     .rst_ni,
-    .instr_i                (instr_if),
-    .ghr_i                  (ghr),
-    .flush_i                (flush_i),
-    .branch_predictions_i   (branch_predictions_i),
-    .trace_valid_o          (),
-    .trace_data_o           (),
-    .mem_req_o              (mem_req_builder),
-    .mem_we_o               (mem_we_builder),
-    .mem_addr_o             (mem_addr_builder),
-    .mem_wdata_o            (mem_wdata_builder),
-    .mem_be_o               (mem_be_builder)
+    .instr_i              (instr_if),
+    .ghr_i                (ghr),
+    .flush_i              (flush_i),
+    .branch_predictions_i (branch_predictions_i),
+    .trace_valid_o        (),
+    .trace_data_o         (),
+    .mem_req_o            (mem_req_builder),
+    .mem_we_o             (mem_we_builder),
+    .mem_addr_o           (mem_addr_builder),
+    .mem_wdata_o          (mem_wdata_builder),
+    .mem_be_o             (mem_be_builder)
   );
 
-  // ---------------------------------------------------------------
-  // Lookup pipeline
-  // ---------------------------------------------------------------
   logic                        lookup_fire;
   logic                        lookup_valid_q;
   logic [PC_WIDTH-1:0]         lookup_pc_q;
@@ -130,19 +115,10 @@ module trace_cache_top (
     end
   end
 
-  // ---------------------------------------------------------------
-  // LRU state: 1 bit per set (for 2-way)
-  //   lru[set] = which way was Most Recently Used
-  //   Eviction way = ~lru[set]
-  // ---------------------------------------------------------------
   logic lru [(1 << TRACE_ADDRW)];
-
   logic wr_way;
-  assign wr_way = ~lru[mem_addr_builder];  // evict the non-MRU way
+  assign wr_way = ~lru[mem_addr_builder];
 
-  // ---------------------------------------------------------------
-  // SRAM arbitration: write to LRU way, or read all ways for lookup
-  // ---------------------------------------------------------------
   always_comb begin
     for (int w = 0; w < NUM_WAYS; w++) begin
       mem_req[w]   = 1'b0;
@@ -153,14 +129,12 @@ module trace_cache_top (
     end
 
     if (mem_req_builder) begin
-      // Write to the LRU way
       mem_req[wr_way]   = 1'b1;
       mem_we[wr_way]    = 1'b1;
       mem_addr[wr_way]  = mem_addr_builder;
       mem_wdata[wr_way] = mem_wdata_builder;
       mem_be[wr_way]    = mem_be_builder;
     end else if (lookup_fire) begin
-      // Read ALL ways in parallel
       for (int w = 0; w < NUM_WAYS; w++) begin
         mem_req[w]  = 1'b1;
         mem_we[w]   = 1'b0;
@@ -169,9 +143,6 @@ module trace_cache_top (
     end
   end
 
-  // ---------------------------------------------------------------
-  // Instantiate NUM_WAYS SRAMs
-  // ---------------------------------------------------------------
   for (genvar w = 0; w < NUM_WAYS; w++) begin : gen_ways
     tc_sram #(
       .NumWords  (1 << TRACE_ADDRW),
@@ -190,9 +161,6 @@ module trace_cache_top (
     );
   end
 
-  // ---------------------------------------------------------------
-  // Per-way tag comparison
-  // ---------------------------------------------------------------
   trace_data_t trace_read [NUM_WAYS];
   logic [NUM_WAYS-1:0] pc_match;
   logic [NUM_WAYS-1:0] branch_flags_match;
@@ -202,7 +170,6 @@ module trace_cache_top (
     assign trace_read[w] = mem_rdata[w];
     assign pc_match[w]   = (trace_read[w].base_pc == lookup_pc_q);
 
-    // Compare only the first num_branches bits of branch_flags
     always_comb begin
       branch_flags_match[w] = 1'b1;
       for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
@@ -214,19 +181,15 @@ module trace_cache_top (
     end
 
     assign way_hit[w] = trace_read[w].valid
-                       && pc_match[w]
-                       && branch_flags_match[w]
-                       && lookup_valid_q;
+                     && pc_match[w]
+                     && branch_flags_match[w]
+                     && lookup_valid_q;
   end
 
-  // ---------------------------------------------------------------
-  // Hit detection & way selection
-  // ---------------------------------------------------------------
   logic trace_hit;
   assign trace_hit   = |way_hit;
   assign trace_hit_o = trace_hit;
 
-  // Priority encoder: lowest-index way wins on ties
   logic [$clog2(NUM_WAYS)-1:0] hit_way_idx;
   always_comb begin
     hit_way_idx = '0;
@@ -235,15 +198,11 @@ module trace_cache_top (
     end
   end
 
-  // Mux the hitting way's data
   trace_data_t hit_trace;
   assign hit_trace       = trace_read[hit_way_idx];
   assign trace_next_pc_o = hit_trace.target_addr;
 
-  // ---------------------------------------------------------------
-  // Instruction count & reconstruction from hitting trace
-  // ---------------------------------------------------------------
-  logic [4:0] instr_count;
+  logic [TRACE_LEN_WIDTH-1:0] instr_count;
   always_comb begin
     instr_count = '0;
     for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
@@ -251,7 +210,7 @@ module trace_cache_top (
         instr_count = instr_count + 1;
     end
   end
-  assign trace_length_o = trace_hit ? instr_count : 5'b0;
+  assign trace_length_o = trace_hit ? instr_count : '0;
 
   always_comb begin
     int instr_idx;
@@ -263,7 +222,7 @@ module trace_cache_top (
       if (hit_trace.valid_chunks[chunk_idx]) begin
         if (chunk_idx + 1 < CHUNKS_PER_TRACE && !hit_trace.valid_chunks[chunk_idx + 1]) begin
           trace_instructions_o[instr_idx] = {hit_trace.chunks[chunk_idx + 1],
-                                              hit_trace.chunks[chunk_idx]};
+                                             hit_trace.chunks[chunk_idx]};
           chunk_idx += 2;
         end else begin
           trace_instructions_o[instr_idx] = {16'b0, hit_trace.chunks[chunk_idx]};
@@ -276,30 +235,21 @@ module trace_cache_top (
     end
   end
 
-  // ---------------------------------------------------------------
-  // LRU update
-  // ---------------------------------------------------------------
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       for (int s = 0; s < (1 << TRACE_ADDRW); s++)
         lru[s] <= 1'b0;
     end else begin
-      // On hit: mark hitting way as MRU
       if (trace_hit)
         lru[lookup_set_q] <= hit_way_idx[0];
-      // On write: mark written way as MRU (takes priority if same set)
       if (mem_req_builder)
         lru[mem_addr_builder] <= wr_way;
     end
   end
 
-  // ---------------------------------------------------------------
-  // Debug & stats
-  // ---------------------------------------------------------------
 `ifndef SYNTHESIS
   always_ff @(posedge clk_i) begin
     if (lookup_valid_q) begin
-      // Check if any way has a valid entry
       logic any_valid;
       any_valid = 1'b0;
       for (int w = 0; w < NUM_WAYS; w++)
@@ -308,7 +258,6 @@ module trace_cache_top (
       if (trace_hit) begin
         $display("[TC-LOOKUP] HIT at 0x%h (way %0d)", lookup_pc_q, hit_way_idx);
       end else if (any_valid) begin
-        // Report the first valid way's stored PC for diagnostics
         for (int w = 0; w < NUM_WAYS; w++) begin
           if (trace_read[w].valid && !pc_match[w])
             $display("[TC-LOOKUP] PC MISS: stored=0x%h lookup=0x%h (way %0d)",
@@ -322,7 +271,6 @@ module trace_cache_top (
     end
   end
 
-  // Useful hit rate counters
   int unsigned tc_valid_lookups;
   int unsigned tc_useful_hits;
 

@@ -448,6 +448,13 @@ module frontend
   logic [SLOTS_PER_CYCLE-1:0]               tc_taken;
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
   logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
+  logic                                     tc_trace_hit;
+  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]      tc_trace_instructions;
+  logic [TRACE_LEN_WIDTH-1:0]                tc_trace_length;
+  logic [PC_WIDTH-1:0]                      tc_trace_next_pc;
+  logic                                     tc_lookup_valid_q;
+  logic [PC_WIDTH-1:0]                      tc_lookup_pc_q;
+  logic                                     tc_active_hit;
 
   for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
     assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
@@ -527,11 +534,32 @@ module frontend
     .branch_predictions_i   (tc_branch_predictions),
     .lookup_valid_i         (|instr_queue_consumed),
     .lookup_pc_i            (tc_pc[0]),
-    .trace_hit_o            (),
-    .trace_instructions_o   (),
-    .trace_length_o         (),
-    .trace_next_pc_o        ()
+    .trace_hit_o            (tc_trace_hit),
+    .trace_instructions_o   (tc_trace_instructions),
+    .trace_length_o         (tc_trace_length),
+    .trace_next_pc_o        (tc_trace_next_pc)
   );
+
+  // Frontend copy of lookup timing context, aligned with tc_trace_hit.
+  // This avoids depending on hierarchical references to trace_cache_top internals.
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      tc_lookup_valid_q <= 1'b0;
+      tc_lookup_pc_q    <= '0;
+    end else begin
+      tc_lookup_valid_q <= (|instr_queue_consumed) && !flush_i;
+      tc_lookup_pc_q    <= tc_pc[0] & {
+                            {(PC_WIDTH-CVA6Cfg.FETCH_ALIGN_BITS){1'b1}},
+                            {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}
+                          };
+    end
+  end
+
+  // Candidate active-mode replay event (timing-aligned only, no datapath mux yet).
+  assign tc_active_hit = tc_lookup_valid_q
+                       && tc_trace_hit
+                       && (tc_trace_length != '0)
+                       && !flush_i;
 
 // pragma translate_off
   logic         counting_active;
@@ -610,11 +638,11 @@ module frontend
         window_count <= window_count + 1;
       end
 
-      // Hit/miss counters — GATED by counting_active (CoreMark only)
+      // Hit/miss counters â?? GATED by counting_active (CoreMark only)
       if (counting_active) begin
-        if (i_trace_cache_top.trace_hit_o) begin
+        if (tc_trace_hit) begin
           tc_hits <= tc_hits + 1;
-        end else if (i_trace_cache_top.lookup_valid_q) begin
+        end else if (tc_lookup_valid_q) begin
           tc_misses <= tc_misses + 1;
         end
 
@@ -623,7 +651,7 @@ module frontend
         tc_had_taken_q <= |tc_taken && |instr_queue_consumed && !flush_i;
         if (tc_had_taken_q) begin
           tc_taken_lookups <= tc_taken_lookups + 1;
-          if (i_trace_cache_top.trace_hit_o)
+          if (tc_trace_hit)
             tc_taken_hits <= tc_taken_hits + 1;
         end
       end
@@ -646,6 +674,10 @@ always_ff @(posedge clk_i) begin
              tc_is_branch,
              tc_taken,
              tc_branch_predictions);
+  end
+  if (tc_active_hit) begin
+    $display("[TC-ACTIVE-CAND] pc=0x%h len=%0d next=0x%h",
+             tc_lookup_pc_q, tc_trace_length, tc_trace_next_pc);
   end
 end
 // pragma translate_on

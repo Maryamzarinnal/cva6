@@ -7,10 +7,16 @@ package trace_cache_pkg;
   // Max instructions per trace
   localparam int unsigned TRACE_LEN = 4;
 
-  // ——— Associativity ———
+  // Architectural instruction width
+  localparam int unsigned INSTR_WIDTH = 32;
+
+  // Bits to encode [0..TRACE_LEN] instruction count
+  localparam int unsigned TRACE_LEN_WIDTH = $clog2(TRACE_LEN + 1);
+
+  // Associativity
   localparam int unsigned NUM_WAYS = 2;
 
-  // With NUM_WAYS=2, TRACE_ADDRW=8: 2 × 256 = 512 total entries.
+  // With NUM_WAYS=2, TRACE_ADDRW=8: 2 x 256 = 512 total entries.
   localparam int unsigned TRACE_ADDRW = 8;
 
   // Global history register width
@@ -38,22 +44,16 @@ package trace_cache_pkg;
 
   localparam int unsigned BE_WIDTH = (TRACE_WIDTH + 7) / 8;
 
-  // One trace entry stored in SRAM.
-  // branch_flags records T/NT outcome for every branch in the trace,
-  // in order. Used both as the tag (for lookup matching) and as replay data.
   typedef struct packed {
     logic                              valid;
     logic [PC_WIDTH-1:0]               base_pc;
-    logic [CHUNKS_PER_TRACE-1:0]       branch_flags;   // T/NT per branch, across all windows
+    logic [CHUNKS_PER_TRACE-1:0]       branch_flags;
     logic [BR_CNT_WIDTH-1:0]           num_branches;
-    logic [PC_WIDTH-1:0]               target_addr;    // fetch target after trace ends
+    logic [PC_WIDTH-1:0]               target_addr;
     logic [CHUNKS_PER_TRACE-1:0][15:0] chunks;
-    logic [CHUNKS_PER_TRACE-1:0]       valid_chunks;   // 1 = start of instruction
+    logic [CHUNKS_PER_TRACE-1:0]       valid_chunks;
   } trace_data_t;
 
-  // Set index: XOR-folded PC hash with masked branch predictions.
-  // Three folds of the PC (bits 4..27 for TRACE_ADDRW=8) plus the first
-  // TC_INDEX_FLAG_BITS of branch_flags to separate prediction paths.
   localparam int unsigned TC_INDEX_FLAG_BITS = 2;
 
   function automatic logic [TRACE_ADDRW-1:0] tc_index(
