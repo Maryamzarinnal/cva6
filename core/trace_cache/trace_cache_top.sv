@@ -31,10 +31,12 @@ module trace_cache_top (
   input  logic [PC_WIDTH-1:0] lookup_pc_i,
 
   // Lookup results
-  output logic                                        trace_hit_o,
-  output logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]      trace_instructions_o,
-  output logic [TRACE_LEN_WIDTH-1:0]                 trace_length_o,
-  output logic [PC_WIDTH-1:0]                        trace_next_pc_o
+  output logic                                   trace_hit_o,
+  output logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]  trace_instructions_o,
+  output logic [TRACE_LEN_WIDTH-1:0]             trace_length_o,
+  output logic [PC_WIDTH-1:0]                    trace_next_pc_o,
+  output logic [CHUNKS_PER_TRACE-1:0][15:0]      trace_chunks_o,
+  output logic [CHUNKS_PER_TRACE-1:0]            trace_valid_chunks_o
 );
 
   tracebuilder_instr_if instr_if (
@@ -199,14 +201,17 @@ module trace_cache_top (
   end
 
   trace_data_t hit_trace;
-  assign hit_trace       = trace_read[hit_way_idx];
-  assign trace_next_pc_o = hit_trace.target_addr;
+  assign hit_trace            = trace_read[hit_way_idx];
+  assign trace_next_pc_o      = hit_trace.target_addr;
+  assign trace_chunks_o       = trace_hit ? hit_trace.chunks       : '0;
+  assign trace_valid_chunks_o = trace_hit ? hit_trace.valid_chunks : '0;
 
+  // Clamp exported instruction length to TRACE_LEN (4 slots path).
   logic [TRACE_LEN_WIDTH-1:0] instr_count;
   always_comb begin
     instr_count = '0;
     for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
-      if (hit_trace.valid_chunks[i])
+      if (hit_trace.valid_chunks[i] && instr_count < TRACE_LEN_WIDTH'(TRACE_LEN))
         instr_count = instr_count + 1;
     end
   end

@@ -449,8 +449,10 @@ module frontend
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
   logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
   logic                                     tc_trace_hit;
-  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]      tc_trace_instructions;
-  logic [TRACE_LEN_WIDTH-1:0]                tc_trace_length;
+  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]    tc_trace_instructions;
+  logic [TRACE_LEN_WIDTH-1:0]               tc_trace_length;
+  logic [CHUNKS_PER_TRACE-1:0][15:0]        tc_trace_chunks;
+  logic [CHUNKS_PER_TRACE-1:0]              tc_trace_valid_chunks;
   logic [PC_WIDTH-1:0]                      tc_trace_next_pc;
   logic                                     tc_lookup_valid_q;
   logic [PC_WIDTH-1:0]                      tc_lookup_pc_q;
@@ -537,6 +539,8 @@ module frontend
     .trace_hit_o            (tc_trace_hit),
     .trace_instructions_o   (tc_trace_instructions),
     .trace_length_o         (tc_trace_length),
+    .trace_chunks_o         (tc_trace_chunks),
+    .trace_valid_chunks_o   (tc_trace_valid_chunks)
     .trace_next_pc_o        (tc_trace_next_pc)
   );
 
