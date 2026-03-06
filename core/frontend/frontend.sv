@@ -577,6 +577,7 @@ module frontend
   int unsigned  tc_taken_lookups;  // windows with a taken branch (active-mode denominator)
   int unsigned  tc_taken_hits;     // hits among those windows
   logic         tc_had_taken_q;    // pipelined |tc_taken for alignment with trace_hit_o
+  logic [TRACE_LEN_WIDTH-1:0] tc_active_chunk_starts; // ADDED: number of starts in valid-chunk mask
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -670,6 +671,16 @@ module frontend
 
     end
   end
+
+  // ADDED: debug-only reconstruction count from chunk start bits.
+  always_comb begin
+    tc_active_chunk_starts = '0;
+    for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
+      if (tc_trace_valid_chunks[i] && tc_active_chunk_starts < TRACE_LEN_WIDTH'(TRACE_LEN))
+        tc_active_chunk_starts = tc_active_chunk_starts + 1'b1;
+    end
+  end
+
 always_ff @(posedge clk_i) begin
   if (icache_valid_q && icache_vaddr_q == 'h80000310) begin
     $display("[TC-DEBUG] fetch=0x%h valid=%b is_branch=%b taken=%b pred=%b",
@@ -682,6 +693,13 @@ always_ff @(posedge clk_i) begin
   if (tc_active_hit) begin
     $display("[TC-ACTIVE-CAND] pc=0x%h len=%0d next=0x%h",
              tc_lookup_pc_q, tc_trace_length, tc_trace_next_pc);
+
+    // ADDED: chunk mask and raw chunk payload for hit inspection.
+    $display("[TC-ACTIVE-CHUNKS] vmask=%b starts=%0d",
+             tc_trace_valid_chunks, tc_active_chunk_starts);
+    $display("[TC-ACTIVE-CHUNKS] c0=%h c1=%h c2=%h c3=%h c4=%h c5=%h c6=%h c7=%h",
+             tc_trace_chunks[0], tc_trace_chunks[1], tc_trace_chunks[2], tc_trace_chunks[3],
+             tc_trace_chunks[4], tc_trace_chunks[5], tc_trace_chunks[6], tc_trace_chunks[7]);
   end
 end
 // pragma translate_on
