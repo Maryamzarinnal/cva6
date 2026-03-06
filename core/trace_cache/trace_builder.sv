@@ -410,9 +410,15 @@ module trace_builder (
       dbg = trace_data_t'(commit_data_q);
 
       if (dbg.target_addr == dbg.base_pc) begin
-        $display("[TC-WARN] target==base_pc base=0x%h target=0x%h",
-                 dbg.base_pc, dbg.target_addr);
+        if (dbg.num_branches != '0) begin
+          $display("[TC-LOOP] target==base_pc (likely legal loop) base=0x%h target=0x%h branches=%0d",
+                   dbg.base_pc, dbg.target_addr, dbg.num_branches);
+        end else begin
+          $display("[TC-BUG] target==base_pc but no branch in tag base=0x%h target=0x%h",
+                   dbg.base_pc, dbg.target_addr);
+        end
       end
+
       if (dbg.target_addr == last_instr_pc_q) begin
         $display("[TC-WARN] target==last_instr_pc base=0x%h last_pc=0x%h target=0x%h",
                  dbg.base_pc, last_instr_pc_q, dbg.target_addr);
@@ -444,5 +450,6 @@ module trace_builder (
     end
   end
 `endif
+
 
 endmodule
