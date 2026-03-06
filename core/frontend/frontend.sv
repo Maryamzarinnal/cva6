@@ -540,7 +540,7 @@ module frontend
     .trace_instructions_o   (tc_trace_instructions),
     .trace_length_o         (tc_trace_length),
     .trace_chunks_o         (tc_trace_chunks),
-    .trace_valid_chunks_o   (tc_trace_valid_chunks)
+    .trace_valid_chunks_o   (tc_trace_valid_chunks),
     .trace_next_pc_o        (tc_trace_next_pc)
   );
 
