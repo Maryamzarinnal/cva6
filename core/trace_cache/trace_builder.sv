@@ -78,7 +78,7 @@ module trace_builder (
   localparam int unsigned MAX_TAKEN = 3;
 
   // Per-set duplicate filter: remembers the last committed (pc, flags) for each
-  // set index. Catches the interleaving pattern (A→B→A→B) that a single-entry
+  // set index. Catches the interleaving pattern (A?B?A?B) that a single-entry
   // filter misses, eliminating thousands of redundant SRAM writes.
   logic                        dup_valid [(1 << TRACE_ADDRW)];
   logic [PC_WIDTH-1:0]         dup_pc    [(1 << TRACE_ADDRW)];
@@ -408,6 +408,16 @@ module trace_builder (
     if (commit_valid_q) begin
       trace_data_t dbg;
       dbg = trace_data_t'(commit_data_q);
+
+      if (dbg.target_addr == dbg.base_pc) begin
+        $display("[TC-WARN] target==base_pc base=0x%h target=0x%h",
+                 dbg.base_pc, dbg.target_addr);
+      end
+      if (dbg.target_addr == last_instr_pc_q) begin
+        $display("[TC-WARN] target==last_instr_pc base=0x%h last_pc=0x%h target=0x%h",
+                 dbg.base_pc, last_instr_pc_q, dbg.target_addr);
+      end
+
       $display("[TC-BUILDER] ---- TRACE COMMITTED (non-duplicate) ----");
       $display("[TC-BUILDER]   SRAM addr  = %0d", sram_wr_addr_q);
       $display("[TC-BUILDER]   base_pc    = 0x%h", dbg.base_pc);
