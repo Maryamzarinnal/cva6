@@ -84,10 +84,10 @@ module frontend
   logic                                    replay;
   logic [CVA6Cfg.VLEN-1:0]                 replay_addr;
 
-  // Trace-cache control used by npc_select (active mode step 1)
   logic [PC_WIDTH-1:0]                     tc_trace_next_pc;
   logic                                    tc_active_hit;
   logic                                    tc_active_use;
+  localparam logic [PC_WIDTH-1:0]          TC_ACTIVE_TEST_PC = 64'h0000_0000_0000_0840;
 
   logic [$clog2(CVA6Cfg.INSTR_PER_FETCH)-1:0] shamt;
   if (CVA6Cfg.RVC) begin : gen_shamt
@@ -263,8 +263,7 @@ module frontend
     if (if_ready)
       npc_d = {fetch_address[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] + 1, {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}};
 
-    // Active mode step 1: allow TC hit to redirect next fetch PC.
-    // Higher-priority redirects below (replay/mispredict/eret/exception/debug) still win.
+    // Active mode test: only one known-safe PC.
     if (tc_active_use)
       npc_d = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
 
@@ -448,10 +447,6 @@ module frontend
       .fetch_entry_ready_i(fetch_entry_ready_i)
   );
 
-  // ---------------------------------------------------------------
-  // Trace cache integration - passive recording + lookup
-  // ---------------------------------------------------------------
-
   logic [SLOTS_PER_CYCLE-1:0]               tc_instr_valid;
   logic [SLOTS_PER_CYCLE-1:0][31:0]         tc_instr;
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_pc;
@@ -487,7 +482,6 @@ module frontend
     end
   end
 
-  // Mask tc_taken after first taken control flow ? only one redirect per cycle
   always_comb begin
     logic found_taken;
     found_taken = 1'b0;
@@ -507,7 +501,6 @@ module frontend
     end
   end
 
-  // Branch prediction vector - mirrors tc_is_branch, used for lookup tag comparison
   always_comb begin
     integer br_idx;
     tc_branch_predictions = '0;
@@ -553,8 +546,6 @@ module frontend
     .trace_next_pc_o        (tc_trace_next_pc)
   );
 
-  // Frontend copy of lookup timing context, aligned with tc_trace_hit.
-  // This avoids depending on hierarchical references to trace_cache_top internals.
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       tc_lookup_valid_q <= 1'b0;
@@ -568,14 +559,13 @@ module frontend
     end
   end
 
-  // Candidate active-mode replay event (timing-aligned)
   assign tc_active_hit = tc_lookup_valid_q
                        && tc_trace_hit
                        && (tc_trace_length != '0)
                        && !flush_i;
 
-  // Active-use signal used by npc_select (first functional step)
-  assign tc_active_use = tc_active_hit;
+  assign tc_active_use = tc_active_hit
+                      && (tc_lookup_pc_q == TC_ACTIVE_TEST_PC);
 
 // pragma translate_off
   logic         counting_active;
@@ -651,7 +641,6 @@ module frontend
         window_count <= window_count + 1;
       end
 
-      // Hit/miss counters - gated by counting_active (CoreMark only)
       if (counting_active) begin
         if (tc_trace_hit) begin
           tc_hits <= tc_hits + 1;
@@ -685,6 +674,9 @@ module frontend
   end
 
   always_ff @(posedge clk_i) begin
+    if (tc_active_use) begin
+      $display("[TC-ACTIVE-USE] pc=0x%h next=0x%h", tc_lookup_pc_q, tc_trace_next_pc);
+    end
     if (icache_valid_q && icache_vaddr_q == 'h80000310) begin
       $display("[TC-DEBUG] fetch=0x%h valid=%b is_branch=%b taken=%b pred=%b",
                icache_vaddr_q,
