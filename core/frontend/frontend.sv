@@ -84,6 +84,14 @@ module frontend
   logic                                    replay;
   logic [CVA6Cfg.VLEN-1:0]                 replay_addr;
 
+  // Trace-cache outputs/state used across the module (declared early to avoid forward-reference issues)
+  logic                                    tc_trace_hit;
+  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   tc_trace_instructions;
+  logic [TRACE_LEN_WIDTH-1:0]              tc_trace_length;
+  logic [CHUNKS_PER_TRACE-1:0][15:0]       tc_trace_chunks;
+  logic [CHUNKS_PER_TRACE-1:0]             tc_trace_valid_chunks;
+  logic                                    tc_lookup_valid_q;
+  logic [PC_WIDTH-1:0]                     tc_lookup_pc_q;
   logic [PC_WIDTH-1:0]                     tc_trace_next_pc;
   logic                                    tc_active_use;
   logic                                    tc_active_hit;
@@ -361,24 +369,24 @@ module frontend
   // Mux source into instr_queue
   always_comb begin
     if (tc_replay_active_q) begin
-      instr_to_iq          = replay_instr_iq;
-      addr_to_iq           = replay_addr_iq;
-      valid_to_iq          = replay_valid_iq;
-      cf_type_to_iq        = replay_cf_type_iq;
-      predict_addr_to_iq   = replay_predict_addr_iq;
-      exception_to_iq      = ariane_pkg::FE_NONE;
-      exception_addr_to_iq = '0;
+      instr_to_iq            = replay_instr_iq;
+      addr_to_iq             = replay_addr_iq;
+      valid_to_iq            = replay_valid_iq;
+      cf_type_to_iq          = replay_cf_type_iq;
+      predict_addr_to_iq     = replay_predict_addr_iq;
+      exception_to_iq        = ariane_pkg::FE_NONE;
+      exception_addr_to_iq   = '0;
       exception_gpaddr_to_iq = '0;
       exception_tinst_to_iq  = '0;
       exception_gva_to_iq    = 1'b0;
     end else begin
-      instr_to_iq          = instr;
-      addr_to_iq           = addr;
-      valid_to_iq          = instruction_valid;
-      cf_type_to_iq        = cf_type;
-      predict_addr_to_iq   = predict_address;
-      exception_to_iq      = icache_ex_valid_q;
-      exception_addr_to_iq = icache_vaddr_q;
+      instr_to_iq            = instr;
+      addr_to_iq             = addr;
+      valid_to_iq            = instruction_valid;
+      cf_type_to_iq          = cf_type;
+      predict_addr_to_iq     = predict_address;
+      exception_to_iq        = icache_ex_valid_q;
+      exception_addr_to_iq   = icache_vaddr_q;
       exception_gpaddr_to_iq = icache_gpaddr_q;
       exception_tinst_to_iq  = icache_tinst_q;
       exception_gva_to_iq    = icache_gva_q;
@@ -596,12 +604,6 @@ module frontend
   logic [SLOTS_PER_CYCLE-1:0]               tc_taken;
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
   logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
-  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]    tc_trace_instructions;
-  logic [TRACE_LEN_WIDTH-1:0]               tc_trace_length;
-  logic [CHUNKS_PER_TRACE-1:0][15:0]        tc_trace_chunks;
-  logic [CHUNKS_PER_TRACE-1:0]              tc_trace_valid_chunks;
-  logic                                     tc_lookup_valid_q;
-  logic [PC_WIDTH-1:0]                      tc_lookup_pc_q;
 
   for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
     assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
