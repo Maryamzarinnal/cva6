@@ -97,10 +97,11 @@ module frontend
   logic                                    tc_active_hit;
   logic                                    tc_active_pc_match;
 
-  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC0 = PC_WIDTH'(64'h0000000000000840);
-  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC1 = PC_WIDTH'(64'h0000000080000230);
-  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC2 = PC_WIDTH'(64'h0000000080000340);
-
+  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC0 = PC_WIDTH'(64'h0000000080002880);
+  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC1 = PC_WIDTH'(64'h0000000080000510);
+  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC2 = PC_WIDTH'(64'h0000000080000500);
+  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC3 = PC_WIDTH'(64'h0000000080000590);
+  
   // Replay state (test-mode)
   logic                                    tc_replay_active_q, tc_replay_active_d;
   logic [TRACE_LEN_WIDTH-1:0]              tc_replay_len_q, tc_replay_len_d;
@@ -708,7 +709,8 @@ module frontend
 
   assign tc_active_pc_match = (tc_lookup_pc_q == TC_ACTIVE_PC0)
                            || (tc_lookup_pc_q == TC_ACTIVE_PC1)
-                           || (tc_lookup_pc_q == TC_ACTIVE_PC2);
+                           || (tc_lookup_pc_q == TC_ACTIVE_PC2)
+                           || (tc_lookup_pc_q == TC_ACTIVE_PC3);
 
   assign tc_active_use = tc_active_hit
                       && tc_active_pc_match
