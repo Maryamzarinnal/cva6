@@ -562,10 +562,7 @@ module frontend
       tc_lookup_pc_q    <= '0;
     end else begin
       tc_lookup_valid_q <= (|instr_queue_consumed) && !flush_i;
-      tc_lookup_pc_q    <= tc_pc[0] & {
-                            {(PC_WIDTH-CVA6Cfg.FETCH_ALIGN_BITS){1'b1}},
-                            {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}
-                          };
+      tc_lookup_pc_q    <= tc_pc[0] & {{(PC_WIDTH-4){1'b1}}, 4'b0000};
     end
   end
 
