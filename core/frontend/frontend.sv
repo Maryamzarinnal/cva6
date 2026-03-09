@@ -83,11 +83,9 @@ module frontend
   logic                                    npc_rst_load_q;
   logic                                    replay;
   logic [CVA6Cfg.VLEN-1:0]                 replay_addr;
-
   logic [PC_WIDTH-1:0]                     tc_trace_next_pc;
-  logic                                    tc_active_hit;
   logic                                    tc_active_use;
-  localparam logic [PC_WIDTH-1:0]          TC_ACTIVE_TEST_PC = 64'h0000_0000_0000_0840;
+  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_TEST_PC = PC_WIDTH'(64'h0000000000000840);
 
   logic [$clog2(CVA6Cfg.INSTR_PER_FETCH)-1:0] shamt;
   if (CVA6Cfg.RVC) begin : gen_shamt
@@ -260,13 +258,13 @@ module frontend
       fetch_address = predict_address;
       npc_d         = predict_address;
     end
+    // Step-1 active replay check: redirect only for the selected test PC.
+    if (tc_active_use) begin
+      fetch_address = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
+      npc_d         = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
+    end
     if (if_ready)
       npc_d = {fetch_address[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] + 1, {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}};
-
-    // Active mode test: only one known-safe PC.
-    if (tc_active_use)
-      npc_d = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
-
     if (replay)
       npc_d = replay_addr;
     if (is_mispredict)
@@ -447,6 +445,10 @@ module frontend
       .fetch_entry_ready_i(fetch_entry_ready_i)
   );
 
+  // ---------------------------------------------------------------
+  // Trace cache integration - passive recording + lookup
+  // ---------------------------------------------------------------
+
   logic [SLOTS_PER_CYCLE-1:0]               tc_instr_valid;
   logic [SLOTS_PER_CYCLE-1:0][31:0]         tc_instr;
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_pc;
@@ -455,12 +457,13 @@ module frontend
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
   logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
   logic                                     tc_trace_hit;
-  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]    tc_trace_instructions;
-  logic [TRACE_LEN_WIDTH-1:0]               tc_trace_length;
-  logic [CHUNKS_PER_TRACE-1:0][15:0]        tc_trace_chunks;
-  logic [CHUNKS_PER_TRACE-1:0]              tc_trace_valid_chunks;
+  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]      tc_trace_instructions;
+  logic [TRACE_LEN_WIDTH-1:0]                tc_trace_length;
+  logic [CHUNKS_PER_TRACE-1:0][15:0]         tc_trace_chunks;
+  logic [CHUNKS_PER_TRACE-1:0]               tc_trace_valid_chunks;
   logic                                     tc_lookup_valid_q;
   logic [PC_WIDTH-1:0]                      tc_lookup_pc_q;
+  logic                                     tc_active_hit;
 
   for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
     assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
@@ -482,6 +485,7 @@ module frontend
     end
   end
 
+  // Mask tc_taken after first taken control flow ? only one redirect per cycle
   always_comb begin
     logic found_taken;
     found_taken = 1'b0;
@@ -501,6 +505,7 @@ module frontend
     end
   end
 
+  // Branch prediction vector - mirrors tc_is_branch, used for lookup tag comparison
   always_comb begin
     integer br_idx;
     tc_branch_predictions = '0;
@@ -546,6 +551,8 @@ module frontend
     .trace_next_pc_o        (tc_trace_next_pc)
   );
 
+  // Frontend copy of lookup timing context, aligned with tc_trace_hit.
+  // This avoids depending on hierarchical references to trace_cache_top internals.
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       tc_lookup_valid_q <= 1'b0;
@@ -559,13 +566,16 @@ module frontend
     end
   end
 
+  // Candidate active-mode replay event (timing-aligned only, no datapath mux yet).
   assign tc_active_hit = tc_lookup_valid_q
                        && tc_trace_hit
                        && (tc_trace_length != '0)
                        && !flush_i;
 
+  // Step-1 active mode: only allow one known-safe loop PC while validating control behavior.
   assign tc_active_use = tc_active_hit
-                      && (tc_lookup_pc_q == TC_ACTIVE_TEST_PC);
+                      && (tc_lookup_pc_q == TC_ACTIVE_TEST_PC)
+                      && (tc_trace_next_pc != tc_lookup_pc_q);
 
 // pragma translate_off
   logic         counting_active;
@@ -576,10 +586,9 @@ module frontend
   int unsigned  window_count;
   int unsigned  tc_hits;
   int unsigned  tc_misses;
-  int unsigned  tc_taken_lookups;
-  int unsigned  tc_taken_hits;
-  logic         tc_had_taken_q;
-  logic [TRACE_LEN_WIDTH-1:0] tc_active_chunk_starts;
+  int unsigned  tc_taken_lookups;  // windows with a taken branch (active-mode denominator)
+  int unsigned  tc_taken_hits;     // hits among those windows
+  logic         tc_had_taken_q;    // pipelined |tc_taken for alignment with trace_hit_o
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -597,6 +606,8 @@ module frontend
       tc_taken_hits    <= 0;
       tc_had_taken_q   <= 1'b0;
     end else begin
+
+      // CoreMark gating
       if (pc_commit_i == 64'h80001568) begin
         counting_active <= 1'b1;
         stats_printed   <= 1'b0;
@@ -615,6 +626,7 @@ module frontend
         for (int i = 0; i <= SLOTS_PER_CYCLE; i++)
           $display("[BENCH-STATS]   %0d total: %0d", i, total_branch_hist[i]);
 
+        // Benchmark-gated trace cache stats
         $display("\n[BENCH-TC] === Trace Cache (CoreMark only) ===");
         $display("[BENCH-TC] hits=%0d misses=%0d rate=%0d%%",
                  tc_hits, tc_misses,
@@ -624,6 +636,7 @@ module frontend
                  tc_taken_lookups > 0 ? (tc_taken_hits * 100) / tc_taken_lookups : 0);
       end
 
+      // Branch histogram (CoreMark-gated)
       if (counting_active && |tc_instr_valid) begin
         automatic int unsigned taken_count        = 0;
         automatic int unsigned not_taken_count    = 0;
@@ -641,6 +654,7 @@ module frontend
         window_count <= window_count + 1;
       end
 
+      // Hit/miss counters Ã¢?? GATED by counting_active (CoreMark only)
       if (counting_active) begin
         if (tc_trace_hit) begin
           tc_hits <= tc_hits + 1;
@@ -648,6 +662,8 @@ module frontend
           tc_misses <= tc_misses + 1;
         end
 
+        // Taken-only counters: track hits among windows that have a taken branch.
+        // tc_taken must be pipelined by 1 cycle to align with trace_hit_o
         tc_had_taken_q <= |tc_taken && |instr_queue_consumed && !flush_i;
         if (tc_had_taken_q) begin
           tc_taken_lookups <= tc_taken_lookups + 1;
@@ -656,45 +672,44 @@ module frontend
         end
       end
 
+      // Print running totals on every trace commit (ungated, for debug)
       if (i_trace_cache_top.i_trace_builder.commit_valid_q) begin
+        int unsigned tc_taken_rate;
+        tc_taken_rate = 0;
+        if (tc_taken_lookups > 0)
+          tc_taken_rate = (tc_taken_hits * 100) / tc_taken_lookups;
         $display("[TC-STATS] hits=%0d misses=%0d", tc_hits, tc_misses);
         $display("[TC-TAKEN] taken_lookups=%0d taken_hits=%0d rate=%0d%%",
-                 tc_taken_lookups, tc_taken_hits,
-                 tc_taken_lookups > 0 ? (tc_taken_hits * 100) / tc_taken_lookups : 0);
+                 tc_taken_lookups, tc_taken_hits, tc_taken_rate);
       end
-    end
-  end
 
-  always_comb begin
-    tc_active_chunk_starts = '0;
-    for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
-      if (tc_trace_valid_chunks[i] && tc_active_chunk_starts < TRACE_LEN_WIDTH'(TRACE_LEN))
-        tc_active_chunk_starts = tc_active_chunk_starts + 1'b1;
     end
   end
-
-  always_ff @(posedge clk_i) begin
-    if (tc_active_use) begin
-      $display("[TC-ACTIVE-USE] pc=0x%h next=0x%h", tc_lookup_pc_q, tc_trace_next_pc);
-    end
-    if (icache_valid_q && icache_vaddr_q == 'h80000310) begin
-      $display("[TC-DEBUG] fetch=0x%h valid=%b is_branch=%b taken=%b pred=%b",
-               icache_vaddr_q,
-               instruction_valid,
-               tc_is_branch,
-               tc_taken,
-               tc_branch_predictions);
-    end
-    if (tc_active_hit) begin
-      $display("[TC-ACTIVE-CAND] pc=0x%h len=%0d next=0x%h",
-               tc_lookup_pc_q, tc_trace_length, tc_trace_next_pc);
-      $display("[TC-ACTIVE-CHUNKS] vmask=%b starts=%0d",
-               tc_trace_valid_chunks, tc_active_chunk_starts);
-      $display("[TC-ACTIVE-CHUNKS] c0=%h c1=%h c2=%h c3=%h c4=%h c5=%h c6=%h c7=%h",
-               tc_trace_chunks[0], tc_trace_chunks[1], tc_trace_chunks[2], tc_trace_chunks[3],
-               tc_trace_chunks[4], tc_trace_chunks[5], tc_trace_chunks[6], tc_trace_chunks[7]);
-    end
+always_ff @(posedge clk_i) begin
+  if (icache_valid_q && icache_vaddr_q == 'h80000310) begin
+    $display("[TC-DEBUG] fetch=0x%h valid=%b is_branch=%b taken=%b pred=%b",
+             icache_vaddr_q,
+             instruction_valid,
+             tc_is_branch,
+             tc_taken,
+             tc_branch_predictions);
   end
+  if (tc_active_hit) begin
+    int starts;
+    starts = 0;
+    for (int k = 0; k < CHUNKS_PER_TRACE; k++)
+      if (tc_trace_valid_chunks[k]) starts++;
+    $display("[TC-ACTIVE-CAND] pc=0x%h len=%0d next=0x%h",
+             tc_lookup_pc_q, tc_trace_length, tc_trace_next_pc);
+    $display("[TC-ACTIVE-CHUNKS] vmask=%b starts=%0d", tc_trace_valid_chunks, starts);
+    $display("[TC-ACTIVE-CHUNKS] c0=%h c1=%h c2=%h c3=%h c4=%h c5=%h c6=%h c7=%h",
+             tc_trace_chunks[0], tc_trace_chunks[1], tc_trace_chunks[2], tc_trace_chunks[3],
+             tc_trace_chunks[4], tc_trace_chunks[5], tc_trace_chunks[6], tc_trace_chunks[7]);
+  end
+  if (tc_active_use) begin
+    $display("[TC-ACTIVE-USE] pc=0x%h -> next=0x%h", tc_lookup_pc_q, tc_trace_next_pc);
+  end
+end
 // pragma translate_on
 
 endmodule
