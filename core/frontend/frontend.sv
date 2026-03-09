@@ -813,7 +813,7 @@ module frontend
                icache_vaddr_q, instruction_valid, tc_is_branch, tc_taken, tc_branch_predictions);
     end
 
-    if (tc_active_hit) begin
+    if (tc_active_hit && tc_active_pc_match) begin
       int starts;
       starts = 0;
       for (int k = 0; k < CHUNKS_PER_TRACE; k++)
@@ -826,7 +826,7 @@ module frontend
                tc_trace_chunks[4], tc_trace_chunks[5], tc_trace_chunks[6], tc_trace_chunks[7]);
     end
 
-    if (tc_active_hit && !tc_active_use) begin
+    if (tc_active_hit && !tc_active_use && tc_active_pc_match) begin
       $display("[TC-ACTIVE-BLOCK] pc=0x%h match=%0b linear=%0b self=%0b replay=%0b len=%0d next=0x%h",
                tc_lookup_pc_q,
                tc_active_pc_match,
