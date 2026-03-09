@@ -85,7 +85,10 @@ module frontend
   logic [CVA6Cfg.VLEN-1:0]                 replay_addr;
   logic [PC_WIDTH-1:0]                     tc_trace_next_pc;
   logic                                    tc_active_use;
-  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_TEST_PC = PC_WIDTH'(64'h0000000000000840);
+  logic                                    tc_active_pc_match;
+  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC0 = PC_WIDTH'(64'h0000000000000840);
+  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC1 = PC_WIDTH'(64'h0000000080000230);
+  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC2 = PC_WIDTH'(64'h0000000080000340);
 
   logic [$clog2(CVA6Cfg.INSTR_PER_FETCH)-1:0] shamt;
   if (CVA6Cfg.RVC) begin : gen_shamt
@@ -258,7 +261,7 @@ module frontend
       fetch_address = predict_address;
       npc_d         = predict_address;
     end
-    // Step-1 active replay check: redirect only for the selected test PC.
+    // Step-2 active replay check: redirect only for whitelisted PCs.
     if (tc_active_use) begin
       fetch_address = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
       npc_d         = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
@@ -457,10 +460,10 @@ module frontend
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
   logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
   logic                                     tc_trace_hit;
-  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]      tc_trace_instructions;
-  logic [TRACE_LEN_WIDTH-1:0]                tc_trace_length;
-  logic [CHUNKS_PER_TRACE-1:0][15:0]         tc_trace_chunks;
-  logic [CHUNKS_PER_TRACE-1:0]               tc_trace_valid_chunks;
+  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]    tc_trace_instructions;
+  logic [TRACE_LEN_WIDTH-1:0]               tc_trace_length;
+  logic [CHUNKS_PER_TRACE-1:0][15:0]        tc_trace_chunks;
+  logic [CHUNKS_PER_TRACE-1:0]              tc_trace_valid_chunks;
   logic                                     tc_lookup_valid_q;
   logic [PC_WIDTH-1:0]                      tc_lookup_pc_q;
   logic                                     tc_active_hit;
@@ -572,9 +575,13 @@ module frontend
                        && (tc_trace_length != '0)
                        && !flush_i;
 
-  // Step-1 active mode: only allow one known-safe loop PC while validating control behavior.
+  // Step-2 active mode: small whitelist for controlled bring-up.
+  assign tc_active_pc_match = (tc_lookup_pc_q == TC_ACTIVE_PC0)
+                           || (tc_lookup_pc_q == TC_ACTIVE_PC1)
+                           || (tc_lookup_pc_q == TC_ACTIVE_PC2);
+
   assign tc_active_use = tc_active_hit
-                      && (tc_lookup_pc_q == TC_ACTIVE_TEST_PC)
+                      && tc_active_pc_match
                       && (tc_trace_next_pc != tc_lookup_pc_q);
 
 // pragma translate_off
@@ -654,7 +661,7 @@ module frontend
         window_count <= window_count + 1;
       end
 
-      // Hit/miss counters Ã¢?? GATED by counting_active (CoreMark only)
+      // Hit/miss counters GATED by counting_active (CoreMark only)
       if (counting_active) begin
         if (tc_trace_hit) begin
           tc_hits <= tc_hits + 1;
@@ -685,31 +692,32 @@ module frontend
 
     end
   end
-always_ff @(posedge clk_i) begin
-  if (icache_valid_q && icache_vaddr_q == 'h80000310) begin
-    $display("[TC-DEBUG] fetch=0x%h valid=%b is_branch=%b taken=%b pred=%b",
-             icache_vaddr_q,
-             instruction_valid,
-             tc_is_branch,
-             tc_taken,
-             tc_branch_predictions);
+
+  always_ff @(posedge clk_i) begin
+    if (icache_valid_q && tc_active_pc_match) begin
+      $display("[TC-DEBUG] fetch=0x%h valid=%b is_branch=%b taken=%b pred=%b",
+               icache_vaddr_q,
+               instruction_valid,
+               tc_is_branch,
+               tc_taken,
+               tc_branch_predictions);
+    end
+    if (tc_active_hit) begin
+      int starts;
+      starts = 0;
+      for (int k = 0; k < CHUNKS_PER_TRACE; k++)
+        if (tc_trace_valid_chunks[k]) starts++;
+      $display("[TC-ACTIVE-CAND] pc=0x%h len=%0d next=0x%h",
+               tc_lookup_pc_q, tc_trace_length, tc_trace_next_pc);
+      $display("[TC-ACTIVE-CHUNKS] vmask=%b starts=%0d", tc_trace_valid_chunks, starts);
+      $display("[TC-ACTIVE-CHUNKS] c0=%h c1=%h c2=%h c3=%h c4=%h c5=%h c6=%h c7=%h",
+               tc_trace_chunks[0], tc_trace_chunks[1], tc_trace_chunks[2], tc_trace_chunks[3],
+               tc_trace_chunks[4], tc_trace_chunks[5], tc_trace_chunks[6], tc_trace_chunks[7]);
+    end
+    if (tc_active_use) begin
+      $display("[TC-ACTIVE-USE] pc=0x%h -> next=0x%h", tc_lookup_pc_q, tc_trace_next_pc);
+    end
   end
-  if (tc_active_hit) begin
-    int starts;
-    starts = 0;
-    for (int k = 0; k < CHUNKS_PER_TRACE; k++)
-      if (tc_trace_valid_chunks[k]) starts++;
-    $display("[TC-ACTIVE-CAND] pc=0x%h len=%0d next=0x%h",
-             tc_lookup_pc_q, tc_trace_length, tc_trace_next_pc);
-    $display("[TC-ACTIVE-CHUNKS] vmask=%b starts=%0d", tc_trace_valid_chunks, starts);
-    $display("[TC-ACTIVE-CHUNKS] c0=%h c1=%h c2=%h c3=%h c4=%h c5=%h c6=%h c7=%h",
-             tc_trace_chunks[0], tc_trace_chunks[1], tc_trace_chunks[2], tc_trace_chunks[3],
-             tc_trace_chunks[4], tc_trace_chunks[5], tc_trace_chunks[6], tc_trace_chunks[7]);
-  end
-  if (tc_active_use) begin
-    $display("[TC-ACTIVE-USE] pc=0x%h -> next=0x%h", tc_lookup_pc_q, tc_trace_next_pc);
-  end
-end
 // pragma translate_on
 
 endmodule
