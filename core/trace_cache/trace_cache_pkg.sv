@@ -4,13 +4,9 @@ package trace_cache_pkg;
 
   localparam int unsigned SLOTS_PER_CYCLE = 4;
 
-  // Max instructions per trace
+  // Max instructions replayed from one trace
   localparam int unsigned TRACE_LEN = 4;
-
-  // Architectural instruction width
   localparam int unsigned INSTR_WIDTH = 32;
-
-  // Bits to encode [0..TRACE_LEN] instruction count
   localparam int unsigned TRACE_LEN_WIDTH = $clog2(TRACE_LEN + 1);
 
   // Associativity
@@ -27,31 +23,33 @@ package trace_cache_pkg;
 
   // Each instruction is stored in 16-bit chunks.
   // 32-bit inst = 2 chunks, compressed = 1 chunk.
-  // Worst case (all compressed): TRACE_LEN * 2 chunks.
+  // Worst case for 4 starts is 8 chunks.
   localparam int unsigned CHUNKS_PER_TRACE = TRACE_LEN * 2;
 
   // Bits to count up to CHUNKS_PER_TRACE branches
   localparam int unsigned BR_CNT_WIDTH = $clog2(CHUNKS_PER_TRACE + 1);
 
   localparam int unsigned TRACE_WIDTH =
-    1 +                        // valid
-    PC_WIDTH +                 // base_pc
-    CHUNKS_PER_TRACE +         // branch_flags
-    BR_CNT_WIDTH +             // num_branches
-    PC_WIDTH +                 // target_addr
-    (CHUNKS_PER_TRACE * 16) +  // instruction chunks
-    CHUNKS_PER_TRACE;          // valid_chunks
+    1 +                            // valid
+    PC_WIDTH +                     // base_pc
+    CHUNKS_PER_TRACE +             // branch_flags
+    BR_CNT_WIDTH +                 // num_branches
+    PC_WIDTH +                     // target_addr
+    (CHUNKS_PER_TRACE * 16) +      // instruction chunks
+    CHUNKS_PER_TRACE +             // valid_chunks
+    (TRACE_LEN * PC_WIDTH);        // per-instruction PCs for replay semantics
 
   localparam int unsigned BE_WIDTH = (TRACE_WIDTH + 7) / 8;
 
   typedef struct packed {
-    logic                              valid;
-    logic [PC_WIDTH-1:0]               base_pc;
-    logic [CHUNKS_PER_TRACE-1:0]       branch_flags;
-    logic [BR_CNT_WIDTH-1:0]           num_branches;
-    logic [PC_WIDTH-1:0]               target_addr;
-    logic [CHUNKS_PER_TRACE-1:0][15:0] chunks;
-    logic [CHUNKS_PER_TRACE-1:0]       valid_chunks;
+    logic                               valid;
+    logic [PC_WIDTH-1:0]                base_pc;
+    logic [CHUNKS_PER_TRACE-1:0]        branch_flags;
+    logic [BR_CNT_WIDTH-1:0]            num_branches;
+    logic [PC_WIDTH-1:0]                target_addr;
+    logic [CHUNKS_PER_TRACE-1:0][15:0]  chunks;
+    logic [CHUNKS_PER_TRACE-1:0]        valid_chunks;   // 1 = instruction start
+    logic [TRACE_LEN-1:0][PC_WIDTH-1:0] instr_pcs;      // PC per replayed instruction start
   } trace_data_t;
 
   localparam int unsigned TC_INDEX_FLAG_BITS = 2;

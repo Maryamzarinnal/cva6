@@ -96,6 +96,8 @@ module frontend
   logic                                    tc_active_use;
   logic                                    tc_active_hit;
   logic                                    tc_active_pc_match;
+  logic [TRACE_LEN-1:0][PC_WIDTH-1:0]      tc_trace_pcs;
+
 
   localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC0 = PC_WIDTH'(64'h0000000080002880);
   localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC1 = PC_WIDTH'(64'h0000000080000500);
@@ -291,20 +293,17 @@ module frontend
 
   // Replay payload generation (held while tc_replay_active_q=1)
   always_comb begin
-    logic [CVA6Cfg.VLEN-1:0] pc_acc;
     replay_instr_iq        = '0;
     replay_addr_iq         = '0;
     replay_valid_iq        = '0;
     replay_predict_addr_iq = '0;
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) replay_cf_type_iq[i] = ariane_pkg::NoCF;
 
-    pc_acc = tc_replay_base_pc_q;
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
       if (i < int'(tc_replay_len_q)) begin
         replay_valid_iq[i] = 1'b1;
         replay_instr_iq[i] = tc_replay_instr_q[i];
-        replay_addr_iq[i]  = pc_acc;
-        pc_acc = pc_acc + ((tc_replay_instr_q[i][1:0] != 2'b11) ? CVA6Cfg.VLEN'(2) : CVA6Cfg.VLEN'(4));
+        replay_addr_iq[i]  = tc_trace_pcs[i][CVA6Cfg.VLEN-1:0];
       end
     end
     tc_replay_done = tc_replay_active_q
@@ -687,6 +686,7 @@ module frontend
     .trace_length_o         (tc_trace_length),
     .trace_chunks_o         (tc_trace_chunks),
     .trace_valid_chunks_o   (tc_trace_valid_chunks),
+    .trace_pcs_o            (tc_trace_pcs),
     .trace_next_pc_o        (tc_trace_next_pc)
   );
 
