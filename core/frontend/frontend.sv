@@ -813,6 +813,7 @@ module frontend
       $display("[TC-DEBUG] fetch=0x%h valid=%b is_branch=%b taken=%b pred=%b",
                icache_vaddr_q, instruction_valid, tc_is_branch, tc_taken, tc_branch_predictions);
     end
+
     if (tc_active_hit) begin
       int starts;
       starts = 0;
@@ -825,12 +826,26 @@ module frontend
                tc_trace_chunks[0], tc_trace_chunks[1], tc_trace_chunks[2], tc_trace_chunks[3],
                tc_trace_chunks[4], tc_trace_chunks[5], tc_trace_chunks[6], tc_trace_chunks[7]);
     end
+
+    if (tc_active_hit && !tc_active_use) begin
+      $display("[TC-ACTIVE-BLOCK] pc=0x%h match=%0b linear=%0b self=%0b replay=%0b len=%0d next=0x%h",
+               tc_lookup_pc_q,
+               tc_active_pc_match,
+               tc_replay_linear_ok,
+               (tc_trace_next_pc == tc_lookup_pc_q),
+               tc_replay_active_q,
+               tc_trace_length,
+               tc_trace_next_pc);
+    end
+
     if (tc_active_use)
       $display("[TC-ACTIVE-USE] pc=0x%h -> next=0x%h", tc_lookup_pc_q, tc_trace_next_pc);
+
     if (tc_replay_active_q)
       $display("[TC-REPLAY] active len=%0d base=0x%h next=0x%h done=%b consumed=%b",
                tc_replay_len_q, tc_replay_base_pc_q, tc_replay_next_pc_q, tc_replay_done, instr_queue_consumed);
   end
+
 // pragma translate_on
 
 endmodule
