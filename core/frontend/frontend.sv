@@ -84,29 +84,29 @@ module frontend
   logic                                    replay;
   logic [CVA6Cfg.VLEN-1:0]                 replay_addr;
 
-  // Trace-cache outputs/state used across the module (declared early to avoid forward-reference issues)
   logic                                    tc_trace_hit;
   logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   tc_trace_instructions;
   logic [TRACE_LEN_WIDTH-1:0]              tc_trace_length;
   logic [CHUNKS_PER_TRACE-1:0][15:0]       tc_trace_chunks;
   logic [CHUNKS_PER_TRACE-1:0]             tc_trace_valid_chunks;
+  logic [TRACE_LEN-1:0][PC_WIDTH-1:0]      tc_trace_pcs;
   logic                                    tc_lookup_valid_q;
   logic [PC_WIDTH-1:0]                     tc_lookup_pc_q;
   logic [PC_WIDTH-1:0]                     tc_trace_next_pc;
   logic                                    tc_active_use;
   logic                                    tc_active_hit;
   logic                                    tc_active_pc_match;
-  logic [TRACE_LEN-1:0][PC_WIDTH-1:0]      tc_trace_pcs;
-
+  logic [TRACE_LEN_WIDTH-1:0]              tc_trace_starts;
+  logic                                    tc_trace_starts_ok;
 
   localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC0 = PC_WIDTH'(64'h0000000080002880);
   localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC1 = PC_WIDTH'(64'h0000000080000500);
   localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC2 = PC_WIDTH'(64'h0000000080000590);
 
-  // Replay state (test-mode)
   logic                                    tc_replay_active_q, tc_replay_active_d;
   logic [TRACE_LEN_WIDTH-1:0]              tc_replay_len_q, tc_replay_len_d;
   logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   tc_replay_instr_q, tc_replay_instr_d;
+  logic [TRACE_LEN-1:0][CVA6Cfg.VLEN-1:0]  tc_replay_pcs_q, tc_replay_pcs_d;
   logic [CVA6Cfg.VLEN-1:0]                 tc_replay_base_pc_q, tc_replay_base_pc_d;
   logic [CVA6Cfg.VLEN-1:0]                 tc_replay_next_pc_q, tc_replay_next_pc_d;
   logic                                    tc_replay_start;
@@ -189,7 +189,6 @@ module frontend
     assign bht_prediction_shifted[0] = (serving_unaligned) ? bht_q : bht_prediction[addr[0][1]];
     assign btb_prediction_shifted[0] = (serving_unaligned) ? btb_q : btb_prediction[addr[0][1]];
   end
-  ;
 
   logic bp_valid;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] is_branch;
@@ -271,7 +270,6 @@ module frontend
 
   assign is_mispredict = resolved_branch_i.valid & resolved_branch_i.is_mispredict;
 
-  // During replay injection we pause icache requests.
   assign icache_dreq_o.req     = instr_queue_ready & ~halt_frontend_i & ~tc_replay_active_q;
   assign if_ready              = icache_dreq_i.ready & instr_queue_ready & ~halt_frontend_i & ~tc_replay_active_q;
   assign icache_dreq_o.kill_s1 = is_mispredict | flush_i | replay;
@@ -291,7 +289,6 @@ module frontend
   assign btb_update.pc             = resolved_branch_i.pc;
   assign btb_update.target_address = resolved_branch_i.target_address;
 
-  // Replay payload generation (held while tc_replay_active_q=1)
   always_comb begin
     replay_instr_iq        = '0;
     replay_addr_iq         = '0;
@@ -303,7 +300,7 @@ module frontend
       if (i < int'(tc_replay_len_q)) begin
         replay_valid_iq[i] = 1'b1;
         replay_instr_iq[i] = tc_replay_instr_q[i];
-        replay_addr_iq[i]  = tc_trace_pcs[i][CVA6Cfg.VLEN-1:0];
+        replay_addr_iq[i]  = tc_replay_pcs_q[i];
       end
     end
     tc_replay_done = tc_replay_active_q
@@ -311,7 +308,6 @@ module frontend
                   && ((instr_queue_consumed & replay_valid_iq) == replay_valid_iq);
   end
 
-  // Only use replay in test mode when trace looks linear in PC space.
   always_comb begin
     logic [CVA6Cfg.VLEN-1:0] pc_acc;
     tc_replay_linear_end_pc = '0;
@@ -324,18 +320,19 @@ module frontend
     tc_replay_linear_ok     = (tc_trace_next_pc[CVA6Cfg.VLEN-1:0] == tc_replay_linear_end_pc);
   end
 
-  // Replay state
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       tc_replay_active_q   <= 1'b0;
       tc_replay_len_q      <= '0;
       tc_replay_instr_q    <= '0;
+      tc_replay_pcs_q      <= '0;
       tc_replay_base_pc_q  <= '0;
       tc_replay_next_pc_q  <= '0;
     end else begin
       tc_replay_active_q   <= tc_replay_active_d;
       tc_replay_len_q      <= tc_replay_len_d;
       tc_replay_instr_q    <= tc_replay_instr_d;
+      tc_replay_pcs_q      <= tc_replay_pcs_d;
       tc_replay_base_pc_q  <= tc_replay_base_pc_d;
       tc_replay_next_pc_q  <= tc_replay_next_pc_d;
     end
@@ -347,6 +344,7 @@ module frontend
     tc_replay_active_d   = tc_replay_active_q;
     tc_replay_len_d      = tc_replay_len_q;
     tc_replay_instr_d    = tc_replay_instr_q;
+    tc_replay_pcs_d      = tc_replay_pcs_q;
     tc_replay_base_pc_d  = tc_replay_base_pc_q;
     tc_replay_next_pc_d  = tc_replay_next_pc_q;
 
@@ -357,6 +355,8 @@ module frontend
         tc_replay_active_d  = 1'b1;
         tc_replay_len_d     = tc_trace_length;
         tc_replay_instr_d   = tc_trace_instructions;
+        for (int i = 0; i < TRACE_LEN; i++)
+          tc_replay_pcs_d[i] = tc_trace_pcs[i][CVA6Cfg.VLEN-1:0];
         tc_replay_base_pc_d = tc_lookup_pc_q[CVA6Cfg.VLEN-1:0];
         tc_replay_next_pc_d = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
       end else if (tc_replay_done) begin
@@ -365,7 +365,6 @@ module frontend
     end
   end
 
-  // Mux source into instr_queue
   always_comb begin
     if (tc_replay_active_q) begin
       instr_to_iq            = replay_instr_iq;
@@ -408,7 +407,6 @@ module frontend
     if (if_ready)
       npc_d = {fetch_address[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] + 1, {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}};
 
-    // Commit replay path only after replayed instructions are consumed.
     if (tc_replay_done)
       npc_d = tc_replay_next_pc_q;
 
@@ -592,10 +590,6 @@ module frontend
       .fetch_entry_ready_i(fetch_entry_ready_i)
   );
 
-  // ---------------------------------------------------------------
-  // Trace cache integration - passive recording + lookup
-  // ---------------------------------------------------------------
-
   logic [SLOTS_PER_CYCLE-1:0]               tc_instr_valid;
   logic [SLOTS_PER_CYCLE-1:0][31:0]         tc_instr;
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_pc;
@@ -678,7 +672,6 @@ module frontend
     .instr_queue_ready_i    (instr_queue_ready),
     .instr_queue_consumed_i (instr_queue_consumed),
     .branch_predictions_i   (tc_branch_predictions),
-    // prevent recursive lookups during replay injection
     .lookup_valid_i         ((|instr_queue_consumed) && !tc_replay_active_q),
     .lookup_pc_i            (tc_pc[0]),
     .trace_hit_o            (tc_trace_hit),
@@ -696,10 +689,19 @@ module frontend
       tc_lookup_pc_q    <= '0;
     end else begin
       tc_lookup_valid_q <= (|instr_queue_consumed) && !flush_i && !tc_replay_active_q;
-      // Match trace_cache_top lookup base alignment (16B)
       tc_lookup_pc_q    <= tc_pc[0] & {{(PC_WIDTH-4){1'b1}}, 4'b0000};
     end
   end
+
+  always_comb begin
+    tc_trace_starts = '0;
+    for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
+      if (tc_trace_valid_chunks[i])
+        tc_trace_starts = tc_trace_starts + TRACE_LEN_WIDTH'(1);
+    end
+  end
+
+  assign tc_trace_starts_ok = (tc_trace_starts <= TRACE_LEN_WIDTH'(TRACE_LEN));
 
   assign tc_active_hit = tc_lookup_valid_q
                        && tc_trace_hit
@@ -712,6 +714,7 @@ module frontend
 
   assign tc_active_use = tc_active_hit
                       && tc_active_pc_match
+                      && tc_trace_starts_ok
                       && (tc_trace_next_pc != tc_lookup_pc_q)
                       && !tc_replay_active_q;
 
