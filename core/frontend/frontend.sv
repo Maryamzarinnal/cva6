@@ -376,12 +376,11 @@ module frontend
           tc_replay_pcs_d[i] = tc_trace_pcs[i][CVA6Cfg.VLEN-1:0];
         tc_replay_base_pc_d    = tc_lookup_pc_q[CVA6Cfg.VLEN-1:0];
         tc_replay_next_pc_d    = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
-      end else if (tc_replay_active_q && (tc_replay_remaining_q != '0)) begin
-        if (TRACE_LEN_WIDTH'(tc_replay_consumed_cnt) >= tc_replay_remaining_q)
-          tc_replay_remaining_d = '0;
-        else
-          tc_replay_remaining_d = tc_replay_remaining_q - TRACE_LEN_WIDTH'(tc_replay_consumed_cnt);
-      end
+    end else if (tc_replay_active_q && (tc_replay_remaining_q != '0)) begin
+      if (TRACE_LEN_WIDTH'(tc_replay_consumed_cnt) >= tc_replay_remaining_q)
+        tc_replay_remaining_d = '0;
+      else
+        tc_replay_remaining_d = tc_replay_remaining_q - TRACE_LEN_WIDTH'(tc_replay_consumed_cnt);
     end
   end
 
