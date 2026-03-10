@@ -107,6 +107,7 @@ module frontend
   logic [CVA6Cfg.VLEN-1:0]                 tc_replay_next_pc_q, tc_replay_next_pc_d;
   logic                                    tc_replay_start;
   logic                                    tc_replay_done;
+  logic                                    tc_replay_just_done_q, tc_replay_just_done_d;
   logic [$clog2(CVA6Cfg.INSTR_PER_FETCH+1)-1:0] tc_replay_consumed_cnt;
 
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0]             replay_instr_iq;
@@ -323,6 +324,7 @@ module frontend
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       tc_replay_active_q     <= 1'b0;
+      tc_replay_just_done_q  <= 1'b0;
       tc_replay_len_q        <= '0;
       tc_replay_remaining_q  <= '0;
       tc_replay_instr_q      <= '0;
@@ -331,6 +333,7 @@ module frontend
       tc_replay_next_pc_q    <= '0;
     end else begin
       tc_replay_active_q     <= tc_replay_active_d;
+      tc_replay_just_done_q  <= tc_replay_just_done_d;
       tc_replay_len_q        <= tc_replay_len_d;
       tc_replay_remaining_q  <= tc_replay_remaining_d;
       tc_replay_instr_q      <= tc_replay_instr_d;
@@ -351,11 +354,20 @@ module frontend
     tc_replay_base_pc_d    = tc_replay_base_pc_q;
     tc_replay_next_pc_d    = tc_replay_next_pc_q;
 
+    tc_replay_just_done_d = tc_replay_just_done_q;
     if (flush_i || is_mispredict || set_pc_commit_i || ex_valid_i || eret_i) begin
-      tc_replay_active_d   = 1'b0;
+      tc_replay_active_d    = 1'b0;
       tc_replay_remaining_d = '0;
-    end else begin
-      if (tc_replay_start) begin
+      tc_replay_just_done_d = 1'b0;
+    end else if (tc_replay_done) begin
+      tc_replay_just_done_d = 1'b1;
+      tc_replay_active_d    = 1'b0;
+      tc_replay_remaining_d = '0;
+    end else if (tc_replay_just_done_q && icache_dreq_i.valid &&
+                 (icache_dreq_i.vaddr[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] ==
+                  npc_q[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS])) begin
+      tc_replay_just_done_d = 1'b0;
+    end else if (tc_replay_start) begin
         tc_replay_active_d     = 1'b1;
         tc_replay_len_d        = tc_trace_length;
         tc_replay_remaining_d  = tc_trace_length;
@@ -364,9 +376,6 @@ module frontend
           tc_replay_pcs_d[i] = tc_trace_pcs[i][CVA6Cfg.VLEN-1:0];
         tc_replay_base_pc_d    = tc_lookup_pc_q[CVA6Cfg.VLEN-1:0];
         tc_replay_next_pc_d    = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
-      end else if (tc_replay_done) begin
-        tc_replay_active_d    = 1'b0;
-        tc_replay_remaining_d = '0;
       end else if (tc_replay_active_q && (tc_replay_remaining_q != '0)) begin
         if (TRACE_LEN_WIDTH'(tc_replay_consumed_cnt) >= tc_replay_remaining_q)
           tc_replay_remaining_d = '0;
@@ -383,6 +392,18 @@ module frontend
       valid_to_iq            = replay_valid_iq;
       cf_type_to_iq          = replay_cf_type_iq;
       predict_addr_to_iq     = replay_predict_addr_iq;
+      exception_to_iq        = ariane_pkg::FE_NONE;
+      exception_addr_to_iq   = '0;
+      exception_gpaddr_to_iq = '0;
+      exception_tinst_to_iq  = '0;
+      exception_gva_to_iq    = 1'b0;
+    end else if (tc_replay_just_done_q) begin
+      // Do not feed stale fetch data; wait for new fetch from tc_replay_next_pc_q
+      instr_to_iq            = '0;
+      addr_to_iq             = '0;
+      valid_to_iq            = '0;
+      cf_type_to_iq          = '{default: ariane_pkg::NoCF};
+      predict_addr_to_iq     = '0;
       exception_to_iq        = ariane_pkg::FE_NONE;
       exception_addr_to_iq   = '0;
       exception_gpaddr_to_iq = '0;
@@ -415,7 +436,7 @@ module frontend
       fetch_address = predict_address;
       npc_d         = predict_address;
     end
-    if (if_ready)
+    if (if_ready && !tc_replay_just_done_q)
       npc_d = {fetch_address[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] + 1, {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}};
 
     if (tc_replay_done)
@@ -683,7 +704,7 @@ module frontend
     .instr_queue_ready_i    (instr_queue_ready),
     .instr_queue_consumed_i (instr_queue_consumed),
     .branch_predictions_i   (tc_branch_predictions),
-    .lookup_valid_i         ((|instr_queue_consumed) && !tc_replay_active_q),
+    .lookup_valid_i         ((|instr_queue_consumed) && !tc_replay_active_q && !tc_replay_just_done_q),
     .lookup_pc_i            (tc_pc[0]),
     .trace_hit_o            (tc_trace_hit),
     .trace_instructions_o   (tc_trace_instructions),
@@ -699,7 +720,7 @@ module frontend
       tc_lookup_valid_q <= 1'b0;
       tc_lookup_pc_q    <= '0;
     end else begin
-      tc_lookup_valid_q <= (|instr_queue_consumed) && !flush_i && !tc_replay_active_q;
+      tc_lookup_valid_q <= (|instr_queue_consumed) && !flush_i && !tc_replay_active_q && !tc_replay_just_done_q;
       tc_lookup_pc_q    <= tc_pc[0] & {{(PC_WIDTH-4){1'b1}}, 4'b0000};
     end
   end
