@@ -266,8 +266,8 @@ module trace_cache_top (
       end else if (any_valid) begin
         for (int w = 0; w < NUM_WAYS; w++) begin
           if (trace_read[w].valid && !pc_match[w])
-            $display("[TC-LOOKUP] PC MISS: stored=0x%h lookup=0x%h (way %0d)",
-                     trace_read[w].base_pc, lookup_pc_q, w);
+            $display("[TC-LOOKUP] lookup PC 0x%h missed (way %0d had base_pc 0x%h)",
+                     lookup_pc_q, w, trace_read[w].base_pc);
           else if (trace_read[w].valid && pc_match[w] && !branch_flags_match[w])
             $display("[TC-LOOKUP] BR MISS at 0x%h (way %0d): stored=%b lookup=%b num=%0d",
                      lookup_pc_q, w, trace_read[w].branch_flags,

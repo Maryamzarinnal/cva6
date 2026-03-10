@@ -753,6 +753,19 @@ module frontend
                       && (tc_same_pc_replay_count_q < TC_SAME_PC_REPLAY_CAP);
 
 // pragma translate_off
+  logic         tc_replay_active_q_prev;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni)
+      tc_replay_active_q_prev <= 1'b0;
+    else
+      tc_replay_active_q_prev <= tc_replay_active_q;
+  end
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (rst_ni && tc_replay_active_q && !tc_replay_active_q_prev)
+      $display("[TC-REPLAY-META] len=%0d branch_slot=%0d predict_addr=0x%h @ %0t",
+               tc_replay_len_q, (tc_replay_len_q != 0) ? (tc_replay_len_q - 1) : 0,
+               tc_replay_next_pc_q, $time);
+  end
   logic         counting_active;
   logic         stats_printed;
   int unsigned  taken_hist        [SLOTS_PER_CYCLE+1];
