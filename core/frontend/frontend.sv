@@ -786,7 +786,15 @@ module frontend
   int unsigned  tc_global_misses;
   int unsigned  tc_replays_completed;
   int unsigned  tc_replay_cycles_total;
+  int unsigned  tc_cap_events;  // times same-PC cap blocked replay (forced normal fetch)
   logic [PC_WIDTH-1:0] tc_last_replay_base_pc_q;
+  int unsigned  tc_commit_count_q;  // trace commits (for gating TC-STATS print)
+  longint unsigned tc_total_cycles_q;  // total cycles (for fetch-improvement metric)
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) tc_total_cycles_q <= 0;
+    else         tc_total_cycles_q <= tc_total_cycles_q + 1;
+  end
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -807,6 +815,8 @@ module frontend
       tc_global_misses <= 0;
       tc_replays_completed <= 0;
       tc_replay_cycles_total <= 0;
+      tc_cap_events    <= 0;
+      tc_commit_count_q <= 0;
     end else begin
       if (pc_commit_i == 64'h80001568) begin
         counting_active <= 1'b1;
@@ -859,14 +869,16 @@ module frontend
         end
       end
 
+      // Print TC-STATS/TC-TAKEN only every 500 trace commits to avoid flooding the transcript
       if (i_trace_cache_top.i_trace_builder.commit_valid_q) begin
-        int unsigned tc_taken_rate;
-        tc_taken_rate = 0;
-        if (tc_taken_lookups > 0)
-          tc_taken_rate = (tc_taken_hits * 100) / tc_taken_lookups;
-        $display("[TC-STATS] hits=%0d misses=%0d", tc_hits, tc_misses);
-        $display("[TC-TAKEN] taken_lookups=%0d taken_hits=%0d rate=%0d%%",
-                 tc_taken_lookups, tc_taken_hits, tc_taken_rate);
+        tc_commit_count_q <= tc_commit_count_q + 1;
+        if ((tc_commit_count_q + 1) % 500 == 0) begin
+          int unsigned tc_taken_rate;
+          tc_taken_rate = (tc_taken_lookups > 0) ? (tc_taken_hits * 100) / tc_taken_lookups : 0;
+          $display("[TC-STATS] hits=%0d misses=%0d (every 500 commits, #%0d)", tc_hits, tc_misses, tc_commit_count_q + 1);
+          $display("[TC-TAKEN] taken_lookups=%0d taken_hits=%0d rate=%0d%%",
+                   tc_taken_lookups, tc_taken_hits, tc_taken_rate);
+        end
       end
 
       // Global stats (whole run) for long-run debug
@@ -881,6 +893,9 @@ module frontend
       if (tc_replay_done) begin
         tc_replays_completed <= tc_replays_completed + 1;
       end
+      if (tc_active_hit && tc_trace_starts_ok && (tc_trace_next_pc != tc_lookup_pc_q) && !tc_replay_active_q &&
+          (tc_same_pc_replay_count_q >= TC_SAME_PC_REPLAY_CAP))
+        tc_cap_events <= tc_cap_events + 1;
     end
   end
 
@@ -917,6 +932,21 @@ module frontend
                tc_replays_completed + 1, tc_global_hits, tc_global_misses,
                (tc_global_hits + tc_global_misses) > 0 ? (tc_global_hits * 100) / (tc_global_hits + tc_global_misses) : 0,
                tc_replay_cycles_total, $time);
+    end
+    // Print full TC summary every 5000 replays so it appears even if final block does not run
+    if (tc_replay_done && (tc_replays_completed + 1) % 5000 == 0) begin
+      automatic int tot, pct, fetch_pct;
+      tot = tc_global_hits + tc_global_misses;
+      pct = (tot > 0) ? (tc_global_hits * 100) / tot : 0;
+      fetch_pct = (tc_total_cycles_q > 0) ? (int'(tc_replay_cycles_total) * 100 / int'(tc_total_cycles_q)) : 0;
+      $display("[TC-SUMMARY] ========== (every 5000 replays, replays=%0d) ==========", tc_replays_completed + 1);
+      $display("[TC-SUMMARY] lookups: %0d (hits=%0d misses=%0d) hit_rate=%0d%%",
+               tot, tc_global_hits, tc_global_misses, pct);
+      $display("[TC-SUMMARY] replays_completed=%0d replay_cycles=%0d cap_events=%0d",
+               tc_replays_completed + 1, tc_replay_cycles_total, tc_cap_events);
+      $display("[TC-SUMMARY] total_cycles=%0d -> %0d%% of run fetch from trace (fetch improvement)",
+               tc_total_cycles_q, fetch_pct);
+      $display("[TC-SUMMARY] ========================================");
     end
   end
 
@@ -966,13 +996,26 @@ module frontend
   end
 
   final begin
-    $display("[TC-FINAL] === Trace Cache summary ===");
-    $display("[TC-FINAL] replays_completed=%0d global_hits=%0d global_misses=%0d hit_rate=%0d%%",
-             tc_replays_completed, tc_global_hits, tc_global_misses,
-             (tc_global_hits + tc_global_misses) > 0 ? (tc_global_hits * 100) / (tc_global_hits + tc_global_misses) : 0);
-    $display("[TC-FINAL] replay_cycles_total=%0d (cycles spent feeding from trace)",
-             tc_replay_cycles_total);
-    $display("[TC-FINAL] ===========================");
+    int tc_total_lookups;
+    int tc_hit_pct;
+    int tc_fetch_from_trace_pct;
+    tc_total_lookups = tc_global_hits + tc_global_misses;
+    tc_hit_pct = (tc_total_lookups > 0) ? (tc_global_hits * 100) / tc_total_lookups : 0;
+    tc_fetch_from_trace_pct = (tc_total_cycles_q > 0) ? (int'(tc_replay_cycles_total) * 100 / int'(tc_total_cycles_q)) : 0;
+    $display("[TC-FINAL] ========== Trace Cache summary ==========");
+    $display("[TC-FINAL] lookups: %0d (hits=%0d misses=%0d) -> hit_rate=%0d%%",
+             tc_total_lookups, tc_global_hits, tc_global_misses, tc_hit_pct);
+    $display("[TC-FINAL] replays_completed=%0d  replay_cycles=%0d (cycles fed from trace, no icache fetch)",
+             tc_replays_completed, tc_replay_cycles_total);
+    $display("[TC-FINAL] cap_events=%0d (times replay was blocked at same-PC cap; forced normal fetch)",
+             tc_cap_events);
+    $display("[TC-FINAL] --- Fetch improvement (did the trace cache help?) ---");
+    $display("[TC-FINAL] total_cycles=%0d  replay_cycles=%0d  -> %0d%% of run fetch was from trace (i-cache not used)",
+             tc_total_cycles_q, tc_replay_cycles_total, tc_fetch_from_trace_pct);
+    $display("[TC-FINAL] So: trace cache served fetch for %0d%% of simulation; rest used normal i-cache.",
+             tc_fetch_from_trace_pct);
+    $display("[TC-FINAL] To measure run-time speedup: run same workload with TC disabled, compare total_cycles.");
+    $display("[TC-FINAL] ========================================");
   end
 
 // pragma translate_on
