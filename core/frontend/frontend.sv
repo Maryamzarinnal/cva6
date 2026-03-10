@@ -291,9 +291,11 @@ module frontend
     replay_instr_iq        = '0;
     replay_addr_iq         = '0;
     replay_valid_iq        = '0;
-    replay_predict_addr_iq = '0;
+    replay_predict_addr_iq = tc_replay_next_pc_q;  // so backend can detect mispredict when branch resolves not-taken
     tc_replay_consumed_cnt = '0;
-    for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) replay_cf_type_iq[i] = ariane_pkg::NoCF;
+    for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++)
+      replay_cf_type_iq[i] = (tc_replay_len_q != 0 && TRACE_LEN_WIDTH'(i) == tc_replay_len_q - 1)
+                            ? ariane_pkg::Branch : ariane_pkg::NoCF;
 
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
       if (i < int'(tc_replay_len_q)) begin
@@ -739,10 +741,16 @@ module frontend
                        && (tc_trace_length != '0)
                        && !flush_i;
 
+  // Cap consecutive replays from the same PC to avoid stuck loops (predictor always taken).
+  // After TC_SAME_PC_REPLAY_CAP replays we fetch normally so the branch can resolve.
+  localparam int unsigned TC_SAME_PC_REPLAY_CAP = 4096;
+  logic [15:0] tc_same_pc_replay_count_q;
+
   assign tc_active_use = tc_active_hit
                       && tc_trace_starts_ok
                       && (tc_trace_next_pc != tc_lookup_pc_q)
-                      && !tc_replay_active_q;
+                      && !tc_replay_active_q
+                      && (tc_same_pc_replay_count_q < TC_SAME_PC_REPLAY_CAP);
 
 // pragma translate_off
   logic         counting_active;
@@ -862,11 +870,16 @@ module frontend
   // Replay lifecycle and periodic summary (one-line events for grep/debug)
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      tc_last_replay_base_pc_q <= '1;
+      tc_last_replay_base_pc_q  <= '1;
+      tc_same_pc_replay_count_q <= 16'd0;
     end else if (tc_replay_start) begin
-      if (tc_lookup_pc_q != tc_last_replay_base_pc_q)
+      if (tc_lookup_pc_q != tc_last_replay_base_pc_q) begin
         $display("[TC-HOT-CHANGE] 0x%h -> 0x%h (replay #%0d) @ %0t",
                  tc_last_replay_base_pc_q, tc_lookup_pc_q, tc_replays_completed + 1, $time);
+        tc_same_pc_replay_count_q <= 16'd1;
+      end else begin
+        tc_same_pc_replay_count_q <= tc_same_pc_replay_count_q + 1'b1;
+      end
       tc_last_replay_base_pc_q <= tc_lookup_pc_q;
     end
   end
@@ -920,6 +933,10 @@ module frontend
 
     if (tc_active_use)
       $display("[TC-ACTIVE-USE] pc=0x%h -> next=0x%h", tc_lookup_pc_q, tc_trace_next_pc);
+    if (tc_active_hit && tc_trace_starts_ok && (tc_trace_next_pc != tc_lookup_pc_q) && !tc_replay_active_q &&
+        (tc_same_pc_replay_count_q >= TC_SAME_PC_REPLAY_CAP))
+      $display("[TC-SAME-PC-CAP] blocking replay at 0x%h (count=%0d) - fetch normally @ %0t",
+               tc_lookup_pc_q, tc_same_pc_replay_count_q, $time);
 
     // Progress only when we consume the last chunk of a replay (same cycle as DONE)
     if (tc_replay_active_q && (tc_replay_remaining_q != '0) &&
