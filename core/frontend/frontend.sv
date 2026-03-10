@@ -752,6 +752,7 @@ module frontend
                       && !tc_replay_active_q
                       && (tc_same_pc_replay_count_q < TC_SAME_PC_REPLAY_CAP);
 
+// Define TRACE_CACHE_DEBUG_VERBOSE for per-replay/lookup prints; without it only HOT-CHANGE, SAME-PC-CAP, PERIODIC, FINAL.
 // pragma translate_off
   logic         tc_replay_active_q_prev;
   always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -760,12 +761,14 @@ module frontend
     else
       tc_replay_active_q_prev <= tc_replay_active_q;
   end
+  `ifdef TRACE_CACHE_DEBUG_VERBOSE
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (rst_ni && tc_replay_active_q && !tc_replay_active_q_prev)
       $display("[TC-REPLAY-META] len=%0d branch_slot=%0d predict_addr=0x%h @ %0t",
                tc_replay_len_q, (tc_replay_len_q != 0) ? (tc_replay_len_q - 1) : 0,
                tc_replay_next_pc_q, $time);
   end
+  `endif
   logic         counting_active;
   logic         stats_printed;
   int unsigned  taken_hist        [SLOTS_PER_CYCLE+1];
@@ -898,6 +901,7 @@ module frontend
   end
 
   always_ff @(posedge clk_i) begin
+    `ifdef TRACE_CACHE_DEBUG_VERBOSE
     if (tc_replay_start) begin
       $display("[TC-REPLAY-START] #%0d base_pc=0x%h len=%0d next_pc=0x%h @ %0t",
                tc_replays_completed + 1, tc_lookup_pc_q, tc_trace_length, tc_trace_next_pc, $time);
@@ -906,16 +910,17 @@ module frontend
       $display("[TC-REPLAY-DONE]  #%0d base_pc=0x%h next_pc=0x%h remaining_was=%0d @ %0t",
                tc_replays_completed + 1, tc_replay_base_pc_q, tc_replay_next_pc_q,
                tc_replay_remaining_q, $time);
-      if ((tc_replays_completed + 1) % 100 == 0) begin
-        $display("[TC-PERIODIC] replays=%0d global_hits=%0d global_misses=%0d hit_rate=%0d%% replay_cycles=%0d @ %0t",
-                 tc_replays_completed + 1, tc_global_hits, tc_global_misses,
-                 (tc_global_hits + tc_global_misses) > 0 ? (tc_global_hits * 100) / (tc_global_hits + tc_global_misses) : 0,
-                 tc_replay_cycles_total, $time);
-      end
+    `endif
+    if (tc_replay_done && (tc_replays_completed + 1) % 100 == 0) begin
+      $display("[TC-PERIODIC] replays=%0d global_hits=%0d global_misses=%0d hit_rate=%0d%% replay_cycles=%0d @ %0t",
+               tc_replays_completed + 1, tc_global_hits, tc_global_misses,
+               (tc_global_hits + tc_global_misses) > 0 ? (tc_global_hits * 100) / (tc_global_hits + tc_global_misses) : 0,
+               tc_replay_cycles_total, $time);
     end
   end
 
   always_ff @(posedge clk_i) begin
+    `ifdef TRACE_CACHE_DEBUG_VERBOSE
     if (icache_valid_q && tc_active_hit) begin
       $display("[TC-DEBUG] fetch=0x%h valid=%b is_branch=%b taken=%b pred=%b",
                icache_vaddr_q, instruction_valid, tc_is_branch, tc_taken, tc_branch_predictions);
@@ -946,17 +951,17 @@ module frontend
 
     if (tc_active_use)
       $display("[TC-ACTIVE-USE] pc=0x%h -> next=0x%h", tc_lookup_pc_q, tc_trace_next_pc);
-    if (tc_active_hit && tc_trace_starts_ok && (tc_trace_next_pc != tc_lookup_pc_q) && !tc_replay_active_q &&
-        (tc_same_pc_replay_count_q >= TC_SAME_PC_REPLAY_CAP))
-      $display("[TC-SAME-PC-CAP] blocking replay at 0x%h (count=%0d) - fetch normally @ %0t",
-               tc_lookup_pc_q, tc_same_pc_replay_count_q, $time);
-
-    // Progress only when we consume the last chunk of a replay (same cycle as DONE)
     if (tc_replay_active_q && (tc_replay_remaining_q != '0) &&
         (TRACE_LEN_WIDTH'(tc_replay_consumed_cnt) >= tc_replay_remaining_q)) begin
       $display("[TC-REPLAY-FINISH] base_pc=0x%h remaining=%0d consumed_this_cycle=%0d",
                tc_replay_base_pc_q, tc_replay_remaining_q, tc_replay_consumed_cnt);
     end
+    `endif
+    // Always print (important for stuck-loop diagnosis)
+    if (tc_active_hit && tc_trace_starts_ok && (tc_trace_next_pc != tc_lookup_pc_q) && !tc_replay_active_q &&
+        (tc_same_pc_replay_count_q >= TC_SAME_PC_REPLAY_CAP))
+      $display("[TC-SAME-PC-CAP] blocking replay at 0x%h (count=%0d) - fetch normally @ %0t",
+               tc_lookup_pc_q, tc_same_pc_replay_count_q, $time);
   end
 
   final begin

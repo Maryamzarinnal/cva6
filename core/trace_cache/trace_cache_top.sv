@@ -253,7 +253,9 @@ module trace_cache_top (
     end
   end
 
+// Define TRACE_CACHE_DEBUG_VERBOSE (e.g. +define+TRACE_CACHE_DEBUG_VERBOSE) for per-lookup/replay prints.
 `ifndef SYNTHESIS
+  `ifdef TRACE_CACHE_DEBUG_VERBOSE
   always_ff @(posedge clk_i) begin
     if (lookup_valid_q) begin
       logic any_valid;
@@ -276,6 +278,7 @@ module trace_cache_top (
       end
     end
   end
+  `endif
 
   int unsigned tc_valid_lookups;
   int unsigned tc_useful_hits;
