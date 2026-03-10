@@ -95,22 +95,19 @@ module frontend
   logic [PC_WIDTH-1:0]                     tc_trace_next_pc;
   logic                                    tc_active_use;
   logic                                    tc_active_hit;
-  logic                                    tc_active_pc_match;
   logic [TRACE_LEN_WIDTH-1:0]              tc_trace_starts;
   logic                                    tc_trace_starts_ok;
 
-  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC0 = PC_WIDTH'(64'h0000000080002880);
-  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC1 = PC_WIDTH'(64'h0000000080000500);
-  localparam logic [PC_WIDTH-1:0] TC_ACTIVE_PC2 = PC_WIDTH'(64'h0000000080000590);
-
   logic                                    tc_replay_active_q, tc_replay_active_d;
   logic [TRACE_LEN_WIDTH-1:0]              tc_replay_len_q, tc_replay_len_d;
+  logic [TRACE_LEN_WIDTH-1:0]              tc_replay_remaining_q, tc_replay_remaining_d;
   logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   tc_replay_instr_q, tc_replay_instr_d;
   logic [TRACE_LEN-1:0][CVA6Cfg.VLEN-1:0]  tc_replay_pcs_q, tc_replay_pcs_d;
   logic [CVA6Cfg.VLEN-1:0]                 tc_replay_base_pc_q, tc_replay_base_pc_d;
   logic [CVA6Cfg.VLEN-1:0]                 tc_replay_next_pc_q, tc_replay_next_pc_d;
   logic                                    tc_replay_start;
   logic                                    tc_replay_done;
+  logic [$clog2(CVA6Cfg.INSTR_PER_FETCH+1)-1:0] tc_replay_consumed_cnt;
 
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0]             replay_instr_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] replay_addr_iq;
@@ -294,6 +291,7 @@ module frontend
     replay_addr_iq         = '0;
     replay_valid_iq        = '0;
     replay_predict_addr_iq = '0;
+    tc_replay_consumed_cnt = '0;
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) replay_cf_type_iq[i] = ariane_pkg::NoCF;
 
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
@@ -301,11 +299,13 @@ module frontend
         replay_valid_iq[i] = 1'b1;
         replay_instr_iq[i] = tc_replay_instr_q[i];
         replay_addr_iq[i]  = tc_replay_pcs_q[i];
+        if (instr_queue_consumed[i]) tc_replay_consumed_cnt = tc_replay_consumed_cnt + 1;
       end
     end
+    // Replay done when all replayed instructions have been consumed (over one or more cycles)
     tc_replay_done = tc_replay_active_q
-                  && (tc_replay_len_q != '0)
-                  && ((instr_queue_consumed & replay_valid_iq) == replay_valid_iq);
+                  && (tc_replay_remaining_q != '0)
+                  && (TRACE_LEN_WIDTH'(tc_replay_consumed_cnt) >= tc_replay_remaining_q);
   end
 
   always_comb begin
@@ -322,45 +322,56 @@ module frontend
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      tc_replay_active_q   <= 1'b0;
-      tc_replay_len_q      <= '0;
-      tc_replay_instr_q    <= '0;
-      tc_replay_pcs_q      <= '0;
-      tc_replay_base_pc_q  <= '0;
-      tc_replay_next_pc_q  <= '0;
+      tc_replay_active_q     <= 1'b0;
+      tc_replay_len_q        <= '0;
+      tc_replay_remaining_q  <= '0;
+      tc_replay_instr_q      <= '0;
+      tc_replay_pcs_q        <= '0;
+      tc_replay_base_pc_q    <= '0;
+      tc_replay_next_pc_q    <= '0;
     end else begin
-      tc_replay_active_q   <= tc_replay_active_d;
-      tc_replay_len_q      <= tc_replay_len_d;
-      tc_replay_instr_q    <= tc_replay_instr_d;
-      tc_replay_pcs_q      <= tc_replay_pcs_d;
-      tc_replay_base_pc_q  <= tc_replay_base_pc_d;
-      tc_replay_next_pc_q  <= tc_replay_next_pc_d;
+      tc_replay_active_q     <= tc_replay_active_d;
+      tc_replay_len_q        <= tc_replay_len_d;
+      tc_replay_remaining_q  <= tc_replay_remaining_d;
+      tc_replay_instr_q      <= tc_replay_instr_d;
+      tc_replay_pcs_q        <= tc_replay_pcs_d;
+      tc_replay_base_pc_q    <= tc_replay_base_pc_d;
+      tc_replay_next_pc_q    <= tc_replay_next_pc_d;
     end
   end
 
   assign tc_replay_start = tc_active_use && !tc_replay_active_q;
 
   always_comb begin
-    tc_replay_active_d   = tc_replay_active_q;
-    tc_replay_len_d      = tc_replay_len_q;
-    tc_replay_instr_d    = tc_replay_instr_q;
-    tc_replay_pcs_d      = tc_replay_pcs_q;
-    tc_replay_base_pc_d  = tc_replay_base_pc_q;
-    tc_replay_next_pc_d  = tc_replay_next_pc_q;
+    tc_replay_active_d     = tc_replay_active_q;
+    tc_replay_len_d        = tc_replay_len_q;
+    tc_replay_remaining_d  = tc_replay_remaining_q;
+    tc_replay_instr_d      = tc_replay_instr_q;
+    tc_replay_pcs_d        = tc_replay_pcs_q;
+    tc_replay_base_pc_d    = tc_replay_base_pc_q;
+    tc_replay_next_pc_d    = tc_replay_next_pc_q;
 
     if (flush_i || is_mispredict || set_pc_commit_i || ex_valid_i || eret_i) begin
-      tc_replay_active_d  = 1'b0;
+      tc_replay_active_d   = 1'b0;
+      tc_replay_remaining_d = '0;
     end else begin
       if (tc_replay_start) begin
-        tc_replay_active_d  = 1'b1;
-        tc_replay_len_d     = tc_trace_length;
-        tc_replay_instr_d   = tc_trace_instructions;
+        tc_replay_active_d     = 1'b1;
+        tc_replay_len_d        = tc_trace_length;
+        tc_replay_remaining_d  = tc_trace_length;
+        tc_replay_instr_d      = tc_trace_instructions;
         for (int i = 0; i < TRACE_LEN; i++)
           tc_replay_pcs_d[i] = tc_trace_pcs[i][CVA6Cfg.VLEN-1:0];
-        tc_replay_base_pc_d = tc_lookup_pc_q[CVA6Cfg.VLEN-1:0];
-        tc_replay_next_pc_d = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
+        tc_replay_base_pc_d    = tc_lookup_pc_q[CVA6Cfg.VLEN-1:0];
+        tc_replay_next_pc_d    = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
       end else if (tc_replay_done) begin
-        tc_replay_active_d  = 1'b0;
+        tc_replay_active_d    = 1'b0;
+        tc_replay_remaining_d = '0;
+      end else if (tc_replay_active_q && (tc_replay_remaining_q != '0)) begin
+        if (TRACE_LEN_WIDTH'(tc_replay_consumed_cnt) >= tc_replay_remaining_q)
+          tc_replay_remaining_d = '0;
+        else
+          tc_replay_remaining_d = tc_replay_remaining_q - TRACE_LEN_WIDTH'(tc_replay_consumed_cnt);
       end
     end
   end
@@ -708,12 +719,7 @@ module frontend
                        && (tc_trace_length != '0)
                        && !flush_i;
 
-  assign tc_active_pc_match = (tc_lookup_pc_q == TC_ACTIVE_PC0)
-                           || (tc_lookup_pc_q == TC_ACTIVE_PC1)
-                           || (tc_lookup_pc_q == TC_ACTIVE_PC2);
-
   assign tc_active_use = tc_active_hit
-                      && tc_active_pc_match
                       && tc_trace_starts_ok
                       && (tc_trace_next_pc != tc_lookup_pc_q)
                       && !tc_replay_active_q;
@@ -730,6 +736,11 @@ module frontend
   int unsigned  tc_taken_lookups;
   int unsigned  tc_taken_hits;
   logic         tc_had_taken_q;
+  // Global trace-cache stats 
+  int unsigned  tc_global_hits;
+  int unsigned  tc_global_misses;
+  int unsigned  tc_replays_completed;
+  int unsigned  tc_replay_cycles_total;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -746,6 +757,10 @@ module frontend
       tc_taken_lookups <= 0;
       tc_taken_hits    <= 0;
       tc_had_taken_q   <= 1'b0;
+      tc_global_hits   <= 0;
+      tc_global_misses <= 0;
+      tc_replays_completed <= 0;
+      tc_replay_cycles_total <= 0;
     end else begin
       if (pc_commit_i == 64'h80001568) begin
         counting_active <= 1'b1;
@@ -807,16 +822,48 @@ module frontend
         $display("[TC-TAKEN] taken_lookups=%0d taken_hits=%0d rate=%0d%%",
                  tc_taken_lookups, tc_taken_hits, tc_taken_rate);
       end
+
+      // Global stats (whole run) for long-run debug
+      if (tc_lookup_valid_q) begin
+        if (tc_trace_hit)
+          tc_global_hits   <= tc_global_hits + 1;
+        else
+          tc_global_misses <= tc_global_misses + 1;
+      end
+      if (tc_replay_active_q)
+        tc_replay_cycles_total <= tc_replay_cycles_total + 1;
+      if (tc_replay_done) begin
+        tc_replays_completed <= tc_replays_completed + 1;
+      end
+    end
+  end
+
+  // Replay lifecycle and periodic summary (one-line events for grep/debug)
+  always_ff @(posedge clk_i) begin
+    if (tc_replay_start) begin
+      $display("[TC-REPLAY-START] #%0d base_pc=0x%h len=%0d next_pc=0x%h @ %0t",
+               tc_replays_completed + 1, tc_lookup_pc_q, tc_trace_length, tc_trace_next_pc, $time);
+    end
+    if (tc_replay_done) begin
+      $display("[TC-REPLAY-DONE]  #%0d base_pc=0x%h next_pc=0x%h remaining_was=%0d @ %0t",
+               tc_replays_completed + 1, tc_replay_base_pc_q, tc_replay_next_pc_q,
+               tc_replay_remaining_q, $time);
+      if ((tc_replays_completed + 1) % 100 == 0) begin
+        $display("[TC-PERIODIC] replays=%0d global_hits=%0d global_misses=%0d hit_rate=%0d%% replay_cycles=%0d @ %0t",
+                 tc_replays_completed + 1, tc_global_hits, tc_global_misses,
+                 (tc_global_hits + tc_global_misses) > 0 ? (tc_global_hits * 100) / (tc_global_hits + tc_global_misses) : 0,
+                 tc_replay_cycles_total, $time);
+      end
     end
   end
 
   always_ff @(posedge clk_i) begin
-    if (icache_valid_q && tc_active_pc_match) begin
+    if (icache_valid_q && tc_active_hit) begin
       $display("[TC-DEBUG] fetch=0x%h valid=%b is_branch=%b taken=%b pred=%b",
                icache_vaddr_q, instruction_valid, tc_is_branch, tc_taken, tc_branch_predictions);
     end
 
-    if (tc_active_hit && tc_active_pc_match) begin
+    if (tc_active_hit) begin
       int starts;
       starts = 0;
       for (int k = 0; k < CHUNKS_PER_TRACE; k++)
@@ -829,10 +876,9 @@ module frontend
                tc_trace_chunks[4], tc_trace_chunks[5], tc_trace_chunks[6], tc_trace_chunks[7]);
     end
 
-    if (tc_active_hit && !tc_active_use && tc_active_pc_match) begin
-      $display("[TC-ACTIVE-BLOCK] pc=0x%h match=%0b linear=%0b self=%0b replay=%0b len=%0d next=0x%h",
+    if (tc_active_hit && !tc_active_use) begin
+      $display("[TC-ACTIVE-BLOCK] pc=0x%h linear=%0b self=%0b replay=%0b len=%0d next=0x%h",
                tc_lookup_pc_q,
-               tc_active_pc_match,
                tc_replay_linear_ok,
                (tc_trace_next_pc == tc_lookup_pc_q),
                tc_replay_active_q,
@@ -843,9 +889,22 @@ module frontend
     if (tc_active_use)
       $display("[TC-ACTIVE-USE] pc=0x%h -> next=0x%h", tc_lookup_pc_q, tc_trace_next_pc);
 
-    if (tc_replay_active_q)
-      $display("[TC-REPLAY] active len=%0d base=0x%h next=0x%h done=%b consumed=%b",
-               tc_replay_len_q, tc_replay_base_pc_q, tc_replay_next_pc_q, tc_replay_done, instr_queue_consumed);
+    // Progress only when we consume the last chunk of a replay (same cycle as DONE)
+    if (tc_replay_active_q && (tc_replay_remaining_q != '0) &&
+        (TRACE_LEN_WIDTH'(tc_replay_consumed_cnt) >= tc_replay_remaining_q)) begin
+      $display("[TC-REPLAY-FINISH] base_pc=0x%h remaining=%0d consumed_this_cycle=%0d",
+               tc_replay_base_pc_q, tc_replay_remaining_q, tc_replay_consumed_cnt);
+    end
+  end
+
+  final begin
+    $display("[TC-FINAL] === Trace Cache summary ===");
+    $display("[TC-FINAL] replays_completed=%0d global_hits=%0d global_misses=%0d hit_rate=%0d%%",
+             tc_replays_completed, tc_global_hits, tc_global_misses,
+             (tc_global_hits + tc_global_misses) > 0 ? (tc_global_hits * 100) / (tc_global_hits + tc_global_misses) : 0);
+    $display("[TC-FINAL] replay_cycles_total=%0d (cycles spent feeding from trace)",
+             tc_replay_cycles_total);
+    $display("[TC-FINAL] ===========================");
   end
 
 // pragma translate_on
