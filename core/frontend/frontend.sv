@@ -743,7 +743,8 @@ module frontend
 
   // Cap consecutive replays from the same PC to avoid stuck loops (predictor always taken).
   // After TC_SAME_PC_REPLAY_CAP replays we fetch normally so the branch can resolve.
-  localparam int unsigned TC_SAME_PC_REPLAY_CAP = 4096;
+  // Use a lower cap (e.g. 256) so the program can make progress and finish; 4096 was too high.
+  localparam int unsigned TC_SAME_PC_REPLAY_CAP = 256;
   logic [15:0] tc_same_pc_replay_count_q;
 
   assign tc_active_use = tc_active_hit
