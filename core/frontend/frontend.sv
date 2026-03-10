@@ -761,6 +761,7 @@ module frontend
   int unsigned  tc_global_misses;
   int unsigned  tc_replays_completed;
   int unsigned  tc_replay_cycles_total;
+  logic [PC_WIDTH-1:0] tc_last_replay_base_pc_q;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -859,6 +860,17 @@ module frontend
   end
 
   // Replay lifecycle and periodic summary (one-line events for grep/debug)
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      tc_last_replay_base_pc_q <= '1;
+    end else if (tc_replay_start) begin
+      if (tc_lookup_pc_q != tc_last_replay_base_pc_q)
+        $display("[TC-HOT-CHANGE] 0x%h -> 0x%h (replay #%0d) @ %0t",
+                 tc_last_replay_base_pc_q, tc_lookup_pc_q, tc_replays_completed + 1, $time);
+      tc_last_replay_base_pc_q <= tc_lookup_pc_q;
+    end
+  end
+
   always_ff @(posedge clk_i) begin
     if (tc_replay_start) begin
       $display("[TC-REPLAY-START] #%0d base_pc=0x%h len=%0d next_pc=0x%h @ %0t",
