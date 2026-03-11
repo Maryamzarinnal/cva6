@@ -5,7 +5,8 @@ import trace_cache_pkg::*;
 // windows starting from the base window that contains a taken branch.
 // The trace is tagged by:
 //   - base_pc:      fetch-aligned address of the base window
-//   - branch_flags: predicted outcomes for branches in the base window
+//   - branch_flags: stored path (taken/not-taken). Rotenberg: fill-at-retire => resolved path. We fill
+//     at fetch but overwrite with resolved outcomes on write (when available) to match that semantics.
 //   - num_branches: branch count in the base window
 //
 // Active replay currently supports TRACE_LEN instruction starts. Builder
@@ -20,8 +21,6 @@ module trace_builder (
     input  logic [GHR_WIDTH-1:0] ghr_i,
     input  logic                 flush_i,
 
-    input  logic [CHUNKS_PER_TRACE-1:0] branch_predictions_i,
-
     output logic                   trace_valid_o,
     output logic [TRACE_WIDTH-1:0] trace_data_o,
 
@@ -29,7 +28,8 @@ module trace_builder (
     output logic                   mem_we_o,
     output logic [TRACE_ADDRW-1:0] mem_addr_o,
     output logic [TRACE_WIDTH-1:0] mem_wdata_o,
-    output logic [BE_WIDTH-1:0]    mem_be_o
+    output logic [BE_WIDTH-1:0]    mem_be_o,
+    output logic [CHUNKS_PER_TRACE-1:0][PC_WIDTH-1:0] mem_branch_pcs_o
 );
 
   localparam int unsigned CHUNK_PTR_W = $clog2(CHUNKS_PER_TRACE + 1);
@@ -56,6 +56,8 @@ module trace_builder (
   logic [TRACE_ADDRW-1:0] sram_wr_addr_q, sram_wr_addr_d;
   logic                   commit_valid_q, commit_valid_d;
   logic [TRACE_WIDTH-1:0] commit_data_q,  commit_data_d;
+  logic [CHUNKS_PER_TRACE-1:0][PC_WIDTH-1:0] branch_pcs_q, branch_pcs_d;
+  logic [CHUNKS_PER_TRACE-1:0][PC_WIDTH-1:0] commit_branch_pcs_q, commit_branch_pcs_d;
   logic [GHR_WIDTH-1:0]   trace_start_ghr_q, trace_start_ghr_d;
   logic [CHUNK_PTR_W-1:0] commit_chunk_ptr_q, commit_chunk_ptr_d;
   logic [1:0]             taken_cnt_q, taken_cnt_d;
@@ -69,10 +71,11 @@ module trace_builder (
   assign mem_req_o     = commit_valid_q;
   assign mem_we_o      = commit_valid_q;
   assign mem_addr_o    = sram_wr_addr_q;
-  assign mem_wdata_o   = commit_data_q;
-  assign mem_be_o      = {BE_WIDTH{1'b1}};
-  assign trace_valid_o = commit_valid_q;
-  assign trace_data_o  = commit_data_q;
+  assign mem_wdata_o       = commit_data_q;
+  assign mem_be_o          = {BE_WIDTH{1'b1}};
+  assign mem_branch_pcs_o  = commit_branch_pcs_q;
+  assign trace_valid_o     = commit_valid_q;
+  assign trace_data_o      = commit_data_q;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -88,6 +91,8 @@ module trace_builder (
       sram_wr_addr_q          <= '0;
       commit_valid_q          <= 1'b0;
       commit_data_q           <= '0;
+      branch_pcs_q            <= '0;
+      commit_branch_pcs_q     <= '0;
       trace_start_ghr_q       <= '0;
       commit_chunk_ptr_q      <= '0;
       taken_cnt_q             <= '0;
@@ -104,6 +109,8 @@ module trace_builder (
       sram_wr_addr_q          <= sram_wr_addr_d;
       commit_valid_q          <= commit_valid_d;
       commit_data_q           <= commit_data_d;
+      branch_pcs_q            <= branch_pcs_d;
+      commit_branch_pcs_q     <= commit_branch_pcs_d;
       trace_start_ghr_q       <= trace_start_ghr_d;
       commit_chunk_ptr_q      <= commit_chunk_ptr_d;
       taken_cnt_q             <= taken_cnt_d;
@@ -133,6 +140,8 @@ module trace_builder (
     sram_wr_addr_d          = sram_wr_addr_q;
     commit_valid_d          = 1'b0;
     commit_data_d           = commit_data_q;
+    commit_branch_pcs_d     = commit_branch_pcs_q;
+    branch_pcs_d            = branch_pcs_q;
     trace_start_ghr_d       = trace_start_ghr_q;
     commit_chunk_ptr_d      = commit_chunk_ptr_q;
     taken_cnt_d             = taken_cnt_q;
@@ -182,8 +191,7 @@ module trace_builder (
               last_instr_compressed_d = 1'b0;
               last_instr_was_taken_d  = 1'b0;
 
-              trace_d.base_pc      = instr_i.pc[0] & {{(PC_WIDTH-4){1'b1}}, 4'b0000};
-              trace_d.branch_flags = branch_predictions_i;
+              trace_d.base_pc = instr_i.pc[0] & {{(PC_WIDTH-4){1'b1}}, 4'b0000};
 
               for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
                 if (instr_i.valid[i] && (CHUNK_PTR_W'(i) <= branch_slot) &&
@@ -209,6 +217,8 @@ module trace_builder (
                   temp_start_cnt = temp_start_cnt + START_CNT_W'(1);
 
                   if (instr_i.is_branch[i]) begin
+                    trace_d.branch_flags[temp_br_cnt] = instr_i.taken[i];
+                    branch_pcs_d[temp_br_cnt]         = instr_i.pc[i];
                     if (instr_i.taken[i])
                       last_branch_target_d = instr_i.target[i];
                     temp_br_cnt = temp_br_cnt + 1;
@@ -261,6 +271,7 @@ module trace_builder (
                 temp_start_cnt = temp_start_cnt + START_CNT_W'(1);
 
                 if (instr_i.is_branch[i]) begin
+                  branch_pcs_d[temp_br_cnt] = instr_i.pc[i];
                   if (instr_i.taken[i]) begin
                     last_branch_target_d = instr_i.target[i];
                     taken_cnt_d = taken_cnt_q + 2'd1;
@@ -298,9 +309,10 @@ module trace_builder (
                            && (trace_d.branch_flags == dup_flags[candidate_addr]);
 
               if (!is_duplicate) begin
-                sram_wr_addr_d = candidate_addr;
-                commit_valid_d = 1'b1;
-                commit_data_d  = trace_d;
+                sram_wr_addr_d     = candidate_addr;
+                commit_valid_d     = 1'b1;
+                commit_data_d      = trace_d;
+                commit_branch_pcs_d = branch_pcs_d;
               end
 
               state_d                 = IDLE;

@@ -6,6 +6,9 @@ import trace_cache_pkg::*;
 // N-way set-associative trace cache (parametric via NUM_WAYS in pkg).
 // Each way has its own SRAM; all ways are read in parallel on lookup.
 // LRU replacement selects the eviction way on writes.
+//
+// Timing: Lookup fires when frontend consumes a window (same-cycle PC + predictions).
+// SRAM latency 1 -> hit result valid next cycle. Builder write blocks lookup that cycle (single-port).
 
 module trace_cache_top (
   input  logic clk_i,
@@ -25,6 +28,12 @@ module trace_cache_top (
   input  logic [SLOTS_PER_CYCLE-1:0]  instr_queue_consumed_i,
 
   input  logic [CHUNKS_PER_TRACE-1:0] branch_predictions_i,
+
+  // Resolved branch (from backend): correct-path outcomes to store as path tag, matching Rotenberg fill-at-retire semantics
+  input  logic                resolved_branch_valid_i,
+  input  logic [PC_WIDTH-1:0]  resolved_branch_pc_i,
+  input  logic                resolved_branch_is_taken_i,
+  input  logic                resolved_branch_is_mispredict_i,
 
   // Lookup interface
   input  logic                lookup_valid_i,
@@ -76,6 +85,43 @@ module trace_cache_top (
   logic [TRACE_ADDRW-1:0] mem_addr_builder;
   logic [TRACE_WIDTH-1:0] mem_wdata_builder;
   logic [BE_WIDTH-1:0]    mem_be_builder;
+  logic [CHUNKS_PER_TRACE-1:0][PC_WIDTH-1:0] mem_branch_pcs_builder;
+
+  // Resolved-outcome table: on correct-path resolve store (pc_hi, taken); on write override branch_flags => stored path = resolved (Rotenberg)
+  localparam int unsigned RESOLVED_ADDRW = 6;
+  localparam int unsigned RESOLVED_SIZE  = 1 << RESOLVED_ADDRW;
+  typedef struct packed {
+    logic                 valid;
+    logic [PC_WIDTH-1:10] pc_hi;
+    logic                 taken;
+  } resolved_entry_t;
+  resolved_entry_t resolved_table_q [RESOLVED_SIZE];
+  logic [RESOLVED_ADDRW-1:0] resolved_wr_idx;
+  assign resolved_wr_idx = resolved_branch_pc_i[RESOLVED_ADDRW+3:4];
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      for (int i = 0; i < RESOLVED_SIZE; i++)
+        resolved_table_q[i] <= '0;
+    end else if (resolved_branch_valid_i && !resolved_branch_is_mispredict_i) begin
+      resolved_table_q[resolved_wr_idx].valid <= 1'b1;
+      resolved_table_q[resolved_wr_idx].pc_hi  <= resolved_branch_pc_i[PC_WIDTH-1:10];
+      resolved_table_q[resolved_wr_idx].taken <= resolved_branch_is_taken_i;
+    end
+  end
+
+  logic [TRACE_WIDTH-1:0] mem_wdata_final;
+  always_comb begin
+    trace_data_t w;
+    w = trace_data_t'(mem_wdata_builder);
+    for (int i = 0; i < CHUNKS_PER_TRACE; i++)
+      if (i < int'(w.num_branches)) begin
+        resolved_entry_t re = resolved_table_q[mem_branch_pcs_builder[i][RESOLVED_ADDRW+3:4]];
+        if (re.valid && re.pc_hi == mem_branch_pcs_builder[i][PC_WIDTH-1:10])
+          w.branch_flags[i] = re.taken;
+      end
+    mem_wdata_final = w;
+  end
 
   trace_builder i_trace_builder (
     .clk_i,
@@ -83,14 +129,14 @@ module trace_cache_top (
     .instr_i              (instr_if),
     .ghr_i                (ghr),
     .flush_i              (flush_i),
-    .branch_predictions_i (branch_predictions_i),
     .trace_valid_o        (),
     .trace_data_o         (),
     .mem_req_o            (mem_req_builder),
     .mem_we_o             (mem_we_builder),
     .mem_addr_o           (mem_addr_builder),
     .mem_wdata_o          (mem_wdata_builder),
-    .mem_be_o             (mem_be_builder)
+    .mem_be_o             (mem_be_builder),
+    .mem_branch_pcs_o     (mem_branch_pcs_builder)
   );
 
   logic                        lookup_fire;
@@ -135,7 +181,7 @@ module trace_cache_top (
       mem_req[wr_way]   = 1'b1;
       mem_we[wr_way]    = 1'b1;
       mem_addr[wr_way]  = mem_addr_builder;
-      mem_wdata[wr_way] = mem_wdata_builder;
+      mem_wdata[wr_way] = mem_wdata_final;
       mem_be[wr_way]    = mem_be_builder;
     end else if (lookup_fire) begin
       for (int w = 0; w < NUM_WAYS; w++) begin
