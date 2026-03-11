@@ -747,17 +747,16 @@ module frontend
                        && (tc_trace_length != '0)
                        && !flush_i;
 
-  // Cap consecutive replays from the same PC to avoid stuck loops (predictor always taken).
-  // After TC_SAME_PC_REPLAY_CAP replays we fetch normally so the branch can resolve.
-  // Use a lower cap (e.g. 256) so the program can make progress and finish; 4096 was too high.
+  // Same-PC replay cap was used to avoid runaway replay from one PC before we had one-window replay.
+  // With one-window replay we re-lookup every fetch window, so we no longer block on same-PC count.
+  // Counter and debug stats kept for optional TC-FINAL / diagnostics only.
   localparam int unsigned TC_SAME_PC_REPLAY_CAP = 256;
   logic [15:0] tc_same_pc_replay_count_q;
 
   assign tc_active_use = tc_active_hit
                       && tc_trace_starts_ok
                       && (tc_trace_next_pc != tc_lookup_pc_q)
-                      && !tc_replay_active_q
-                      && (tc_same_pc_replay_count_q < TC_SAME_PC_REPLAY_CAP);
+                      && !tc_replay_active_q;
 
 // Define TRACE_CACHE_DEBUG_VERBOSE for per-replay/lookup prints; without it only HOT-CHANGE, SAME-PC-CAP, PERIODIC, FINAL.
 // pragma translate_off
