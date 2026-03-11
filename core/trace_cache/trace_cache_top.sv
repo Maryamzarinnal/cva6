@@ -113,12 +113,13 @@ module trace_cache_top (
   logic [TRACE_WIDTH-1:0] mem_wdata_final;
   always_comb begin
     trace_data_t w;
+    logic [RESOLVED_ADDRW-1:0] idx;
     w = trace_data_t'(mem_wdata_builder);
     for (int i = 0; i < CHUNKS_PER_TRACE; i++)
       if (i < int'(w.num_branches)) begin
-        resolved_entry_t re = resolved_table_q[mem_branch_pcs_builder[i][RESOLVED_ADDRW+3:4]];
-        if (re.valid && re.pc_hi == mem_branch_pcs_builder[i][PC_WIDTH-1:10])
-          w.branch_flags[i] = re.taken;
+        idx = mem_branch_pcs_builder[i][RESOLVED_ADDRW+3:4];
+        if (resolved_table_q[idx].valid && resolved_table_q[idx].pc_hi == mem_branch_pcs_builder[i][PC_WIDTH-1:10])
+          w.branch_flags[i] = resolved_table_q[idx].taken;
       end
     mem_wdata_final = w;
   end
