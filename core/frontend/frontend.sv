@@ -372,7 +372,9 @@ module frontend
     end else if (tc_replay_start) begin
         tc_replay_active_d     = 1'b1;
         tc_replay_len_d        = tc_trace_length;
-        tc_replay_remaining_d  = tc_trace_length;
+        // Paper-aligned: supply at most one fetch window per hit, then next window does a new lookup
+        tc_replay_remaining_d  = (tc_trace_length > TRACE_LEN_WIDTH'(CVA6Cfg.INSTR_PER_FETCH))
+                                  ? TRACE_LEN_WIDTH'(CVA6Cfg.INSTR_PER_FETCH) : tc_trace_length;
         tc_replay_instr_d      = tc_trace_instructions;
         for (int i = 0; i < TRACE_LEN; i++)
           tc_replay_pcs_d[i] = tc_trace_pcs[i][CVA6Cfg.VLEN-1:0];
