@@ -898,9 +898,7 @@ module frontend
       if (tc_replay_done) begin
         tc_replays_completed <= tc_replays_completed + 1;
       end
-      if (tc_active_hit && tc_trace_starts_ok && (tc_trace_next_pc != tc_lookup_pc_q) && !tc_replay_active_q &&
-          (tc_same_pc_replay_count_q >= TC_SAME_PC_REPLAY_CAP))
-        tc_cap_events <= tc_cap_events + 1;
+      // Same-PC cap no longer blocks replay; cap_events left at 0.
     end
   end
 
@@ -993,11 +991,7 @@ module frontend
                tc_replay_base_pc_q, tc_replay_remaining_q, tc_replay_consumed_cnt);
     end
     `endif
-    // Always print (important for stuck-loop diagnosis)
-    if (tc_active_hit && tc_trace_starts_ok && (tc_trace_next_pc != tc_lookup_pc_q) && !tc_replay_active_q &&
-        (tc_same_pc_replay_count_q >= TC_SAME_PC_REPLAY_CAP))
-      $display("[TC-SAME-PC-CAP] blocking replay at 0x%h (count=%0d) - fetch normally @ %0t",
-               tc_lookup_pc_q, tc_same_pc_replay_count_q, $time);
+    // Same-PC cap no longer blocks; message removed to avoid log spam and confusion.
   end
 
   final begin
