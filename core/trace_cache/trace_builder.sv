@@ -337,6 +337,7 @@ module trace_builder #(
   end
 
 `ifndef SYNTHESIS
+  `ifdef TRACE_CACHE_DEBUG_VERBOSE
   always_ff @(posedge clk_i) begin
     if (commit_valid_q) begin
       trace_data_t dbg;
@@ -366,6 +367,7 @@ module trace_builder #(
       $display("[TC-BUILDER] ---------------------------");
     end
   end
+  `endif
 `endif
 
 endmodule

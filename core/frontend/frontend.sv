@@ -933,8 +933,10 @@ module frontend
       tc_same_pc_replay_count_q <= 16'd0;
     end else if (tc_replay_start) begin
       if (tc_lookup_pc_q != tc_last_replay_base_pc_q) begin
+        `ifdef TRACE_CACHE_DEBUG_VERBOSE
         $display("[TC-HOT-CHANGE] 0x%h -> 0x%h (replay #%0d) @ %0t",
                  tc_last_replay_base_pc_q, tc_lookup_pc_q, tc_replays_completed + 1, $time);
+        `endif
         tc_same_pc_replay_count_q <= 16'd1;
       end else begin
         tc_same_pc_replay_count_q <= tc_same_pc_replay_count_q + 1'b1;
