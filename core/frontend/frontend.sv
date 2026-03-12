@@ -335,27 +335,33 @@ module frontend
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      tc_replay_active_q     <= 1'b0;
-      tc_replay_just_done_q  <= 1'b0;
-      tc_replay_len_q        <= '0;
-      tc_replay_remaining_q  <= '0;
-      tc_replay_instr_q      <= '0;
-      tc_replay_pcs_q        <= '0;
-      tc_replay_base_pc_q    <= '0;
-      tc_replay_next_pc_q    <= '0;
+      tc_replay_active_q        <= 1'b0;
+      tc_replay_just_done_q     <= 1'b0;
+      tc_replay_len_q           <= '0;
+      tc_replay_remaining_q     <= '0;
+      tc_replay_instr_q         <= '0;
+      tc_replay_pcs_q           <= '0;
+      tc_replay_base_pc_q       <= '0;
+      tc_replay_next_pc_q       <= '0;
+      tc_just_done_timeout_cnt_q <= '0;
     end else begin
-      tc_replay_active_q     <= tc_replay_active_d;
-      tc_replay_just_done_q  <= tc_replay_just_done_d;
-      tc_replay_len_q        <= tc_replay_len_d;
-      tc_replay_remaining_q  <= tc_replay_remaining_d;
-      tc_replay_instr_q      <= tc_replay_instr_d;
-      tc_replay_pcs_q        <= tc_replay_pcs_d;
-      tc_replay_base_pc_q    <= tc_replay_base_pc_d;
-      tc_replay_next_pc_q    <= tc_replay_next_pc_d;
+      tc_replay_active_q        <= tc_replay_active_d;
+      tc_replay_just_done_q     <= tc_replay_just_done_d;
+      tc_replay_len_q           <= tc_replay_len_d;
+      tc_replay_remaining_q     <= tc_replay_remaining_d;
+      tc_replay_instr_q         <= tc_replay_instr_d;
+      tc_replay_pcs_q           <= tc_replay_pcs_d;
+      tc_replay_base_pc_q       <= tc_replay_base_pc_d;
+      tc_replay_next_pc_q       <= tc_replay_next_pc_d;
+      tc_just_done_timeout_cnt_q <= tc_just_done_timeout_cnt_d;
     end
   end
 
   assign tc_replay_start = tc_active_use && !tc_replay_active_q;
+
+  // Safety timeout: if we wait too long for icache response after replay, clear just_done to avoid deadlock
+  localparam int unsigned TC_JUST_DONE_TIMEOUT = 4096;
+  logic [$clog2(TC_JUST_DONE_TIMEOUT+1)-1:0] tc_just_done_timeout_cnt_q, tc_just_done_timeout_cnt_d;
 
   always_comb begin
     tc_replay_active_d     = tc_replay_active_q;
@@ -367,6 +373,8 @@ module frontend
     tc_replay_next_pc_d    = tc_replay_next_pc_q;
 
     tc_replay_just_done_d = tc_replay_just_done_q;
+    tc_just_done_timeout_cnt_d = tc_replay_just_done_q ? tc_just_done_timeout_cnt_q + 1'b1 : '0;
+
     if (flush_i || is_mispredict || set_pc_commit_i || ex_valid_i || eret_i) begin
       tc_replay_active_d    = 1'b0;
       tc_replay_remaining_d = '0;
@@ -380,6 +388,12 @@ module frontend
                  (icache_dreq_i.vaddr[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] ==
                   npc_q[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS])) begin
       tc_replay_just_done_d = 1'b0;
+    end else if (tc_replay_just_done_q && (tc_just_done_timeout_cnt_q >= TC_JUST_DONE_TIMEOUT)) begin
+      tc_replay_just_done_d = 1'b0;
+`ifndef SYNTHESIS
+      $display("[TC-TIMEOUT] Cleared just_done after %0d cycles; was waiting for icache at npc=0x%h (trace target); replayed trace base_pc=0x%h",
+               TC_JUST_DONE_TIMEOUT, npc_q, tc_replay_base_pc_q);
+`endif
     end else if (tc_replay_start) begin
         tc_replay_active_d     = 1'b1;
         tc_replay_len_d        = tc_trace_length;
