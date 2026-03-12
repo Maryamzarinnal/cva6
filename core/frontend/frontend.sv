@@ -271,7 +271,10 @@ module frontend
   assign icache_dreq_o.req     = instr_queue_ready & ~halt_frontend_i & ~tc_replay_active_q;
   assign if_ready              = icache_dreq_i.ready & instr_queue_ready & ~halt_frontend_i & ~tc_replay_active_q;
   assign icache_dreq_o.kill_s1 = is_mispredict | flush_i | replay;
-  assign icache_dreq_o.kill_s2 = icache_dreq_o.kill_s1 | bp_valid;
+  // When tc_replay_just_done we are waiting for the icache response at npc (trace target). The aligner still
+  // shows the last replayed window (e.g. JALR), so bp_valid stays 1 and we would kill_s2 every cycle and never
+  // get that response ? stuck until timeout. Do not let bp_valid kill while we are in just_done.
+  assign icache_dreq_o.kill_s2 = icache_dreq_o.kill_s1 | (bp_valid & ~tc_replay_just_done_q);
 
   bht_update_t bht_update;
   btb_update_t btb_update;
@@ -383,7 +386,8 @@ module frontend
       tc_replay_just_done_d = 1'b1;
       tc_replay_active_d    = 1'b0;
       tc_replay_remaining_d = '0;
-    // Wait for icache to return the line at the trace target before we feed again (avoids stale data)
+    // Wait for icache to return the line at the trace target (npc = predicted branch target) before we feed again.
+    // We request that address (icache_dreq_o.vaddr = npc_q), so the response can and should match.
     end else if (tc_replay_just_done_q && icache_dreq_i.valid &&
                  (icache_dreq_i.vaddr[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] ==
                   npc_q[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS])) begin
