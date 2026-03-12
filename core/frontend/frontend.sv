@@ -287,14 +287,24 @@ module frontend
   assign btb_update.pc             = resolved_branch_i.pc;
   assign btb_update.target_address = resolved_branch_i.target_address;
 
+  // Next PC after trace is already correct: tc_replay_next_pc_q = target if last instr was taken branch, else fall-through (+2/+4).
+  // Only mark last slot as Branch when that instruction actually was a taken branch (so backend can detect mispredict).
+  logic [CVA6Cfg.VLEN-1:0] last_replay_pc, last_replay_fall_through;
+  logic                    last_slot_is_taken_branch;
+  always_comb begin
+    last_replay_pc          = (tc_replay_len_q != 0) ? tc_replay_pcs_q[tc_replay_len_q - 1] : '0;
+    last_replay_fall_through = last_replay_pc + ((tc_replay_len_q != 0) && (tc_replay_instr_q[tc_replay_len_q - 1][1:0] != 2'b11) ? CVA6Cfg.VLEN'(2) : CVA6Cfg.VLEN'(4));
+    last_slot_is_taken_branch = (tc_replay_len_q != 0) && (tc_replay_next_pc_q != last_replay_fall_through);
+  end
+
   always_comb begin
     replay_instr_iq        = '0;
     replay_addr_iq         = '0;
     replay_valid_iq        = '0;
-    replay_predict_addr_iq = tc_replay_next_pc_q;  // so backend can detect mispredict when branch resolves not-taken
+    replay_predict_addr_iq = tc_replay_next_pc_q;
     tc_replay_consumed_cnt = '0;
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++)
-      replay_cf_type_iq[i] = (tc_replay_len_q != 0 && TRACE_LEN_WIDTH'(i) == tc_replay_len_q - 1)
+      replay_cf_type_iq[i] = (tc_replay_len_q != 0 && TRACE_LEN_WIDTH'(i) == tc_replay_len_q - 1 && last_slot_is_taken_branch)
                             ? ariane_pkg::Branch : ariane_pkg::NoCF;
 
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
@@ -365,6 +375,7 @@ module frontend
       tc_replay_just_done_d = 1'b1;
       tc_replay_active_d    = 1'b0;
       tc_replay_remaining_d = '0;
+    // Wait for icache to return the line at the trace target before we feed again (avoids stale data)
     end else if (tc_replay_just_done_q && icache_dreq_i.valid &&
                  (icache_dreq_i.vaddr[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] ==
                   npc_q[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS])) begin
@@ -372,7 +383,6 @@ module frontend
     end else if (tc_replay_start) begin
         tc_replay_active_d     = 1'b1;
         tc_replay_len_d        = tc_trace_length;
-        // Paper-aligned: supply at most one fetch window per hit, then next window does a new lookup
         tc_replay_remaining_d  = (tc_trace_length > TRACE_LEN_WIDTH'(CVA6Cfg.INSTR_PER_FETCH))
                                   ? TRACE_LEN_WIDTH'(CVA6Cfg.INSTR_PER_FETCH) : tc_trace_length;
         tc_replay_instr_d      = tc_trace_instructions;
@@ -401,7 +411,6 @@ module frontend
       exception_tinst_to_iq  = '0;
       exception_gva_to_iq    = 1'b0;
     end else if (tc_replay_just_done_q) begin
-      // Do not feed stale fetch data; wait for new fetch from tc_replay_next_pc_q
       instr_to_iq            = '0;
       addr_to_iq             = '0;
       valid_to_iq            = '0;
@@ -672,6 +681,20 @@ module frontend
     end
   end
 
+  // Lookup only when the consumed window contains a taken branch (traces are built from such windows).
+  logic consumed_has_taken_branch;
+  always_comb begin
+    consumed_has_taken_branch = 1'b0;
+    for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++)
+      if (instr_queue_consumed[i] && tc_is_branch[i] && tc_taken[i])
+        consumed_has_taken_branch = 1'b1;
+  end
+
+  // One place for "we may do a TC lookup": consumed window had a taken branch, not in replay
+  logic tc_lookup_cond;
+  assign tc_lookup_cond = (|instr_queue_consumed) && consumed_has_taken_branch
+                          && !tc_replay_active_q && !tc_replay_just_done_q;
+
   always_comb begin
     integer br_idx;
     tc_branch_predictions = '0;
@@ -693,7 +716,9 @@ module frontend
     end
   end
 
-  trace_cache_top i_trace_cache_top (
+  trace_cache_top #(
+    .MaxTraceInstr          (CVA6Cfg.INSTR_PER_FETCH)
+  ) i_trace_cache_top (
     .clk_i                  (clk_i),
     .rst_ni                 (rst_ni),
     .instr_valid_i          (tc_instr_valid),
@@ -711,7 +736,7 @@ module frontend
     .resolved_branch_pc_i         (resolved_branch_i.pc),
     .resolved_branch_is_taken_i   (resolved_branch_i.is_taken),
     .resolved_branch_is_mispredict_i (resolved_branch_i.is_mispredict),
-    .lookup_valid_i         ((|instr_queue_consumed) && !tc_replay_active_q && !tc_replay_just_done_q),
+    .lookup_valid_i         (tc_lookup_cond),
     .lookup_pc_i            (tc_pc[0]),
     .trace_hit_o            (tc_trace_hit),
     .trace_instructions_o   (tc_trace_instructions),
@@ -727,8 +752,8 @@ module frontend
       tc_lookup_valid_q <= 1'b0;
       tc_lookup_pc_q    <= '0;
     end else begin
-      tc_lookup_valid_q <= (|instr_queue_consumed) && !flush_i && !tc_replay_active_q && !tc_replay_just_done_q;
-      tc_lookup_pc_q    <= tc_pc[0] & {{(PC_WIDTH-4){1'b1}}, 4'b0000};
+      tc_lookup_valid_q <= tc_lookup_cond && !flush_i;
+      tc_lookup_pc_q    <= trace_cache_pkg::pc_align_16(tc_pc[0]);
     end
   end
 
@@ -742,14 +767,13 @@ module frontend
 
   assign tc_trace_starts_ok = (tc_trace_starts <= TRACE_LEN_WIDTH'(TRACE_LEN));
 
+  // Hit result appears one cycle after lookup; we latched (valid, pc) when we fired, so pairing is correct
   assign tc_active_hit = tc_lookup_valid_q
                        && tc_trace_hit
                        && (tc_trace_length != '0)
                        && !flush_i;
 
-  // Same-PC replay cap was used to avoid runaway replay from one PC before we had one-window replay.
-  // With one-window replay we re-lookup every fetch window, so we no longer block on same-PC count.
-  // Counter and debug stats kept for optional TC-FINAL / diagnostics only.
+  // Same-PC cap is no longer used to block replay (we replay one window then re-lookup). Kept for stats.
   localparam int unsigned TC_SAME_PC_REPLAY_CAP = 256;
   logic [15:0] tc_same_pc_replay_count_q;
 
@@ -758,8 +782,8 @@ module frontend
                       && (tc_trace_next_pc != tc_lookup_pc_q)
                       && !tc_replay_active_q;
 
-// Define TRACE_CACHE_DEBUG_VERBOSE for per-replay/lookup prints; without it only HOT-CHANGE, SAME-PC-CAP, PERIODIC, FINAL.
 // pragma translate_off
+  // Compile with +define+TRACE_CACHE_DEBUG_VERBOSE for extra per-replay/lookup prints
   logic         tc_replay_active_q_prev;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni)

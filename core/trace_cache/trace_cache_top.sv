@@ -1,16 +1,16 @@
 `timescale 1ns/1ps
 import trace_cache_pkg::*;
+import riscv::*;
 
-// trace_cache_top.sv
-//
-// N-way set-associative trace cache (parametric via NUM_WAYS in pkg).
-// Each way has its own SRAM; all ways are read in parallel on lookup.
-// LRU replacement selects the eviction way on writes.
-//
-// Timing: Lookup fires when frontend consumes a window (same-cycle PC + predictions).
-// SRAM latency 1 -> hit result valid next cycle. Builder write blocks lookup that cycle (single-port).
+// Set-associative trace cache. Each way has its own SRAM; lookup reads all ways in parallel.
+// LRU picks the way to replace on write. Lookup runs when the frontend consumes a window;
+// SRAM has one cycle latency so the hit result is valid the next cycle. Builder and lookup
+// share the port (builder write blocks lookup that cycle).
+// MaxTraceInstr = max instructions per trace (e.g. one fetch window); must be <= TRACE_LEN.
 
-module trace_cache_top (
+module trace_cache_top #(
+  parameter int unsigned MaxTraceInstr = TRACE_LEN
+) (
   input  logic clk_i,
   input  logic rst_ni,
 
@@ -48,6 +48,10 @@ module trace_cache_top (
   output logic [CHUNKS_PER_TRACE-1:0]                trace_valid_chunks_o,
   output logic [TRACE_LEN-1:0][PC_WIDTH-1:0]         trace_pcs_o
 );
+
+  // Stored trace length must not exceed structure size
+  initial assert (MaxTraceInstr <= TRACE_LEN)
+    else $fatal(1, "trace_cache_top: MaxTraceInstr (%0d) must be <= TRACE_LEN (%0d)", MaxTraceInstr, TRACE_LEN);
 
   tracebuilder_instr_if instr_if (
     .clk_i (clk_i),
@@ -124,7 +128,9 @@ module trace_cache_top (
     mem_wdata_final = w;
   end
 
-  trace_builder i_trace_builder (
+  trace_builder #(
+    .MAX_INSTR_PER_TRACE  (MaxTraceInstr)
+  ) i_trace_builder (
     .clk_i,
     .rst_ni,
     .instr_i              (instr_if),
@@ -147,9 +153,8 @@ module trace_cache_top (
   logic [TRACE_ADDRW-1:0]      lookup_set_q;
 
   assign lookup_fire = lookup_valid_i && !mem_req_builder;
-
   logic [PC_WIDTH-1:0] lookup_base;
-  assign lookup_base = lookup_pc_i & {{(PC_WIDTH-4){1'b1}}, 4'b0000};
+  assign lookup_base = pc_align_16(lookup_pc_i);
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -253,7 +258,6 @@ module trace_cache_top (
   assign trace_next_pc_o      = hit_trace.target_addr;
   assign trace_chunks_o       = trace_hit ? hit_trace.chunks : '0;
   assign trace_valid_chunks_o = trace_hit ? hit_trace.valid_chunks : '0;
-  assign trace_pcs_o          = trace_hit ? hit_trace.instr_pcs : '0;
 
   logic [TRACE_LEN_WIDTH-1:0] instr_count;
   always_comb begin
@@ -288,6 +292,54 @@ module trace_cache_top (
     end
   end
 
+  // Reconstruct PCs from base_pc, expanded instructions, and branch_flags. Fall-through +2/+4;
+  // taken branches use pc+imm (B/J/RVC); JALR at end uses stored target_addr. Uses riscv:: opcodes.
+  logic [TRACE_LEN-1:0][PC_WIDTH-1:0] computed_pcs;
+  always_comb begin
+    logic [PC_WIDTH-1:0]     pc;
+    logic [INSTR_WIDTH-1:0]  instr;
+    logic [PC_WIDTH-1:0]     imm_signed;
+    logic                    is_rvc, is_cf, is_jalr, taken;
+    int                      br_idx;
+    for (int j = 0; j < TRACE_LEN; j++) trace_pcs_o[j] = '0;
+    if (!trace_hit) begin
+      pc = '0;
+      br_idx = 0;
+    end else begin
+    pc    = hit_trace.base_pc;
+    br_idx = 0;
+    for (int i = 0; i < TRACE_LEN; i++) begin
+      if (i >= int'(instr_count)) break;
+      instr   = trace_instructions_o[i];
+      is_rvc  = (instr[1:0] != 2'b11);
+      is_cf   = (!is_rvc && (instr[6:0] == OpcodeBranch || instr[6:0] == OpcodeJal || instr[6:0] == OpcodeJalr))
+                || (is_rvc && (instr[15:13] == OpcodeC1J || instr[15:13] == OpcodeC1Beqz || instr[15:13] == OpcodeC1Bnez));
+      is_jalr = (!is_rvc && (instr[6:0] == OpcodeJalr))
+                || (is_rvc && instr[15:13] == OpcodeC2JalrMvAdd && instr[6:2] == 5'b00000 && instr[1:0] == OpcodeC2 && instr[12]);
+      taken   = is_cf && (br_idx < int'(hit_trace.num_branches)) && hit_trace.branch_flags[br_idx];
+      if (is_cf) br_idx++;
+      computed_pcs[i] = pc;
+      if (taken && is_jalr && (i == int'(instr_count) - 1))
+        pc = hit_trace.target_addr;
+      else if (taken && is_cf) begin
+        if (!is_rvc && instr[6:0] == OpcodeBranch)   // B-type (sb_imm)
+          imm_signed = {{(PC_WIDTH-13){instr[31]}}, instr[31], instr[7], instr[30:25], instr[11:8], 1'b0};
+        else if (!is_rvc && instr[6:0] == OpcodeJal) // JAL (uj_imm)
+          imm_signed = {{(PC_WIDTH-21){instr[31]}}, instr[31], instr[19:12], instr[20], instr[30:21], 1'b0};
+        else if (is_rvc && instr[15:13] == OpcodeC1J) // C.jal (two encodings: instr[14] selects format, same as instr_scan rvc_imm_o)
+          imm_signed = instr[14] ? {{(PC_WIDTH-9){instr[12]}}, instr[6:5], instr[2], instr[11:10], instr[4:3], 1'b0}
+                        : {{(PC_WIDTH-12){instr[12]}}, instr[8], instr[10:9], instr[6], instr[7], instr[2], instr[11], instr[5:3], 1'b0};
+        else  // RVC beqz/bnez
+          imm_signed = {{(PC_WIDTH-9){instr[12]}}, instr[6:5], instr[2], instr[11:10], instr[4:3], 1'b0};
+        pc = pc + imm_signed;
+      end else
+        pc = pc + (is_rvc ? PC_WIDTH'(2) : PC_WIDTH'(4));
+    end
+    for (int j = 0; j < TRACE_LEN; j++)
+      trace_pcs_o[j] = (j < int'(instr_count)) ? computed_pcs[j] : '0;
+    end
+  end
+
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       for (int s = 0; s < (1 << TRACE_ADDRW); s++)
@@ -300,8 +352,8 @@ module trace_cache_top (
     end
   end
 
-// Define TRACE_CACHE_DEBUG_VERBOSE (e.g. +define+TRACE_CACHE_DEBUG_VERBOSE) for per-lookup/replay prints.
 `ifndef SYNTHESIS
+  // +define+TRACE_CACHE_DEBUG_VERBOSE for per-lookup prints
   `ifdef TRACE_CACHE_DEBUG_VERBOSE
   always_ff @(posedge clk_i) begin
     if (lookup_valid_q) begin

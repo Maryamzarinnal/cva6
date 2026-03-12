@@ -2,42 +2,27 @@
 
 package trace_cache_pkg;
 
+  // Match frontend: one fetch window = up to 4 slots per cycle
   localparam int unsigned SLOTS_PER_CYCLE = 4;
-
-  // Max instructions replayed from one trace
   localparam int unsigned TRACE_LEN = 4;
   localparam int unsigned INSTR_WIDTH = 32;
   localparam int unsigned TRACE_LEN_WIDTH = $clog2(TRACE_LEN + 1);
 
-  // Associativity
   localparam int unsigned NUM_WAYS = 2;
-
-  // With NUM_WAYS=2, TRACE_ADDRW=8: 2 x 256 = 512 total entries.
-  localparam int unsigned TRACE_ADDRW = 8;
-
-  // Global history register width
+  localparam int unsigned TRACE_ADDRW = 8;  // 2 ways x 256 sets
   localparam int unsigned GHR_WIDTH = 8;
 
-  // CVA6 uses 64-bit addresses
-  localparam int unsigned PC_WIDTH = 64;
+  localparam int unsigned PC_WIDTH = 64;  // CVA6 is 64-bit
 
-  // Each instruction is stored in 16-bit chunks.
-  // 32-bit inst = 2 chunks, compressed = 1 chunk.
-  // Worst case for 4 starts is 8 chunks.
+  // Instructions stored as 16-bit chunks so we can mix 32-bit and RVC (1 or 2 chunks per instr).
+  // valid_chunks[i]=1 means start of an instruction; next chunk may be high half of 32-bit.
   localparam int unsigned CHUNKS_PER_TRACE = TRACE_LEN * 2;
-
-  // Bits to count up to CHUNKS_PER_TRACE branches
   localparam int unsigned BR_CNT_WIDTH = $clog2(CHUNKS_PER_TRACE + 1);
 
+  // PCs are not stored per instruction; on hit we derive them from base_pc + instr + branch_flags
   localparam int unsigned TRACE_WIDTH =
-    1 +                            // valid
-    PC_WIDTH +                     // base_pc
-    CHUNKS_PER_TRACE +             // branch_flags
-    BR_CNT_WIDTH +                 // num_branches
-    PC_WIDTH +                     // target_addr
-    (CHUNKS_PER_TRACE * 16) +      // instruction chunks
-    CHUNKS_PER_TRACE +             // valid_chunks
-    (TRACE_LEN * PC_WIDTH);        // per-instruction PCs for replay semantics
+    1 + PC_WIDTH + CHUNKS_PER_TRACE + BR_CNT_WIDTH + PC_WIDTH
+    + (CHUNKS_PER_TRACE * 16) + CHUNKS_PER_TRACE;
 
   localparam int unsigned BE_WIDTH = (TRACE_WIDTH + 7) / 8;
 
@@ -48,11 +33,14 @@ package trace_cache_pkg;
     logic [BR_CNT_WIDTH-1:0]            num_branches;
     logic [PC_WIDTH-1:0]                target_addr;
     logic [CHUNKS_PER_TRACE-1:0][15:0]  chunks;
-    logic [CHUNKS_PER_TRACE-1:0]        valid_chunks;   // 1 = instruction start
-    logic [TRACE_LEN-1:0][PC_WIDTH-1:0] instr_pcs;      // PC per replayed instruction start
+    logic [CHUNKS_PER_TRACE-1:0]        valid_chunks;
   } trace_data_t;
 
   localparam int unsigned TC_INDEX_FLAG_BITS = 2;
+
+  function automatic logic [PC_WIDTH-1:0] pc_align_16(input logic [PC_WIDTH-1:0] pc);
+    pc_align_16 = pc & {{(PC_WIDTH-4){1'b1}}, 4'b0};
+  endfunction
 
   function automatic logic [TRACE_ADDRW-1:0] tc_index(
     input logic [PC_WIDTH-1:0]         pc,

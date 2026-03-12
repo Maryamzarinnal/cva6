@@ -1,18 +1,15 @@
 `timescale 1ns/1ps
 import trace_cache_pkg::*;
-//
-// A "trace" in this design is the sequence of instructions in the fetch
-// windows starting from the base window that contains a taken branch.
-// The trace is tagged by:
-//   - base_pc:      fetch-aligned address of the base window
-//   - branch_flags: stored path (taken/not-taken). Rotenberg: fill-at-retire => resolved path. We fill
-//     at fetch but overwrite with resolved outcomes on write (when available) to match that semantics.
-//   - num_branches: branch count in the base window
-//
-// Active replay currently supports TRACE_LEN instruction starts. Builder
-// therefore enforces a hard cap of TRACE_LEN starts per committed trace.
 
-module trace_builder (
+// Builds a trace from fetch windows: start at the window where a branch is taken, then keep
+// adding instructions from the next window(s) until we hit MAX_INSTR_PER_TRACE (one fetch
+// window worth, e.g. 4). Tag = (base_pc, branch_flags). We fill at fetch; on write we overwrite
+// branch_flags with resolved outcomes when we have them (Rotenberg-style). Stored as 16-bit
+// chunks; valid_chunks marks instruction starts. MAX_INSTR_PER_TRACE must be <= TRACE_LEN.
+
+module trace_builder #(
+  parameter int unsigned MAX_INSTR_PER_TRACE = TRACE_LEN
+) (
     input  logic clk_i,
     input  logic rst_ni,
 
@@ -39,8 +36,7 @@ module trace_builder (
 
   typedef enum logic [1:0] {
     IDLE,
-    ACCUM,
-    COMMIT
+    ACCUM
   } state_t;
 
   state_t state_q, state_d;
@@ -191,17 +187,16 @@ module trace_builder (
               last_instr_compressed_d = 1'b0;
               last_instr_was_taken_d  = 1'b0;
 
-              trace_d.base_pc = instr_i.pc[0] & {{(PC_WIDTH-4){1'b1}}, 4'b0000};
+              trace_d.base_pc = pc_align_16(instr_i.pc[0]);
 
               for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
                 if (instr_i.valid[i] && (CHUNK_PTR_W'(i) <= branch_slot) &&
-                    (temp_start_cnt < START_CNT_W'(TRACE_LEN))) begin
+                    (temp_start_cnt < START_CNT_W'(MAX_INSTR_PER_TRACE))) begin
                   is_compressed = (instr_i.inst[i][1:0] != 2'b11);
 
                   last_instr_pc_d         = instr_i.pc[i];
                   last_instr_compressed_d = is_compressed;
                   last_instr_was_taken_d  = instr_i.is_branch[i] && instr_i.taken[i];
-                  trace_d.instr_pcs[temp_start_cnt] = instr_i.pc[i];
 
                   if (!is_compressed) begin
                     trace_d.chunks[temp_chunk_ptr]         = instr_i.inst[i][15:0];
@@ -251,11 +246,10 @@ module trace_builder (
                           (temp_chunk_ptr + 2 <= CHUNKS_PER_TRACE);
 
               if (instr_i.valid[i] && has_space && !hit_taken &&
-                  (temp_start_cnt < START_CNT_W'(TRACE_LEN))) begin
+                  (temp_start_cnt < START_CNT_W'(MAX_INSTR_PER_TRACE))) begin
                 last_instr_pc_d         = instr_i.pc[i];
                 last_instr_compressed_d = is_compressed;
                 last_instr_was_taken_d  = instr_i.is_branch[i] && instr_i.taken[i];
-                trace_d.instr_pcs[temp_start_cnt] = instr_i.pc[i];
 
                 if (!is_compressed) begin
                   trace_d.chunks[temp_chunk_ptr]         = instr_i.inst[i][15:0];
@@ -280,7 +274,7 @@ module trace_builder (
                   temp_br_cnt = temp_br_cnt + 1;
                 end
               end else if (instr_i.valid[i] &&
-                           (!has_space || (temp_start_cnt >= START_CNT_W'(TRACE_LEN)))) begin
+                           (!has_space || (temp_start_cnt >= START_CNT_W'(MAX_INSTR_PER_TRACE)))) begin
                 trace_full = 1'b1;
               end
             end
@@ -290,7 +284,7 @@ module trace_builder (
             instr_start_cnt_d = temp_start_cnt;
 
             if (trace_full ||
-                (temp_start_cnt >= START_CNT_W'(TRACE_LEN) && temp_chunk_ptr > 0) ||
+                (temp_start_cnt >= START_CNT_W'(MAX_INSTR_PER_TRACE) && temp_chunk_ptr > 0) ||
                 (taken_cnt_d >= MAX_TAKEN[1:0] && temp_chunk_ptr > 0)) begin
               logic [TRACE_ADDRW-1:0] candidate_addr;
               logic                   is_duplicate;
@@ -323,10 +317,6 @@ module trace_builder (
               trace_d                 = '0;
             end
           end
-        end
-
-        COMMIT: begin
-          state_d = IDLE;
         end
 
       endcase
