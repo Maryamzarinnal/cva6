@@ -333,6 +333,10 @@ module frontend
     tc_replay_linear_ok     = (tc_trace_next_pc[CVA6Cfg.VLEN-1:0] == tc_replay_linear_end_pc);
   end
 
+  // Safety timeout: if we wait too long for icache response after replay, clear just_done to avoid deadlock
+  localparam int unsigned TC_JUST_DONE_TIMEOUT = 4096;
+  logic [$clog2(TC_JUST_DONE_TIMEOUT+1)-1:0] tc_just_done_timeout_cnt_q, tc_just_done_timeout_cnt_d;
+
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       tc_replay_active_q        <= 1'b0;
@@ -358,10 +362,6 @@ module frontend
   end
 
   assign tc_replay_start = tc_active_use && !tc_replay_active_q;
-
-  // Safety timeout: if we wait too long for icache response after replay, clear just_done to avoid deadlock
-  localparam int unsigned TC_JUST_DONE_TIMEOUT = 4096;
-  logic [$clog2(TC_JUST_DONE_TIMEOUT+1)-1:0] tc_just_done_timeout_cnt_q, tc_just_done_timeout_cnt_d;
 
   always_comb begin
     tc_replay_active_d     = tc_replay_active_q;
