@@ -360,6 +360,7 @@ module trace_cache_top #(
 
 // Miss breakdown: use MODEL_TECH (Questa/ModelSim) so it runs in sim even if SYNTHESIS is set by the build
 `ifdef MODEL_TECH
+  initial $display("[TC-DEBUG] trace_cache_top: miss breakdown ACTIVE (MODEL_TECH defined)");
   logic any_valid_in_set;
   logic any_pc_match_in_set;
   always_comb begin
@@ -398,6 +399,7 @@ module trace_cache_top #(
   assign tc_miss_pc_o    = tc_miss_pc;
   assign tc_miss_path_o  = tc_miss_path;
 `else
+  initial $display("[TC-DEBUG] trace_cache_top: miss breakdown DISABLED (MODEL_TECH not defined - add +define+MODEL_TECH to compile)");
   assign tc_miss_total_o = 32'b0;
   assign tc_miss_empty_o = 32'b0;
   assign tc_miss_pc_o    = 32'b0;
