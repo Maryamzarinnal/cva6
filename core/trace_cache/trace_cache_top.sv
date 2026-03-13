@@ -48,6 +48,9 @@ module trace_cache_top #(
   output logic [CHUNKS_PER_TRACE-1:0]                trace_valid_chunks_o,
   output logic [TRACE_LEN-1:0][PC_WIDTH-1:0]         trace_pcs_o,
 
+  // High when this cycle's trace_hit_o is for a lookup we actually did (we fired); use for hit/miss counting
+  output logic                                        lookup_result_valid_o,
+
   // Miss breakdown for debug (0 in synthesis)
   output logic [31:0]                                tc_miss_total_o,
   output logic [31:0]                                tc_miss_empty_o,
@@ -159,6 +162,7 @@ module trace_cache_top #(
   logic [TRACE_ADDRW-1:0]      lookup_set_q;
 
   assign lookup_fire = lookup_valid_i && !mem_req_builder;
+  assign lookup_result_valid_o = lookup_valid_q;  // high when trace_hit_o is for a lookup we actually did
   logic [PC_WIDTH-1:0] lookup_base;
   assign lookup_base = pc_align_16(lookup_pc_i);
 

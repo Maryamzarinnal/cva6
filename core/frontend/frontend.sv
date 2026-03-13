@@ -97,6 +97,7 @@ module frontend
   logic [31:0]                             tc_miss_empty;
   logic [31:0]                             tc_miss_pc;
   logic [31:0]                             tc_miss_path;
+  logic                                    tc_lookup_result_valid;  // TC actually did this lookup; use for hit/miss count
   logic                                    tc_active_use;
   logic                                    tc_active_hit;
   logic [TRACE_LEN_WIDTH-1:0]              tc_trace_starts;
@@ -776,7 +777,8 @@ module frontend
     .tc_miss_total_o        (tc_miss_total),
     .tc_miss_empty_o        (tc_miss_empty),
     .tc_miss_pc_o           (tc_miss_pc),
-    .tc_miss_path_o         (tc_miss_path)
+    .tc_miss_path_o         (tc_miss_path),
+    .lookup_result_valid_o (tc_lookup_result_valid)
   );
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -923,9 +925,9 @@ module frontend
         window_count <= window_count + 1;
       end
 
-      if (counting_active) begin
-        if (tc_trace_hit)      tc_hits   <= tc_hits + 1;
-        else if (tc_lookup_valid_q) tc_misses <= tc_misses + 1;
+      if (counting_active && tc_lookup_result_valid) begin
+        if (tc_trace_hit) tc_hits   <= tc_hits + 1;
+        else              tc_misses <= tc_misses + 1;
 
         tc_had_taken_q <= |tc_taken && |instr_queue_consumed && !flush_i;
         if (tc_had_taken_q) begin
@@ -947,7 +949,8 @@ module frontend
       end
 
       // Global stats (whole run) for long-run debug
-      if (tc_lookup_valid_q) begin
+      // Only count hit/miss when the TC actually did this lookup (fired); else we'd pair our request with an old result
+      if (tc_lookup_result_valid) begin
         if (tc_trace_hit)
           tc_global_hits   <= tc_global_hits + 1;
         else
