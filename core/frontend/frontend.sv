@@ -340,6 +340,12 @@ module frontend
   localparam int unsigned TC_JUST_DONE_TIMEOUT = 4096;
   logic [$clog2(TC_JUST_DONE_TIMEOUT+1)-1:0] tc_just_done_timeout_cnt_q, tc_just_done_timeout_cnt_d;
 
+  // Debug: why we left tc_replay_just_done (for TC-PERIODIC stats)
+  logic tc_just_done_cleared_by_match, tc_just_done_cleared_by_timeout;
+  assign tc_just_done_cleared_by_match  = tc_replay_just_done_q && icache_dreq_i.valid &&
+    (icache_dreq_i.vaddr[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] == npc_q[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS]);
+  assign tc_just_done_cleared_by_timeout = tc_replay_just_done_q && (tc_just_done_timeout_cnt_q >= TC_JUST_DONE_TIMEOUT);
+
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       tc_replay_active_q        <= 1'b0;
@@ -834,6 +840,8 @@ module frontend
   int unsigned  tc_replays_completed;
   int unsigned  tc_replay_cycles_total;
   int unsigned  tc_cap_events;  // times same-PC cap blocked replay (forced normal fetch)
+  int unsigned  tc_just_done_match_cnt;   // cleared just_done because icache vaddr matched npc
+  int unsigned  tc_just_done_timeout_cnt; // cleared just_done by timeout (stuck)
   logic [PC_WIDTH-1:0] tc_last_replay_base_pc_q;
   int unsigned  tc_commit_count_q;  // trace commits (for gating TC-STATS print)
   longint unsigned tc_total_cycles_q;  // total cycles (for fetch-improvement metric)
@@ -863,6 +871,8 @@ module frontend
       tc_replays_completed <= 0;
       tc_replay_cycles_total <= 0;
       tc_cap_events    <= 0;
+      tc_just_done_match_cnt  <= 0;
+      tc_just_done_timeout_cnt <= 0;
       tc_commit_count_q <= 0;
     end else begin
       if (pc_commit_i == 64'h80001568) begin
@@ -940,6 +950,10 @@ module frontend
       if (tc_replay_done) begin
         tc_replays_completed <= tc_replays_completed + 1;
       end
+      if (tc_just_done_cleared_by_match)
+        tc_just_done_match_cnt <= tc_just_done_match_cnt + 1;
+      if (tc_just_done_cleared_by_timeout)
+        tc_just_done_timeout_cnt <= tc_just_done_timeout_cnt + 1;
       // Same-PC cap no longer blocks replay; cap_events left at 0.
     end
   end
@@ -975,10 +989,10 @@ module frontend
                tc_replay_remaining_q, $time);
     `endif
     if (tc_replay_done && (tc_replays_completed + 1) % 100 == 0) begin
-      $display("[TC-PERIODIC] replays=%0d global_hits=%0d global_misses=%0d hit_rate=%0d%% replay_cycles=%0d @ %0t",
+      $display("[TC-PERIODIC] replays=%0d global_hits=%0d global_misses=%0d hit_rate=%0d%% replay_cycles=%0d just_done_match=%0d just_done_timeout=%0d @ %0t",
                tc_replays_completed + 1, tc_global_hits, tc_global_misses,
                (tc_global_hits + tc_global_misses) > 0 ? (tc_global_hits * 100) / (tc_global_hits + tc_global_misses) : 0,
-               tc_replay_cycles_total, $time);
+               tc_replay_cycles_total, tc_just_done_match_cnt, tc_just_done_timeout_cnt, $time);
     end
     // Print full TC summary every 5000 replays so it appears even if final block does not run
     if (tc_replay_done && (tc_replays_completed + 1) % 5000 == 0) begin
@@ -989,8 +1003,8 @@ module frontend
       $display("[TC-SUMMARY] ========== (every 5000 replays, replays=%0d) ==========", tc_replays_completed + 1);
       $display("[TC-SUMMARY] lookups: %0d (hits=%0d misses=%0d) hit_rate=%0d%%",
                tot, tc_global_hits, tc_global_misses, pct);
-      $display("[TC-SUMMARY] replays_completed=%0d replay_cycles=%0d cap_events=%0d",
-               tc_replays_completed + 1, tc_replay_cycles_total, tc_cap_events);
+      $display("[TC-SUMMARY] replays_completed=%0d replay_cycles=%0d cap_events=%0d just_done_match=%0d just_done_timeout=%0d",
+               tc_replays_completed + 1, tc_replay_cycles_total, tc_cap_events, tc_just_done_match_cnt, tc_just_done_timeout_cnt);
       $display("[TC-SUMMARY] total_cycles=%0d -> %0d%% of run fetch from trace (fetch improvement)",
                tc_total_cycles_q, fetch_pct);
       $display("[TC-SUMMARY] ========================================");
@@ -1052,6 +1066,8 @@ module frontend
              tc_replays_completed, tc_replay_cycles_total);
     $display("[TC-FINAL] cap_events=%0d (times replay was blocked at same-PC cap; forced normal fetch)",
              tc_cap_events);
+    $display("[TC-FINAL] just_done_match=%0d just_done_timeout=%0d (how we left tc_replay_just_done: vaddr match vs timeout)",
+             tc_just_done_match_cnt, tc_just_done_timeout_cnt);
     $display("[TC-FINAL] --- Fetch improvement (did the trace cache help?) ---");
     $display("[TC-FINAL] total_cycles=%0d  replay_cycles=%0d  -> %0d%% of run fetch was from trace (i-cache not used)",
              tc_total_cycles_q, tc_replay_cycles_total, tc_fetch_from_trace_pct);
