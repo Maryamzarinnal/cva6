@@ -98,6 +98,9 @@ module frontend
   logic [31:0]                             tc_miss_pc;
   logic [31:0]                             tc_miss_path;
   logic                                    tc_lookup_result_valid;  // TC actually did this lookup; use for hit/miss count
+  logic                                    tc_miss_reason_empty;    // this cycle: miss because set empty
+  logic                                    tc_miss_reason_pc;       // this cycle: miss because no pc match
+  logic                                    tc_miss_reason_path;     // this cycle: miss because path mismatch
   logic                                    tc_active_use;
   logic                                    tc_active_hit;
   logic [TRACE_LEN_WIDTH-1:0]              tc_trace_starts;
@@ -778,7 +781,10 @@ module frontend
     .tc_miss_empty_o        (tc_miss_empty),
     .tc_miss_pc_o           (tc_miss_pc),
     .tc_miss_path_o         (tc_miss_path),
-    .lookup_result_valid_o (tc_lookup_result_valid)
+    .lookup_result_valid_o  (tc_lookup_result_valid),
+    .miss_reason_empty_o    (tc_miss_reason_empty),
+    .miss_reason_pc_o       (tc_miss_reason_pc),
+    .miss_reason_path_o     (tc_miss_reason_path)
   );
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -847,6 +853,9 @@ module frontend
   // Global trace-cache stats 
   int unsigned  tc_global_hits;
   int unsigned  tc_global_misses;
+  int unsigned  tc_fe_miss_empty;
+  int unsigned  tc_fe_miss_pc;
+  int unsigned  tc_fe_miss_path;
   int unsigned  tc_replays_completed;
   int unsigned  tc_replay_cycles_total;
   int unsigned  tc_cap_events;  // times same-PC cap blocked replay (forced normal fetch)
@@ -878,6 +887,9 @@ module frontend
       tc_had_taken_q   <= 1'b0;
       tc_global_hits   <= 0;
       tc_global_misses <= 0;
+      tc_fe_miss_empty <= 0;
+      tc_fe_miss_pc    <= 0;
+      tc_fe_miss_path  <= 0;
       tc_replays_completed <= 0;
       tc_replay_cycles_total <= 0;
       tc_cap_events    <= 0;
@@ -953,8 +965,12 @@ module frontend
       if (tc_lookup_result_valid) begin
         if (tc_trace_hit)
           tc_global_hits   <= tc_global_hits + 1;
-        else
+        else begin
           tc_global_misses <= tc_global_misses + 1;
+          if (tc_miss_reason_empty) tc_fe_miss_empty <= tc_fe_miss_empty + 1;
+          if (tc_miss_reason_pc)    tc_fe_miss_pc    <= tc_fe_miss_pc + 1;
+          if (tc_miss_reason_path)  tc_fe_miss_path  <= tc_fe_miss_path + 1;
+        end
       end
       if (tc_replay_active_q)
         tc_replay_cycles_total <= tc_replay_cycles_total + 1;
@@ -1005,7 +1021,7 @@ module frontend
                (tc_global_hits + tc_global_misses) > 0 ? (tc_global_hits * 100) / (tc_global_hits + tc_global_misses) : 0,
                tc_replay_cycles_total, tc_just_done_match_cnt, tc_just_done_timeout_cnt, $time);
       $display("[TC-MISS-BREAKDOWN] total_misses=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why we miss)",
-               tc_miss_total, tc_miss_empty, tc_miss_pc, tc_miss_path);
+               tc_global_misses, tc_fe_miss_empty, tc_fe_miss_pc, tc_fe_miss_path);
     end
     // Print full TC summary every 5000 replays so it appears even if final block does not run
     if (tc_replay_done && (tc_replays_completed + 1) % 5000 == 0) begin
@@ -1082,7 +1098,7 @@ module frontend
     $display("[TC-FINAL] just_done_match=%0d just_done_timeout=%0d (how we left tc_replay_just_done: vaddr match vs timeout)",
              tc_just_done_match_cnt, tc_just_done_timeout_cnt);
     $display("[TC-FINAL] miss_breakdown: total=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why lookups missed)",
-             tc_miss_total, tc_miss_empty, tc_miss_pc, tc_miss_path);
+             tc_global_misses, tc_fe_miss_empty, tc_fe_miss_pc, tc_fe_miss_path);
     $display("[TC-FINAL] --- Fetch improvement (did the trace cache help?) ---");
     $display("[TC-FINAL] total_cycles=%0d  replay_cycles=%0d  -> %0d%% of run fetch was from trace (i-cache not used)",
              tc_total_cycles_q, tc_replay_cycles_total, tc_fetch_from_trace_pct);

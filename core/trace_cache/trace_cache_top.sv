@@ -51,6 +51,11 @@ module trace_cache_top #(
   // High when this cycle's trace_hit_o is for a lookup we actually did (we fired); use for hit/miss counting
   output logic                                        lookup_result_valid_o,
 
+  // When lookup_result_valid_o and !trace_hit_o: exactly one of these is 1 (why we missed). Frontend counts these.
+  output logic                                        miss_reason_empty_o,
+  output logic                                        miss_reason_pc_o,
+  output logic                                        miss_reason_path_o,
+
   // Miss breakdown for debug (0 in synthesis)
   output logic [31:0]                                tc_miss_total_o,
   output logic [31:0]                                tc_miss_empty_o,
@@ -255,6 +260,21 @@ module trace_cache_top #(
   assign trace_hit   = |way_hit;
   assign trace_hit_o = trace_hit;
 
+  // Miss reason for this cycle (when lookup_valid_q && !trace_hit): so frontend can count same events as global_misses
+  logic any_valid_in_set;
+  logic any_pc_match_in_set;
+  always_comb begin
+    any_valid_in_set = 1'b0;
+    any_pc_match_in_set = 1'b0;
+    for (int w = 0; w < NUM_WAYS; w++) begin
+      if (trace_read[w].valid) any_valid_in_set = 1'b1;
+      if (trace_read[w].valid && pc_match[w]) any_pc_match_in_set = 1'b1;
+    end
+  end
+  assign miss_reason_empty_o = lookup_valid_q && !trace_hit && !any_valid_in_set;
+  assign miss_reason_pc_o    = lookup_valid_q && !trace_hit && any_valid_in_set && !any_pc_match_in_set;
+  assign miss_reason_path_o  = lookup_valid_q && !trace_hit && any_valid_in_set && any_pc_match_in_set;
+
   logic [$clog2(NUM_WAYS)-1:0] hit_way_idx;
   always_comb begin
     hit_way_idx = '0;
@@ -365,16 +385,6 @@ module trace_cache_top #(
 // Miss breakdown: use MODEL_TECH (Questa/ModelSim) so it runs in sim even if SYNTHESIS is set by the build
 `ifdef MODEL_TECH
   initial $display("[TC-DEBUG] trace_cache_top: miss breakdown ACTIVE (MODEL_TECH defined)");
-  logic any_valid_in_set;
-  logic any_pc_match_in_set;
-  always_comb begin
-    any_valid_in_set = 1'b0;
-    any_pc_match_in_set = 1'b0;
-    for (int w = 0; w < NUM_WAYS; w++) begin
-      if (trace_read[w].valid) any_valid_in_set = 1'b1;
-      if (trace_read[w].valid && pc_match[w]) any_pc_match_in_set = 1'b1;
-    end
-  end
 
   int unsigned tc_miss_empty;   // set had no valid trace
   int unsigned tc_miss_pc;      // set had valid trace(s) but no base_pc match (wrong/evicted)
