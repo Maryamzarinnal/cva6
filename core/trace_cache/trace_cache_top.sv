@@ -358,8 +358,8 @@ module trace_cache_top #(
     end
   end
 
-`ifndef SYNTHESIS
-  // Miss breakdown: why did this lookup miss? (for low hit-rate debug)
+// Miss breakdown: use MODEL_TECH (Questa/ModelSim) so it runs in sim even if SYNTHESIS is set by the build
+`ifdef MODEL_TECH
   logic any_valid_in_set;
   logic any_pc_match_in_set;
   always_comb begin
@@ -390,7 +390,6 @@ module trace_cache_top #(
         tc_miss_pc <= tc_miss_pc + 1;
       else
         tc_miss_path <= tc_miss_path + 1;
-
     end
   end
 
@@ -398,7 +397,14 @@ module trace_cache_top #(
   assign tc_miss_empty_o = tc_miss_empty;
   assign tc_miss_pc_o    = tc_miss_pc;
   assign tc_miss_path_o  = tc_miss_path;
+`else
+  assign tc_miss_total_o = 32'b0;
+  assign tc_miss_empty_o = 32'b0;
+  assign tc_miss_pc_o    = 32'b0;
+  assign tc_miss_path_o  = 32'b0;
+`endif
 
+`ifndef SYNTHESIS
   // +define+TRACE_CACHE_DEBUG_VERBOSE for per-lookup prints
   `ifdef TRACE_CACHE_DEBUG_VERBOSE
   always_ff @(posedge clk_i) begin
@@ -449,13 +455,10 @@ module trace_cache_top #(
     $display("[TC-USEFUL] valid_lookups=%0d hits=%0d rate=%0d%%",
              tc_valid_lookups, tc_useful_hits,
              tc_valid_lookups > 0 ? (tc_useful_hits * 100) / tc_valid_lookups : 0);
+    `ifdef MODEL_TECH
     $display("[TC-MISS-BREAKDOWN] total_misses=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why lookups missed)",
              tc_miss_total, tc_miss_empty, tc_miss_pc, tc_miss_path);
+    `endif
   end
-`else
-  assign tc_miss_total_o = 32'b0;
-  assign tc_miss_empty_o = 32'b0;
-  assign tc_miss_pc_o    = 32'b0;
-  assign tc_miss_path_o  = 32'b0;
 `endif
 endmodule
