@@ -353,6 +353,48 @@ module trace_cache_top #(
   end
 
 `ifndef SYNTHESIS
+  // Miss breakdown: why did this lookup miss? (for low hit-rate debug)
+  logic any_valid_in_set;
+  logic any_pc_match_in_set;
+  always_comb begin
+    any_valid_in_set = 1'b0;
+    any_pc_match_in_set = 1'b0;
+    for (int w = 0; w < NUM_WAYS; w++) begin
+      if (trace_read[w].valid) any_valid_in_set = 1'b1;
+      if (trace_read[w].valid && pc_match[w]) any_pc_match_in_set = 1'b1;
+    end
+  end
+
+  int unsigned tc_miss_empty;   // set had no valid trace
+  int unsigned tc_miss_pc;      // set had valid trace(s) but no base_pc match (wrong/evicted)
+  int unsigned tc_miss_path;    // set had valid trace with same base_pc but branch_flags mismatch
+  int unsigned tc_miss_total;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      tc_miss_empty <= 0;
+      tc_miss_pc    <= 0;
+      tc_miss_path  <= 0;
+      tc_miss_total <= 0;
+    end else if (lookup_valid_q && !trace_hit) begin
+      tc_miss_total <= tc_miss_total + 1;
+      if (!any_valid_in_set)
+        tc_miss_empty <= tc_miss_empty + 1;
+      else if (!any_pc_match_in_set)
+        tc_miss_pc <= tc_miss_pc + 1;
+      else
+        tc_miss_path <= tc_miss_path + 1;
+
+      // Print miss breakdown every 500 misses so we see why we miss without flooding
+      if ((tc_miss_total + 1) % 500 == 0)
+        $display("[TC-MISS-BREAKDOWN] total_misses=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d @ %0t",
+                 tc_miss_total + 1,
+                 !any_valid_in_set ? tc_miss_empty + 1 : tc_miss_empty,
+                 any_valid_in_set && !any_pc_match_in_set ? tc_miss_pc + 1 : tc_miss_pc,
+                 any_valid_in_set && any_pc_match_in_set ? tc_miss_path + 1 : tc_miss_path, $time);
+    end
+  end
+
   // +define+TRACE_CACHE_DEBUG_VERBOSE for per-lookup prints
   `ifdef TRACE_CACHE_DEBUG_VERBOSE
   always_ff @(posedge clk_i) begin
@@ -403,6 +445,8 @@ module trace_cache_top #(
     $display("[TC-USEFUL] valid_lookups=%0d hits=%0d rate=%0d%%",
              tc_valid_lookups, tc_useful_hits,
              tc_valid_lookups > 0 ? (tc_useful_hits * 100) / tc_valid_lookups : 0);
+    $display("[TC-MISS-BREAKDOWN] total_misses=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why lookups missed)",
+             tc_miss_total, tc_miss_empty, tc_miss_pc, tc_miss_path);
   end
 `endif
 endmodule
