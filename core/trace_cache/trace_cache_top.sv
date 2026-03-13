@@ -46,7 +46,13 @@ module trace_cache_top #(
   output logic [PC_WIDTH-1:0]                        trace_next_pc_o,
   output logic [CHUNKS_PER_TRACE-1:0][15:0]          trace_chunks_o,
   output logic [CHUNKS_PER_TRACE-1:0]                trace_valid_chunks_o,
-  output logic [TRACE_LEN-1:0][PC_WIDTH-1:0]         trace_pcs_o
+  output logic [TRACE_LEN-1:0][PC_WIDTH-1:0]         trace_pcs_o,
+
+  // Miss breakdown for debug (0 in synthesis)
+  output logic [31:0]                                tc_miss_total_o,
+  output logic [31:0]                                tc_miss_empty_o,
+  output logic [31:0]                                tc_miss_pc_o,
+  output logic [31:0]                                tc_miss_path_o
 );
 
   // Stored trace length must not exceed structure size
@@ -385,15 +391,13 @@ module trace_cache_top #(
       else
         tc_miss_path <= tc_miss_path + 1;
 
-      // Print miss breakdown every 500 misses so we see why we miss without flooding
-      if ((tc_miss_total + 1) % 500 == 0)
-        $display("[TC-MISS-BREAKDOWN] total_misses=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d @ %0t",
-                 tc_miss_total + 1,
-                 !any_valid_in_set ? tc_miss_empty + 1 : tc_miss_empty,
-                 any_valid_in_set && !any_pc_match_in_set ? tc_miss_pc + 1 : tc_miss_pc,
-                 any_valid_in_set && any_pc_match_in_set ? tc_miss_path + 1 : tc_miss_path, $time);
     end
   end
+
+  assign tc_miss_total_o = tc_miss_total;
+  assign tc_miss_empty_o = tc_miss_empty;
+  assign tc_miss_pc_o    = tc_miss_pc;
+  assign tc_miss_path_o  = tc_miss_path;
 
   // +define+TRACE_CACHE_DEBUG_VERBOSE for per-lookup prints
   `ifdef TRACE_CACHE_DEBUG_VERBOSE
@@ -448,5 +452,10 @@ module trace_cache_top #(
     $display("[TC-MISS-BREAKDOWN] total_misses=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why lookups missed)",
              tc_miss_total, tc_miss_empty, tc_miss_pc, tc_miss_path);
   end
+`else
+  assign tc_miss_total_o = 32'b0;
+  assign tc_miss_empty_o = 32'b0;
+  assign tc_miss_pc_o    = 32'b0;
+  assign tc_miss_path_o  = 32'b0;
 `endif
 endmodule

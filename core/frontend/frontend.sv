@@ -93,6 +93,10 @@ module frontend
   logic                                    tc_lookup_valid_q;
   logic [PC_WIDTH-1:0]                     tc_lookup_pc_q;
   logic [PC_WIDTH-1:0]                     tc_trace_next_pc;
+  logic [31:0]                             tc_miss_total;
+  logic [31:0]                             tc_miss_empty;
+  logic [31:0]                             tc_miss_pc;
+  logic [31:0]                             tc_miss_path;
   logic                                    tc_active_use;
   logic                                    tc_active_hit;
   logic [TRACE_LEN_WIDTH-1:0]              tc_trace_starts;
@@ -768,7 +772,11 @@ module frontend
     .trace_chunks_o         (tc_trace_chunks),
     .trace_valid_chunks_o   (tc_trace_valid_chunks),
     .trace_pcs_o            (tc_trace_pcs),
-    .trace_next_pc_o        (tc_trace_next_pc)
+    .trace_next_pc_o        (tc_trace_next_pc),
+    .tc_miss_total_o        (tc_miss_total),
+    .tc_miss_empty_o        (tc_miss_empty),
+    .tc_miss_pc_o           (tc_miss_pc),
+    .tc_miss_path_o         (tc_miss_path)
   );
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -993,6 +1001,8 @@ module frontend
                tc_replays_completed + 1, tc_global_hits, tc_global_misses,
                (tc_global_hits + tc_global_misses) > 0 ? (tc_global_hits * 100) / (tc_global_hits + tc_global_misses) : 0,
                tc_replay_cycles_total, tc_just_done_match_cnt, tc_just_done_timeout_cnt, $time);
+      $display("[TC-MISS-BREAKDOWN] total_misses=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why we miss)",
+               tc_miss_total, tc_miss_empty, tc_miss_pc, tc_miss_path);
     end
     // Print full TC summary every 5000 replays so it appears even if final block does not run
     if (tc_replay_done && (tc_replays_completed + 1) % 5000 == 0) begin
@@ -1068,6 +1078,8 @@ module frontend
              tc_cap_events);
     $display("[TC-FINAL] just_done_match=%0d just_done_timeout=%0d (how we left tc_replay_just_done: vaddr match vs timeout)",
              tc_just_done_match_cnt, tc_just_done_timeout_cnt);
+    $display("[TC-FINAL] miss_breakdown: total=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why lookups missed)",
+             tc_miss_total, tc_miss_empty, tc_miss_pc, tc_miss_path);
     $display("[TC-FINAL] --- Fetch improvement (did the trace cache help?) ---");
     $display("[TC-FINAL] total_cycles=%0d  replay_cycles=%0d  -> %0d%% of run fetch was from trace (i-cache not used)",
              tc_total_cycles_q, tc_replay_cycles_total, tc_fetch_from_trace_pct);
