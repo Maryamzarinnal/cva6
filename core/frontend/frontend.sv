@@ -90,6 +90,8 @@ module frontend
   logic [CHUNKS_PER_TRACE-1:0][15:0]       tc_trace_chunks;
   logic [CHUNKS_PER_TRACE-1:0]             tc_trace_valid_chunks;
   logic [TRACE_LEN-1:0][PC_WIDTH-1:0]      tc_trace_pcs;
+  logic [CHUNKS_PER_TRACE-1:0]             tc_trace_branch_flags;
+  logic [BR_CNT_WIDTH-1:0]                 tc_trace_num_branches;
   logic                                    tc_lookup_valid_q;
   logic [PC_WIDTH-1:0]                     tc_lookup_pc_q;
   logic [PC_WIDTH-1:0]                     tc_trace_next_pc;
@@ -97,24 +99,47 @@ module frontend
   logic [31:0]                             tc_miss_empty;
   logic [31:0]                             tc_miss_pc;
   logic [31:0]                             tc_miss_path;
-  logic                                    tc_lookup_result_valid;  // TC actually did this lookup; use for hit/miss count
-  logic                                    tc_miss_reason_empty;    // this cycle: miss because set empty
-  logic                                    tc_miss_reason_pc;       // this cycle: miss because no pc match
-  logic                                    tc_miss_reason_path;     // this cycle: miss because path mismatch
+  logic                                    tc_lookup_result_valid;
+  logic                                    tc_miss_reason_empty;
+  logic                                    tc_miss_reason_pc;
+  logic                                    tc_miss_reason_path;
   logic                                    tc_active_use;
   logic                                    tc_active_hit;
   logic [TRACE_LEN_WIDTH-1:0]              tc_trace_starts;
   logic                                    tc_trace_starts_ok;
 
-  // ── Trace-cache feeding: simple 2-state FSM (NORMAL / TC_FEEDING) ──
+  // -- Trace-cache feeding: segment-based FSM (NORMAL / TC_FEEDING) --
+  // The trace may contain multiple taken branches. We feed one segment per
+  // cycle, where each segment spans [tc_feed_ptr .. next_taken_branch].
+  // Per-instruction cf_type is derived from the latched branch_flags so the
+  // backend never sees an unexpected branch outcome.
   logic                                    tc_feeding_q, tc_feeding_d;
   logic [TRACE_LEN_WIDTH-1:0]              tc_feeding_len_q, tc_feeding_len_d;
   logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]  tc_feeding_instr_q, tc_feeding_instr_d;
   logic [TRACE_LEN-1:0][CVA6Cfg.VLEN-1:0] tc_feeding_pcs_q, tc_feeding_pcs_d;
   logic [CVA6Cfg.VLEN-1:0]                tc_feeding_next_pc_q, tc_feeding_next_pc_d;
-  logic [TRACE_LEN-1:0]                   tc_feeding_consumed_q, tc_feeding_consumed_d;
+  logic [CHUNKS_PER_TRACE-1:0]            tc_feeding_branch_flags_q, tc_feeding_branch_flags_d;
+  logic [BR_CNT_WIDTH-1:0]                tc_feeding_num_branches_q, tc_feeding_num_branches_d;
+
+  // Segment pointer: first instruction index in the current segment being fed
+  logic [TRACE_LEN_WIDTH-1:0]              tc_feed_ptr_q, tc_feed_ptr_d;
+  // Per-slot consumed mask for the current segment
+  logic [CVA6Cfg.INSTR_PER_FETCH-1:0]     tc_seg_consumed_q, tc_seg_consumed_d;
+  logic                                    tc_seg_done;     // all slots in current segment consumed
   logic                                    tc_feeding_done;
   logic                                    tc_feeding_start;
+
+  // Combinational per-instruction CF classification for the latched trace
+  // is_trace_cf[i]    = instruction i is a branch/jump/jalr (decoded from opcode)
+  // is_trace_taken[i] = the branch_flags say this CF was taken
+  logic [TRACE_LEN-1:0]                   is_trace_cf;
+  logic [TRACE_LEN-1:0]                   is_trace_taken;
+  // Segment boundary: index of last instruction in current segment (inclusive)
+  logic [TRACE_LEN_WIDTH-1:0]              tc_seg_end;
+  // Number of instructions in current segment
+  logic [TRACE_LEN_WIDTH-1:0]              tc_seg_len;
+  // Target address for current segment's taken branch
+  logic [CVA6Cfg.VLEN-1:0]                tc_seg_target;
 
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0]             replay_instr_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] replay_addr_iq;
@@ -290,101 +315,179 @@ module frontend
   assign btb_update.pc             = resolved_branch_i.pc;
   assign btb_update.target_address = resolved_branch_i.target_address;
 
-  // ── Trace-cache feeding: detect last-instruction-is-taken-branch for cf_type ──
-  logic [CVA6Cfg.VLEN-1:0] last_feed_pc, last_feed_fall_through;
-  logic                    last_slot_is_taken_branch;
+  // -- Per-instruction CF classification for latched trace (decode from opcode) --
+  // Walk through the latched trace, decode each instruction's opcode to find
+  // branches/jumps, and pair each CF with its branch_flags entry.
   always_comb begin
-    last_feed_pc            = (tc_feeding_len_q != 0) ? tc_feeding_pcs_q[tc_feeding_len_q - 1] : '0;
-    last_feed_fall_through  = last_feed_pc + ((tc_feeding_len_q != 0) && (tc_feeding_instr_q[tc_feeding_len_q - 1][1:0] != 2'b11) ? CVA6Cfg.VLEN'(2) : CVA6Cfg.VLEN'(4));
-    last_slot_is_taken_branch = (tc_feeding_len_q != 0) && (tc_feeding_next_pc_q != last_feed_fall_through);
-  end
-
-  // ── Present trace instructions to the instruction queue ──
-  always_comb begin
-    replay_instr_iq        = '0;
-    replay_addr_iq         = '0;
-    replay_valid_iq        = '0;
-    replay_predict_addr_iq = tc_feeding_next_pc_q;
-    for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++)
-      replay_cf_type_iq[i] = (tc_feeding_len_q != 0 && TRACE_LEN_WIDTH'(i) == tc_feeding_len_q - 1 && last_slot_is_taken_branch)
-                            ? ariane_pkg::Branch : ariane_pkg::NoCF;
-
-    for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
-      if (i < int'(tc_feeding_len_q) && !tc_feeding_consumed_q[i]) begin
-        replay_valid_iq[i] = 1'b1;
-        replay_instr_iq[i] = tc_feeding_instr_q[i];
-        replay_addr_iq[i]  = tc_feeding_pcs_q[i];
+    int br_idx_scan;
+    br_idx_scan = 0;
+    for (int j = 0; j < TRACE_LEN; j++) begin
+      logic [31:0] t_instr;
+      logic        t_rvc;
+      logic        t_cf;
+      t_instr = tc_feeding_instr_q[j];
+      t_rvc   = (t_instr[1:0] != 2'b11);
+      // Detect control-flow: RV32 branch/jal/jalr or RVC branch/jump/jr/jalr
+      t_cf = (!t_rvc && (t_instr[6:0] == riscv::OpcodeBranch ||
+                         t_instr[6:0] == riscv::OpcodeJal    ||
+                         t_instr[6:0] == riscv::OpcodeJalr))
+           || (t_rvc && (t_instr[15:13] == riscv::OpcodeC1J     ||
+                         t_instr[15:13] == riscv::OpcodeC1Beqz  ||
+                         t_instr[15:13] == riscv::OpcodeC1Bnez))
+           || (t_rvc && t_instr[15:13] == riscv::OpcodeC2JalrMvAdd &&
+               t_instr[6:2] == 5'b00000 && t_instr[1:0] == riscv::OpcodeC2 && t_instr[12]);
+      is_trace_cf[j] = (j < int'(tc_feeding_len_q)) ? t_cf : 1'b0;
+      if (j < int'(tc_feeding_len_q) && t_cf) begin
+        is_trace_taken[j] = (br_idx_scan < int'(tc_feeding_num_branches_q))
+                            ? tc_feeding_branch_flags_q[br_idx_scan] : 1'b0;
+        br_idx_scan = br_idx_scan + 1;
+      end else begin
+        is_trace_taken[j] = 1'b0;
       end
     end
   end
 
-  // ── Feeding done + consumed mask (single driver for tc_feeding_consumed_d) ──
+  // -- Compute current segment boundary and target --
+  // Starting from tc_feed_ptr_q, find the next taken branch (or trace end).
+  // That's the end of the current segment.
   always_comb begin
-    tc_feeding_consumed_d = tc_feeding_consumed_q;
-    tc_feeding_done       = 1'b0;
+    tc_seg_end    = (tc_feeding_len_q != 0) ? tc_feeding_len_q - TRACE_LEN_WIDTH'(1) : '0;
+    tc_seg_target = tc_feeding_next_pc_q[CVA6Cfg.VLEN-1:0]; // default: trace's final target
+    for (int j = int'(tc_feed_ptr_q); j < TRACE_LEN; j++) begin
+      if (j < int'(tc_feeding_len_q) && is_trace_cf[j] && is_trace_taken[j]) begin
+        tc_seg_end = TRACE_LEN_WIDTH'(j);
+        // Compute target: for the taken branch at position j, derive from PC + imm
+        // For intermediate branches we know the next instruction's PC IS the target
+        if (j + 1 < int'(tc_feeding_len_q))
+          tc_seg_target = tc_feeding_pcs_q[j + 1];
+        else
+          tc_seg_target = tc_feeding_next_pc_q[CVA6Cfg.VLEN-1:0];
+        break;
+      end
+    end
+    tc_seg_len = (tc_feeding_len_q != 0) ? tc_seg_end - tc_feed_ptr_q + TRACE_LEN_WIDTH'(1) : '0;
+  end
 
-    if (flush_i || is_mispredict || set_pc_commit_i || ex_valid_i || eret_i) begin
-      tc_feeding_consumed_d = '0;
-    end else if (tc_feeding_q && tc_feeding_len_q != 0) begin
-      for (int i = 0; i < TRACE_LEN; i++)
-        if (i < int'(tc_feeding_len_q) && instr_queue_consumed[i])
-          tc_feeding_consumed_d[i] = 1'b1;
-      // Check if all positions now consumed
-      tc_feeding_done = 1'b1;
-      for (int i = 0; i < TRACE_LEN; i++)
-        if (i < int'(tc_feeding_len_q) && !tc_feeding_consumed_d[i])
-          tc_feeding_done = 1'b0;
-      if (tc_feeding_done)
-        tc_feeding_consumed_d = '0;
-    end else if (tc_feeding_start) begin
-      tc_feeding_consumed_d = '0;
+  // -- Present current segment's instructions to the instruction queue --
+  always_comb begin
+    replay_instr_iq        = '0;
+    replay_addr_iq         = '0;
+    replay_valid_iq        = '0;
+    replay_predict_addr_iq = tc_seg_target;
+    for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++)
+      replay_cf_type_iq[s] = ariane_pkg::NoCF;
+
+    for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++) begin
+      int trace_idx;
+      trace_idx = int'(tc_feed_ptr_q) + s;
+      if (trace_idx <= int'(tc_seg_end) && trace_idx < int'(tc_feeding_len_q)
+          && !tc_seg_consumed_q[s]) begin
+        replay_valid_iq[s] = 1'b1;
+        replay_instr_iq[s] = tc_feeding_instr_q[trace_idx];
+        replay_addr_iq[s]  = tc_feeding_pcs_q[trace_idx];
+        // Set cf_type for the last instruction in this segment if it's a taken branch
+        if (trace_idx == int'(tc_seg_end) && is_trace_cf[trace_idx] && is_trace_taken[trace_idx])
+          replay_cf_type_iq[s] = ariane_pkg::Branch;
+      end
     end
   end
 
-  // ── Feeding state register ──
+  // -- Segment consumed tracking + feeding_done --
+  always_comb begin
+    tc_seg_consumed_d = tc_seg_consumed_q;
+    tc_seg_done       = 1'b0;
+    tc_feeding_done   = 1'b0;
+    tc_feed_ptr_d     = tc_feed_ptr_q;
+
+    if (flush_i || is_mispredict || set_pc_commit_i || ex_valid_i || eret_i) begin
+      tc_seg_consumed_d = '0;
+      tc_feed_ptr_d     = '0;
+    end else if (tc_feeding_q && tc_feeding_len_q != 0) begin
+      // Mark consumed slots in current segment
+      for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++) begin
+        int trace_idx;
+        trace_idx = int'(tc_feed_ptr_q) + s;
+        if (trace_idx <= int'(tc_seg_end) && trace_idx < int'(tc_feeding_len_q)
+            && instr_queue_consumed[s])
+          tc_seg_consumed_d[s] = 1'b1;
+      end
+      // Check if all slots in current segment are consumed
+      tc_seg_done = 1'b1;
+      for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++) begin
+        int trace_idx;
+        trace_idx = int'(tc_feed_ptr_q) + s;
+        if (trace_idx <= int'(tc_seg_end) && trace_idx < int'(tc_feeding_len_q)
+            && !tc_seg_consumed_d[s])
+          tc_seg_done = 1'b0;
+      end
+      if (tc_seg_done) begin
+        tc_seg_consumed_d = '0;
+        // Advance pointer past the current segment
+        tc_feed_ptr_d = tc_seg_end + TRACE_LEN_WIDTH'(1);
+        // If we've consumed the entire trace, we're done
+        if (tc_seg_end + TRACE_LEN_WIDTH'(1) >= tc_feeding_len_q)
+          tc_feeding_done = 1'b1;
+      end
+    end else if (tc_feeding_start) begin
+      tc_seg_consumed_d = '0;
+      tc_feed_ptr_d     = '0;
+    end
+  end
+
+  // -- Feeding state register --
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      tc_feeding_q          <= 1'b0;
-      tc_feeding_len_q      <= '0;
-      tc_feeding_instr_q    <= '0;
-      tc_feeding_pcs_q      <= '0;
-      tc_feeding_next_pc_q  <= '0;
-      tc_feeding_consumed_q <= '0;
+      tc_feeding_q              <= 1'b0;
+      tc_feeding_len_q          <= '0;
+      tc_feeding_instr_q        <= '0;
+      tc_feeding_pcs_q          <= '0;
+      tc_feeding_next_pc_q      <= '0;
+      tc_feeding_branch_flags_q <= '0;
+      tc_feeding_num_branches_q <= '0;
+      tc_feed_ptr_q             <= '0;
+      tc_seg_consumed_q         <= '0;
     end else begin
-      tc_feeding_q          <= tc_feeding_d;
-      tc_feeding_len_q      <= tc_feeding_len_d;
-      tc_feeding_instr_q    <= tc_feeding_instr_d;
-      tc_feeding_pcs_q      <= tc_feeding_pcs_d;
-      tc_feeding_next_pc_q  <= tc_feeding_next_pc_d;
-      tc_feeding_consumed_q <= tc_feeding_consumed_d;
+      tc_feeding_q              <= tc_feeding_d;
+      tc_feeding_len_q          <= tc_feeding_len_d;
+      tc_feeding_instr_q        <= tc_feeding_instr_d;
+      tc_feeding_pcs_q          <= tc_feeding_pcs_d;
+      tc_feeding_next_pc_q      <= tc_feeding_next_pc_d;
+      tc_feeding_branch_flags_q <= tc_feeding_branch_flags_d;
+      tc_feeding_num_branches_q <= tc_feeding_num_branches_d;
+      tc_feed_ptr_q             <= tc_feed_ptr_d;
+      tc_seg_consumed_q         <= tc_seg_consumed_d;
     end
   end
 
   assign tc_feeding_start = tc_active_use && !tc_feeding_q;
 
   always_comb begin
-    tc_feeding_d          = tc_feeding_q;
-    tc_feeding_len_d      = tc_feeding_len_q;
-    tc_feeding_instr_d    = tc_feeding_instr_q;
-    tc_feeding_pcs_d      = tc_feeding_pcs_q;
-    tc_feeding_next_pc_d  = tc_feeding_next_pc_q;
+    tc_feeding_d              = tc_feeding_q;
+    tc_feeding_len_d          = tc_feeding_len_q;
+    tc_feeding_instr_d        = tc_feeding_instr_q;
+    tc_feeding_pcs_d          = tc_feeding_pcs_q;
+    tc_feeding_next_pc_d      = tc_feeding_next_pc_q;
+    tc_feeding_branch_flags_d = tc_feeding_branch_flags_q;
+    tc_feeding_num_branches_d = tc_feeding_num_branches_q;
 
     if (flush_i || is_mispredict || set_pc_commit_i || ex_valid_i || eret_i) begin
-      tc_feeding_d          = 1'b0;
+      tc_feeding_d              = 1'b0;
     end else if (tc_feeding_done) begin
-      // Trace fully consumed → back to normal. npc_d set in npc_select below.
-      tc_feeding_d          = 1'b0;
+      // Trace fully consumed -> back to normal. npc_d set in npc_select below.
+      tc_feeding_d              = 1'b0;
     end else if (tc_feeding_start) begin
-      tc_feeding_d          = 1'b1;
-      tc_feeding_len_d      = tc_trace_length;
-      tc_feeding_instr_d    = tc_trace_instructions;
-      for (int i = 0; i < TRACE_LEN; i++)
-        tc_feeding_pcs_d[i] = tc_trace_pcs[i][CVA6Cfg.VLEN-1:0];
-      tc_feeding_next_pc_d  = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
+      tc_feeding_d              = 1'b1;
+      tc_feeding_len_d          = tc_trace_length;
+      tc_feeding_instr_d        = tc_trace_instructions;
+      for (int k = 0; k < TRACE_LEN; k++)
+        tc_feeding_pcs_d[k]     = tc_trace_pcs[k][CVA6Cfg.VLEN-1:0];
+      tc_feeding_next_pc_d      = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
+      tc_feeding_branch_flags_d = tc_trace_branch_flags;
+      tc_feeding_num_branches_d = tc_trace_num_branches;
     end
   end
 
-  // ── MUX: trace-cache feeding vs normal I-cache ──
+  // ?? MUX: trace-cache feeding vs normal I-cache ??
   always_comb begin
     if (tc_feeding_q) begin
       instr_to_iq            = replay_instr_iq;
@@ -427,9 +530,10 @@ module frontend
     if (if_ready)
       npc_d = {fetch_address[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] + 1, {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}};
 
-    // When trace feeding completes, redirect to trace target address
-    if (tc_feeding_done)
-      npc_d = tc_feeding_next_pc_q;
+    // When a segment completes, redirect NPC. If trace is fully done, go to
+    // the trace's final target. If mid-trace, go to next segment's first PC.
+    if (tc_seg_done && tc_feeding_q)
+      npc_d = tc_seg_target;
 
     if (replay)
       npc_d = replay_addr;
@@ -721,6 +825,8 @@ module frontend
     .trace_chunks_o         (tc_trace_chunks),
     .trace_valid_chunks_o   (tc_trace_valid_chunks),
     .trace_pcs_o            (tc_trace_pcs),
+    .trace_branch_flags_o  (tc_trace_branch_flags),
+    .trace_num_branches_o  (tc_trace_num_branches),
     .trace_next_pc_o        (tc_trace_next_pc),
     .tc_miss_total_o        (tc_miss_total),
     .tc_miss_empty_o        (tc_miss_empty),
