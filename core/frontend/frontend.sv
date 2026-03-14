@@ -318,11 +318,14 @@ module frontend
     end
   end
 
-  // ── Feeding done: all trace positions consumed ──
+  // ── Feeding done + consumed mask (single driver for tc_feeding_consumed_d) ──
   always_comb begin
     tc_feeding_consumed_d = tc_feeding_consumed_q;
     tc_feeding_done       = 1'b0;
-    if (tc_feeding_q && tc_feeding_len_q != 0) begin
+
+    if (flush_i || is_mispredict || set_pc_commit_i || ex_valid_i || eret_i) begin
+      tc_feeding_consumed_d = '0;
+    end else if (tc_feeding_q && tc_feeding_len_q != 0) begin
       for (int i = 0; i < TRACE_LEN; i++)
         if (i < int'(tc_feeding_len_q) && instr_queue_consumed[i])
           tc_feeding_consumed_d[i] = 1'b1;
@@ -331,6 +334,10 @@ module frontend
       for (int i = 0; i < TRACE_LEN; i++)
         if (i < int'(tc_feeding_len_q) && !tc_feeding_consumed_d[i])
           tc_feeding_done = 1'b0;
+      if (tc_feeding_done)
+        tc_feeding_consumed_d = '0;
+    end else if (tc_feeding_start) begin
+      tc_feeding_consumed_d = '0;
     end
   end
 
@@ -364,16 +371,13 @@ module frontend
 
     if (flush_i || is_mispredict || set_pc_commit_i || ex_valid_i || eret_i) begin
       tc_feeding_d          = 1'b0;
-      tc_feeding_consumed_d = '0;
     end else if (tc_feeding_done) begin
       // Trace fully consumed → back to normal. npc_d set in npc_select below.
       tc_feeding_d          = 1'b0;
-      tc_feeding_consumed_d = '0;
     end else if (tc_feeding_start) begin
       tc_feeding_d          = 1'b1;
       tc_feeding_len_d      = tc_trace_length;
       tc_feeding_instr_d    = tc_trace_instructions;
-      tc_feeding_consumed_d = '0;
       for (int i = 0; i < TRACE_LEN; i++)
         tc_feeding_pcs_d[i] = tc_trace_pcs[i][CVA6Cfg.VLEN-1:0];
       tc_feeding_next_pc_d  = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
