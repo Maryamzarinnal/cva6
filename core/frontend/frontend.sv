@@ -817,12 +817,12 @@ module frontend
   localparam int unsigned TC_SAME_PC_REPLAY_CAP = 256;
   logic [15:0] tc_same_pc_replay_count_q;
 
-  assign tc_active_use = 1'b0;
+  //assign tc_active_use = 1'b0;
 
-//  assign tc_active_use = tc_active_hit
-//                      && tc_trace_starts_ok
-//                      && (tc_trace_next_pc != tc_lookup_pc_q)
-//                      && !tc_feeding_q;
+  assign tc_active_use = tc_active_hit
+                      && tc_trace_starts_ok
+                      && (tc_trace_next_pc != tc_lookup_pc_q)
+                      && !tc_feeding_q;
 
 // pragma translate_off
   // Compile with +define+TRACE_CACHE_DEBUG_VERBOSE for extra per-feeding/lookup prints
