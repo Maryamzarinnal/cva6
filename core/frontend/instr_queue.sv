@@ -108,9 +108,11 @@ module instr_queue
       if (idx_ds[0][i]) address_out = addr_data_out[i];
   end
 
-  // full_address: conservative ? any address FIFO full
+  // full_address: no longer used for ready_o gating.
+  // With per-slot FIFOs, |full_addr is too conservative (one full FIFO blocks everything).
+  // Instead, address_overflow triggers replay ONLY when we actually try to push to a full FIFO.
   assign full_address = |full_addr;
-  assign ready_o = ~(|instr_queue_full) & ~full_address;
+  assign ready_o = ~(|instr_queue_full);  // address overflow handled by replay path
 
   if (CVA6Cfg.RVC) begin : gen_multiple_instr_per_fetch_with_C
 
