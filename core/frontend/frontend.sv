@@ -108,10 +108,6 @@ module frontend
   logic [TRACE_LEN_WIDTH-1:0]              tc_trace_starts;
   logic                                    tc_trace_starts_ok;
 
-  // -- Trace-cache feeding: one-cycle push (multi-address queue) --
-  // On a trace hit, latch trace data. Next cycle: present ALL instructions
-  // to the queue with correct cf_type. The queue pushes all addresses at once
-  // via the multi-address circular buffer. No segments needed.
   logic                                    tc_feeding_q, tc_feeding_d;
   logic [TRACE_LEN_WIDTH-1:0]              tc_feeding_len_q, tc_feeding_len_d;
   logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]  tc_feeding_instr_q, tc_feeding_instr_d;
@@ -120,12 +116,10 @@ module frontend
   logic [CHUNKS_PER_TRACE-1:0]            tc_feeding_branch_flags_q, tc_feeding_branch_flags_d;
   logic [BR_CNT_WIDTH-1:0]                tc_feeding_num_branches_q, tc_feeding_num_branches_d;
 
-  // Per-instruction consumed mask
   logic [TRACE_LEN-1:0]                   tc_feeding_consumed_q, tc_feeding_consumed_d;
   logic                                    tc_feeding_done;
   logic                                    tc_feeding_start;
 
-  // CF classification for latched trace (decode opcode + match with branch_flags)
   logic [TRACE_LEN-1:0]                   is_trace_cf;
   logic [TRACE_LEN-1:0]                   is_trace_taken;
 
@@ -339,7 +333,6 @@ module frontend
     replay_addr_iq         = '0;
     replay_valid_iq        = '0;
     replay_predict_addr_iq = '0;
-    // Per-slot predict address: for taken CFs, target is next PC or trace target
     for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++) begin
       if (s < int'(tc_feeding_len_q) && is_trace_cf[s] && is_trace_taken[s]) begin
         if (s + 1 < int'(tc_feeding_len_q))
@@ -434,7 +427,8 @@ module frontend
       tc_feeding_num_branches_d = tc_trace_num_branches;
     end
   end
-  // ?? MUX: trace-cache feeding vs normal I-cache ??
+
+  // MUX: trace-cache feeding vs normal I-cache
   always_comb begin
     if (tc_feeding_q) begin
       instr_to_iq            = replay_instr_iq;
@@ -479,7 +473,6 @@ module frontend
     if (if_ready)
       npc_d = {fetch_address[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] + 1, {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}};
 
-    // When trace feeding completes, redirect NPC to trace target
     if (tc_feeding_done && tc_feeding_q)
       npc_d = tc_feeding_next_pc_q;
 
@@ -672,6 +665,20 @@ module frontend
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
   logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
 
+  // *** FIX: registered versions for alignment with instr_queue_consumed ***
+  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] tc_is_branch_q;
+  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] tc_taken_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      tc_is_branch_q <= '0;
+      tc_taken_q     <= '0;
+    end else begin
+      tc_is_branch_q <= tc_is_branch;
+      tc_taken_q     <= tc_taken;
+    end
+  end
+
   for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
     assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
     assign tc_pc[i]          = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, addr[i]};
@@ -711,16 +718,16 @@ module frontend
     end
   end
 
-  // Lookup only when the consumed window contains a taken branch (traces are built from such windows).
+  // Lookup only when the consumed window contains a taken branch.
+  // Use registered tc_is_branch_q/tc_taken_q to align with instr_queue_consumed.
   logic consumed_has_taken_branch;
   always_comb begin
     consumed_has_taken_branch = 1'b0;
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++)
-      if (instr_queue_consumed[i] && tc_is_branch[i] && tc_taken[i])
+      if (instr_queue_consumed[i] && tc_is_branch_q[i] && tc_taken_q[i])
         consumed_has_taken_branch = 1'b1;
   end
 
-  // One place for "we may do a TC lookup": consumed window had a taken branch, not in replay
   logic tc_lookup_cond;
   assign tc_lookup_cond = (|instr_queue_consumed) && consumed_has_taken_branch
                           && !tc_feeding_q;
@@ -807,17 +814,13 @@ module frontend
 
   assign tc_trace_starts_ok = (tc_trace_starts <= TRACE_LEN_WIDTH'(TRACE_LEN));
 
-  // Hit result appears one cycle after lookup; we latched (valid, pc) when we fired, so pairing is correct
   assign tc_active_hit = tc_lookup_valid_q
                        && tc_trace_hit
                        && (tc_trace_length != '0)
                        && !flush_i;
 
-  // Same-PC cap is no longer used to block replay (we replay one window then re-lookup). Kept for stats.
   localparam int unsigned TC_SAME_PC_REPLAY_CAP = 256;
   logic [15:0] tc_same_pc_replay_count_q;
-
-  //assign tc_active_use = 1'b0;
 
   assign tc_active_use = tc_active_hit
                       && tc_trace_starts_ok
@@ -825,7 +828,6 @@ module frontend
                       && !tc_feeding_q;
 
 // pragma translate_off
-  // Compile with +define+TRACE_CACHE_DEBUG_VERBOSE for extra per-feeding/lookup prints
   logic         tc_feeding_q_prev;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni)
@@ -851,7 +853,6 @@ module frontend
   int unsigned  tc_taken_lookups;
   int unsigned  tc_taken_hits;
   logic         tc_had_taken_q;
-  // Global trace-cache stats
   int unsigned  tc_global_hits;
   int unsigned  tc_global_misses;
   int unsigned  tc_fe_miss_empty;
@@ -860,8 +861,8 @@ module frontend
   int unsigned  tc_feeds_completed;
   int unsigned  tc_feed_cycles_total;
   logic [PC_WIDTH-1:0] tc_last_feed_base_pc_q;
-  int unsigned  tc_commit_count_q;  // trace commits (for gating TC-STATS print)
-  longint unsigned tc_total_cycles_q;  // total cycles (for fetch-improvement metric)
+  int unsigned  tc_commit_count_q;
+  longint unsigned tc_total_cycles_q;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) tc_total_cycles_q <= 0;
@@ -943,7 +944,6 @@ module frontend
         end
       end
 
-      // Print TC-STATS/TC-TAKEN only every 500 trace commits to avoid flooding the transcript
       if (i_trace_cache_top.i_trace_builder.commit_valid_q) begin
         tc_commit_count_q <= tc_commit_count_q + 1;
         if ((tc_commit_count_q + 1) % 500 == 0) begin
@@ -955,8 +955,6 @@ module frontend
         end
       end
 
-      // Global stats (whole run) for long-run debug
-      // Only count hit/miss when the TC actually did this lookup (fired); else we'd pair our request with an old result
       if (tc_lookup_result_valid) begin
         if (tc_trace_hit)
           tc_global_hits   <= tc_global_hits + 1;
@@ -974,7 +972,6 @@ module frontend
     end
   end
 
-  // Feed lifecycle and periodic summary
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       tc_last_feed_base_pc_q    <= '1;
@@ -1011,7 +1008,6 @@ module frontend
       $display("[TC-MISS-BREAKDOWN] total_misses=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why we miss)",
                tc_global_misses, tc_fe_miss_empty, tc_fe_miss_pc, tc_fe_miss_path);
     end
-    // Print full TC summary every 5000 feeds so it appears even if final block does not run
     if (tc_feeding_done && (tc_feeds_completed + 1) % 5000 == 0) begin
       automatic int tot, pct, fetch_pct;
       tot = tc_global_hits + tc_global_misses;
@@ -1063,7 +1059,6 @@ module frontend
       $display("[TC-FEED-FINISH] next_pc=0x%h", tc_feeding_next_pc_q);
     end
     `endif
-    // Same-PC cap no longer blocks; message removed to avoid log spam and confusion.
   end
 
   final begin
