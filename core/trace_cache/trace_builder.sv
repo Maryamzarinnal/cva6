@@ -62,6 +62,7 @@ module trace_builder #(
   logic                        dup_valid [(1 << TRACE_ADDRW)];
   logic [PC_WIDTH-1:0]         dup_pc    [(1 << TRACE_ADDRW)];
   logic [CHUNKS_PER_TRACE-1:0] dup_flags [(1 << TRACE_ADDRW)];
+  logic [BR_CNT_WIDTH-1:0]     dup_num_branches [(1 << TRACE_ADDRW)];
 
   assign instr_i.ready = 1'b1;
   assign mem_req_o     = commit_valid_q;
@@ -212,8 +213,9 @@ module trace_builder #(
                   temp_start_cnt = temp_start_cnt + START_CNT_W'(1);
 
                   if (instr_i.is_branch[i]) begin
-                    trace_d.branch_flags[temp_br_cnt] = instr_i.taken[i];
-                    branch_pcs_d[temp_br_cnt]         = instr_i.pc[i];
+                    trace_d.lookup_branch_flags[temp_br_cnt] = instr_i.taken[i];
+                    trace_d.branch_flags[temp_br_cnt]        = instr_i.taken[i];
+                    branch_pcs_d[temp_br_cnt]                = instr_i.pc[i];
                     if (instr_i.taken[i])
                       last_branch_target_d = instr_i.target[i];
                     temp_br_cnt = temp_br_cnt + 1;
@@ -221,12 +223,13 @@ module trace_builder #(
                 end
               end
 
-              trace_d.num_branches = BR_CNT_W'(temp_br_cnt);
-              chunk_ptr_d          = temp_chunk_ptr;
-              br_cnt_d             = temp_br_cnt;
-              instr_start_cnt_d    = temp_start_cnt;
-              taken_cnt_d          = 2'd1;
-              state_d              = ACCUM;
+              trace_d.lookup_num_branches = BR_CNT_W'(temp_br_cnt);
+              trace_d.num_branches        = BR_CNT_W'(temp_br_cnt);
+              chunk_ptr_d                 = temp_chunk_ptr;
+              br_cnt_d                    = temp_br_cnt;
+              instr_start_cnt_d           = temp_start_cnt;
+              taken_cnt_d                 = 2'd1;
+              state_d                     = ACCUM;
             end
           end
         end
@@ -265,7 +268,8 @@ module trace_builder #(
                 temp_start_cnt = temp_start_cnt + START_CNT_W'(1);
 
                 if (instr_i.is_branch[i]) begin
-                  branch_pcs_d[temp_br_cnt] = instr_i.pc[i];
+                  trace_d.branch_flags[temp_br_cnt] = instr_i.taken[i];
+                  branch_pcs_d[temp_br_cnt]         = instr_i.pc[i];
                   if (instr_i.taken[i]) begin
                     last_branch_target_d = instr_i.target[i];
                     taken_cnt_d = taken_cnt_q + 2'd1;
@@ -282,6 +286,7 @@ module trace_builder #(
             chunk_ptr_d       = temp_chunk_ptr;
             br_cnt_d          = temp_br_cnt;
             instr_start_cnt_d = temp_start_cnt;
+            trace_d.num_branches = BR_CNT_W'(temp_br_cnt);
 
             if (trace_full ||
                 (temp_start_cnt >= START_CNT_W'(MAX_INSTR_PER_TRACE) && temp_chunk_ptr > 0) ||
@@ -296,11 +301,12 @@ module trace_builder #(
                                     ? last_branch_target_d
                                     : last_instr_pc_d + (last_instr_compressed_d ? 64'h2 : 64'h4);
 
-              candidate_addr = tc_index(trace_d.base_pc, trace_d.branch_flags);
+              candidate_addr = tc_index(trace_d.base_pc, trace_d.lookup_branch_flags);
 
               is_duplicate = dup_valid[candidate_addr]
                            && (trace_d.base_pc      == dup_pc[candidate_addr])
-                           && (trace_d.branch_flags == dup_flags[candidate_addr]);
+                           && (trace_d.lookup_branch_flags == dup_flags[candidate_addr])
+                           && (trace_d.lookup_num_branches == dup_num_branches[candidate_addr]);
 
               if (!is_duplicate) begin
                 sram_wr_addr_d     = candidate_addr;
@@ -325,14 +331,17 @@ module trace_builder #(
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      for (int i = 0; i < (1 << TRACE_ADDRW); i++)
+      for (int i = 0; i < (1 << TRACE_ADDRW); i++) begin
         dup_valid[i] <= 1'b0;
+        dup_num_branches[i] <= '0;
+      end
     end else if (commit_valid_d) begin
       trace_data_t dup_tmp;
       dup_tmp = trace_data_t'(commit_data_d);
       dup_valid[sram_wr_addr_d] <= 1'b1;
       dup_pc[sram_wr_addr_d]    <= dup_tmp.base_pc;
-      dup_flags[sram_wr_addr_d] <= dup_tmp.branch_flags;
+      dup_flags[sram_wr_addr_d] <= dup_tmp.lookup_branch_flags;
+      dup_num_branches[sram_wr_addr_d] <= dup_tmp.lookup_num_branches;
     end
   end
 

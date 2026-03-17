@@ -92,8 +92,6 @@ module frontend
   logic [TRACE_LEN-1:0][PC_WIDTH-1:0]      tc_trace_pcs;
   logic [CHUNKS_PER_TRACE-1:0]             tc_trace_branch_flags;
   logic [BR_CNT_WIDTH-1:0]                 tc_trace_num_branches;
-  logic                                    tc_lookup_valid_q;
-  logic [PC_WIDTH-1:0]                     tc_lookup_pc_q;
   logic [PC_WIDTH-1:0]                     tc_trace_next_pc;
   logic [31:0]                             tc_miss_total;
   logic [31:0]                             tc_miss_empty;
@@ -327,6 +325,31 @@ module frontend
     end
   end
 
+  function automatic cf_t decode_trace_cf(input logic [31:0] instr_word);
+    logic is_rvc;
+    decode_trace_cf = ariane_pkg::NoCF;
+    is_rvc = (instr_word[1:0] != 2'b11);
+
+    if (!is_rvc) begin
+      unique case (instr_word[6:0])
+        riscv::OpcodeBranch: decode_trace_cf = ariane_pkg::Branch;
+        riscv::OpcodeJal:    decode_trace_cf = ariane_pkg::Jump;
+        riscv::OpcodeJalr:   decode_trace_cf = ariane_pkg::JumpR;
+        default: ;
+      endcase
+    end else begin
+      if (instr_word[15:13] == riscv::OpcodeC1Beqz || instr_word[15:13] == riscv::OpcodeC1Bnez)
+        decode_trace_cf = ariane_pkg::Branch;
+      else if (instr_word[15:13] == riscv::OpcodeC1J)
+        decode_trace_cf = ariane_pkg::Jump;
+      else if (instr_word[1:0] == riscv::OpcodeC2
+               && instr_word[15:13] == riscv::OpcodeC2JalrMvAdd
+               && instr_word[6:2] == 5'b00000
+               && instr_word[11:7] != 5'b00000)
+        decode_trace_cf = ariane_pkg::JumpR;
+    end
+  endfunction
+
   // -- Present trace instructions to the instruction queue --
   always_comb begin
     replay_instr_iq        = '0;
@@ -351,7 +374,7 @@ module frontend
         replay_instr_iq[s] = tc_feeding_instr_q[s];
         replay_addr_iq[s]  = tc_feeding_pcs_q[s];
         if (is_trace_cf[s] && is_trace_taken[s])
-          replay_cf_type_iq[s] = ariane_pkg::Branch;
+          replay_cf_type_iq[s] = decode_trace_cf(tc_feeding_instr_q[s]);
       end
     end
   end
@@ -664,20 +687,7 @@ module frontend
   logic [SLOTS_PER_CYCLE-1:0]               tc_taken;
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
   logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
-
-  // *** FIX: registered versions for alignment with instr_queue_consumed ***
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] tc_is_branch_q;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] tc_taken_q;
-
-  always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) begin
-      tc_is_branch_q <= '0;
-      tc_taken_q     <= '0;
-    end else begin
-      tc_is_branch_q <= tc_is_branch;
-      tc_taken_q     <= tc_taken;
-    end
-  end
+  logic [BR_CNT_WIDTH-1:0]                  tc_lookup_num_branches;
 
   for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
     assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
@@ -719,12 +729,11 @@ module frontend
   end
 
   // Lookup only when the consumed window contains a taken branch.
-  // Use registered tc_is_branch_q/tc_taken_q to align with instr_queue_consumed.
   logic consumed_has_taken_branch;
   always_comb begin
     consumed_has_taken_branch = 1'b0;
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++)
-      if (instr_queue_consumed[i] && tc_is_branch_q[i] && tc_taken_q[i])
+      if (instr_queue_consumed[i] && tc_taken[i])
         consumed_has_taken_branch = 1'b1;
   end
 
@@ -735,9 +744,11 @@ module frontend
   always_comb begin
     integer br_idx;
     tc_branch_predictions = '0;
+    tc_lookup_num_branches = '0;
     br_idx = 0;
     for (int i = 0; i < SLOTS_PER_CYCLE && br_idx < CHUNKS_PER_TRACE; i++) begin
-      if (tc_is_branch[i] && instruction_valid[i]) begin
+      if (instr_queue_consumed[i] && tc_is_branch[i]) begin
+        tc_lookup_num_branches = tc_lookup_num_branches + BR_CNT_WIDTH'(1);
         if (is_jump[i] || is_call[i])
           tc_branch_predictions[br_idx] = 1'b1;
         else if (is_return[i])
@@ -765,16 +776,17 @@ module frontend
     .branch_taken_i         (tc_taken),
     .branch_target_i        (tc_target),
     .serving_unaligned_i    (serving_unaligned),
-    .flush_i                (flush_i),
+    .flush_i                (flush_i || is_mispredict),
     .instr_queue_ready_i    (instr_queue_ready),
     .instr_queue_consumed_i (instr_queue_consumed),
     .branch_predictions_i   (tc_branch_predictions),
+    .lookup_num_branches_i  (tc_lookup_num_branches),
     .resolved_branch_valid_i      (resolved_branch_i.valid),
     .resolved_branch_pc_i         (resolved_branch_i.pc),
     .resolved_branch_is_taken_i   (resolved_branch_i.is_taken),
     .resolved_branch_is_mispredict_i (resolved_branch_i.is_mispredict),
     .lookup_valid_i         (tc_lookup_cond),
-    .lookup_pc_i            (tc_pc[0]),
+    .lookup_pc_i            (trace_cache_pkg::pc_align_16(tc_pc[0])),
     .trace_hit_o            (tc_trace_hit),
     .trace_instructions_o   (tc_trace_instructions),
     .trace_length_o         (tc_trace_length),
@@ -794,16 +806,6 @@ module frontend
     .miss_reason_path_o     (tc_miss_reason_path)
   );
 
-  always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) begin
-      tc_lookup_valid_q <= 1'b0;
-      tc_lookup_pc_q    <= '0;
-    end else begin
-      tc_lookup_valid_q <= tc_lookup_cond && !flush_i;
-      tc_lookup_pc_q    <= trace_cache_pkg::pc_align_16(tc_pc[0]);
-    end
-  end
-
   always_comb begin
     tc_trace_starts = '0;
     for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
@@ -814,17 +816,18 @@ module frontend
 
   assign tc_trace_starts_ok = (tc_trace_starts <= TRACE_LEN_WIDTH'(TRACE_LEN));
 
-  assign tc_active_hit = tc_lookup_valid_q
+  assign tc_active_hit = tc_lookup_result_valid
                        && tc_trace_hit
                        && (tc_trace_length != '0)
-                       && !flush_i;
+                       && !flush_i
+                       && !is_mispredict;
 
   localparam int unsigned TC_SAME_PC_REPLAY_CAP = 256;
   logic [15:0] tc_same_pc_replay_count_q;
 
   assign tc_active_use = tc_active_hit
                       && tc_trace_starts_ok
-                      && (tc_trace_next_pc != tc_lookup_pc_q)
+                      && (tc_trace_next_pc != tc_trace_pcs[0])
                       && !tc_feeding_q;
 
 // pragma translate_off
@@ -852,7 +855,6 @@ module frontend
   int unsigned  tc_misses;
   int unsigned  tc_taken_lookups;
   int unsigned  tc_taken_hits;
-  logic         tc_had_taken_q;
   int unsigned  tc_global_hits;
   int unsigned  tc_global_misses;
   int unsigned  tc_fe_miss_empty;
@@ -883,7 +885,6 @@ module frontend
       tc_misses        <= 0;
       tc_taken_lookups <= 0;
       tc_taken_hits    <= 0;
-      tc_had_taken_q   <= 1'b0;
       tc_global_hits   <= 0;
       tc_global_misses <= 0;
       tc_fe_miss_empty <= 0;
@@ -936,12 +937,8 @@ module frontend
       if (counting_active && tc_lookup_result_valid) begin
         if (tc_trace_hit) tc_hits   <= tc_hits + 1;
         else              tc_misses <= tc_misses + 1;
-
-        tc_had_taken_q <= |tc_taken && |instr_queue_consumed && !flush_i;
-        if (tc_had_taken_q) begin
-          tc_taken_lookups <= tc_taken_lookups + 1;
-          if (tc_trace_hit) tc_taken_hits <= tc_taken_hits + 1;
-        end
+        tc_taken_lookups <= tc_taken_lookups + 1;
+        if (tc_trace_hit) tc_taken_hits <= tc_taken_hits + 1;
       end
 
       if (i_trace_cache_top.i_trace_builder.commit_valid_q) begin
@@ -977,16 +974,16 @@ module frontend
       tc_last_feed_base_pc_q    <= '1;
       tc_same_pc_replay_count_q <= 16'd0;
     end else if (tc_feeding_start) begin
-      if (tc_lookup_pc_q != tc_last_feed_base_pc_q) begin
+      if (tc_trace_pcs[0] != tc_last_feed_base_pc_q) begin
         `ifdef TRACE_CACHE_DEBUG_VERBOSE
         $display("[TC-HOT-CHANGE] 0x%h -> 0x%h (feed #%0d) @ %0t",
-                 tc_last_feed_base_pc_q, tc_lookup_pc_q, tc_feeds_completed + 1, $time);
+                 tc_last_feed_base_pc_q, tc_trace_pcs[0], tc_feeds_completed + 1, $time);
         `endif
         tc_same_pc_replay_count_q <= 16'd1;
       end else begin
         tc_same_pc_replay_count_q <= tc_same_pc_replay_count_q + 1'b1;
       end
-      tc_last_feed_base_pc_q <= tc_lookup_pc_q;
+      tc_last_feed_base_pc_q <= tc_trace_pcs[0];
     end
   end
 
@@ -994,7 +991,7 @@ module frontend
     `ifdef TRACE_CACHE_DEBUG_VERBOSE
     if (tc_feeding_start) begin
       $display("[TC-FEED-START] #%0d base_pc=0x%h len=%0d next_pc=0x%h @ %0t",
-               tc_feeds_completed + 1, tc_lookup_pc_q, tc_trace_length, tc_trace_next_pc, $time);
+               tc_feeds_completed + 1, tc_trace_pcs[0], tc_trace_length, tc_trace_next_pc, $time);
     end
     if (tc_feeding_done) begin
       $display("[TC-FEED-DONE]  #%0d next_pc=0x%h @ %0t",
@@ -1037,7 +1034,7 @@ module frontend
       for (int k = 0; k < CHUNKS_PER_TRACE; k++)
         if (tc_trace_valid_chunks[k]) starts++;
       $display("[TC-ACTIVE-CAND] pc=0x%h len=%0d next=0x%h",
-               tc_lookup_pc_q, tc_trace_length, tc_trace_next_pc);
+               tc_trace_pcs[0], tc_trace_length, tc_trace_next_pc);
       $display("[TC-ACTIVE-CHUNKS] vmask=%b starts=%0d", tc_trace_valid_chunks, starts);
       $display("[TC-ACTIVE-CHUNKS] c0=%h c1=%h c2=%h c3=%h c4=%h c5=%h c6=%h c7=%h",
                tc_trace_chunks[0], tc_trace_chunks[1], tc_trace_chunks[2], tc_trace_chunks[3],
@@ -1046,15 +1043,15 @@ module frontend
 
     if (tc_active_hit && !tc_active_use) begin
       $display("[TC-ACTIVE-BLOCK] pc=0x%h self=%0b feeding=%0b len=%0d next=0x%h",
-               tc_lookup_pc_q,
-               (tc_trace_next_pc == tc_lookup_pc_q),
+               tc_trace_pcs[0],
+               (tc_trace_next_pc == tc_trace_pcs[0]),
                tc_feeding_q,
                tc_trace_length,
                tc_trace_next_pc);
     end
 
     if (tc_active_use)
-      $display("[TC-ACTIVE-USE] pc=0x%h -> next=0x%h", tc_lookup_pc_q, tc_trace_next_pc);
+      $display("[TC-ACTIVE-USE] pc=0x%h -> next=0x%h", tc_trace_pcs[0], tc_trace_next_pc);
     if (tc_feeding_done) begin
       $display("[TC-FEED-FINISH] next_pc=0x%h", tc_feeding_next_pc_q);
     end

@@ -28,6 +28,7 @@ module trace_cache_top #(
   input  logic [SLOTS_PER_CYCLE-1:0]  instr_queue_consumed_i,
 
   input  logic [CHUNKS_PER_TRACE-1:0] branch_predictions_i,
+  input  logic [BR_CNT_WIDTH-1:0]     lookup_num_branches_i,
 
   // Resolved branch (from backend): correct-path outcomes to store as path tag, matching Rotenberg fill-at-retire semantics
   input  logic                resolved_branch_valid_i,
@@ -166,6 +167,7 @@ module trace_cache_top #(
   logic                        lookup_valid_q;
   logic [PC_WIDTH-1:0]         lookup_pc_q;
   logic [CHUNKS_PER_TRACE-1:0] branch_predictions_q;
+  logic [BR_CNT_WIDTH-1:0]     lookup_num_branches_q;
   logic [TRACE_ADDRW-1:0]      lookup_set_q;
 
   assign lookup_fire = lookup_valid_i && !mem_req_builder;
@@ -178,11 +180,13 @@ module trace_cache_top #(
       lookup_valid_q       <= 1'b0;
       lookup_pc_q          <= '0;
       branch_predictions_q <= '0;
+      lookup_num_branches_q <= '0;
       lookup_set_q         <= '0;
     end else begin
       lookup_valid_q       <= lookup_fire;
       lookup_pc_q          <= lookup_base;
       branch_predictions_q <= branch_predictions_i;
+      lookup_num_branches_q <= lookup_num_branches_i;
       lookup_set_q         <= tc_index(lookup_base, branch_predictions_i);
     end
   end
@@ -235,18 +239,20 @@ module trace_cache_top #(
 
   trace_data_t trace_read [NUM_WAYS];
   logic [NUM_WAYS-1:0] pc_match;
+  logic [NUM_WAYS-1:0] branch_count_match;
   logic [NUM_WAYS-1:0] branch_flags_match;
   logic [NUM_WAYS-1:0] way_hit;
 
   for (genvar w = 0; w < NUM_WAYS; w++) begin : gen_tag_cmp
     assign trace_read[w] = mem_rdata[w];
     assign pc_match[w]   = (trace_read[w].base_pc == lookup_pc_q);
+    assign branch_count_match[w] = (trace_read[w].lookup_num_branches == lookup_num_branches_q);
 
     always_comb begin
       branch_flags_match[w] = 1'b1;
       for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
-        if (i < int'(trace_read[w].num_branches)) begin
-          if (branch_predictions_q[i] != trace_read[w].branch_flags[i])
+        if (i < int'(trace_read[w].lookup_num_branches)) begin
+          if (branch_predictions_q[i] != trace_read[w].lookup_branch_flags[i])
             branch_flags_match[w] = 1'b0;
         end
       end
@@ -254,6 +260,7 @@ module trace_cache_top #(
 
     assign way_hit[w] = trace_read[w].valid
                      && pc_match[w]
+                     && branch_count_match[w]
                      && branch_flags_match[w]
                      && lookup_valid_q;
   end
@@ -441,10 +448,10 @@ module trace_cache_top #(
           if (trace_read[w].valid && !pc_match[w])
             $display("[TC-LOOKUP] lookup PC 0x%h missed (way %0d had base_pc 0x%h)",
                      lookup_pc_q, w, trace_read[w].base_pc);
-          else if (trace_read[w].valid && pc_match[w] && !branch_flags_match[w])
-            $display("[TC-LOOKUP] BR MISS at 0x%h (way %0d): stored=%b lookup=%b num=%0d",
-                     lookup_pc_q, w, trace_read[w].branch_flags,
-                     branch_predictions_q, trace_read[w].num_branches);
+          else if (trace_read[w].valid && pc_match[w] && (!branch_count_match[w] || !branch_flags_match[w]))
+            $display("[TC-LOOKUP] BR MISS at 0x%h (way %0d): stored=%b lookup=%b stored_num=%0d lookup_num=%0d",
+                     lookup_pc_q, w, trace_read[w].lookup_branch_flags,
+                     branch_predictions_q, trace_read[w].lookup_num_branches, lookup_num_branches_q);
         end
       end
     end

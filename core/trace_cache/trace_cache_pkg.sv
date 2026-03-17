@@ -21,7 +21,10 @@ package trace_cache_pkg;
 
   // PCs are not stored per instruction; on hit we derive them from base_pc + instr + branch_flags
   localparam int unsigned TRACE_WIDTH =
-    1 + PC_WIDTH + CHUNKS_PER_TRACE + BR_CNT_WIDTH + PC_WIDTH
+    1 + PC_WIDTH
+    + CHUNKS_PER_TRACE + BR_CNT_WIDTH
+    + CHUNKS_PER_TRACE + BR_CNT_WIDTH
+    + PC_WIDTH
     + (CHUNKS_PER_TRACE * 16) + CHUNKS_PER_TRACE;
 
   localparam int unsigned BE_WIDTH = (TRACE_WIDTH + 7) / 8;
@@ -29,6 +32,8 @@ package trace_cache_pkg;
   typedef struct packed {
     logic                               valid;
     logic [PC_WIDTH-1:0]                base_pc;
+    logic [CHUNKS_PER_TRACE-1:0]        lookup_branch_flags;
+    logic [BR_CNT_WIDTH-1:0]            lookup_num_branches;
     logic [CHUNKS_PER_TRACE-1:0]        branch_flags;
     logic [BR_CNT_WIDTH-1:0]            num_branches;
     logic [PC_WIDTH-1:0]                target_addr;
