@@ -108,18 +108,18 @@ module frontend
 
   logic                                    tc_feeding_q, tc_feeding_d;
   logic [TRACE_LEN_WIDTH-1:0]              tc_feeding_len_q, tc_feeding_len_d;
-  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]  tc_feeding_instr_q, tc_feeding_instr_d;
-  logic [TRACE_LEN-1:0][CVA6Cfg.VLEN-1:0] tc_feeding_pcs_q, tc_feeding_pcs_d;
-  logic [CVA6Cfg.VLEN-1:0]                tc_feeding_next_pc_q, tc_feeding_next_pc_d;
-  logic [CHUNKS_PER_TRACE-1:0]            tc_feeding_branch_flags_q, tc_feeding_branch_flags_d;
-  logic [BR_CNT_WIDTH-1:0]                tc_feeding_num_branches_q, tc_feeding_num_branches_d;
+  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   tc_feeding_instr_q, tc_feeding_instr_d;
+  logic [TRACE_LEN-1:0][CVA6Cfg.VLEN-1:0]  tc_feeding_pcs_q, tc_feeding_pcs_d;
+  logic [CVA6Cfg.VLEN-1:0]                 tc_feeding_next_pc_q, tc_feeding_next_pc_d;
+  logic [CHUNKS_PER_TRACE-1:0]             tc_feeding_branch_flags_q, tc_feeding_branch_flags_d;
+  logic [BR_CNT_WIDTH-1:0]                 tc_feeding_num_branches_q, tc_feeding_num_branches_d;
 
-  logic [TRACE_LEN-1:0]                   tc_feeding_consumed_q, tc_feeding_consumed_d;
+  logic [TRACE_LEN-1:0]                    tc_feeding_consumed_q, tc_feeding_consumed_d;
   logic                                    tc_feeding_done;
   logic                                    tc_feeding_start;
 
-  logic [TRACE_LEN-1:0]                   is_trace_cf;
-  logic [TRACE_LEN-1:0]                   is_trace_taken;
+  logic [TRACE_LEN-1:0]                    is_trace_cf;
+  logic [TRACE_LEN-1:0]                    is_trace_taken;
 
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0]             replay_instr_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] replay_addr_iq;
@@ -295,7 +295,6 @@ module frontend
   assign btb_update.pc             = resolved_branch_i.pc;
   assign btb_update.target_address = resolved_branch_i.target_address;
 
-  // -- Per-instruction CF classification for latched trace --
   always_comb begin
     int br_idx_scan;
     br_idx_scan = 0;
@@ -350,7 +349,6 @@ module frontend
     end
   endfunction
 
-  // -- Present trace instructions to the instruction queue --
   always_comb begin
     replay_instr_iq        = '0;
     replay_addr_iq         = '0;
@@ -379,7 +377,6 @@ module frontend
     end
   end
 
-  // -- Consumed mask + feeding done --
   always_comb begin
     tc_feeding_consumed_d = tc_feeding_consumed_q;
     tc_feeding_done       = 1'b0;
@@ -401,7 +398,6 @@ module frontend
     end
   end
 
-  // -- Feeding state register --
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       tc_feeding_q              <= 1'b0;
@@ -451,7 +447,6 @@ module frontend
     end
   end
 
-  // MUX: trace-cache feeding vs normal I-cache
   always_comb begin
     if (tc_feeding_q) begin
       instr_to_iq            = replay_instr_iq;
@@ -688,9 +683,12 @@ module frontend
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
   logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
   logic [BR_CNT_WIDTH-1:0]                  tc_lookup_num_branches;
+  logic                                     tc_enable;
+
+  assign tc_enable = !halt_i && !halt_frontend_i && !debug_mode_i;
 
   for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
-    assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i;
+    assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i & tc_enable;
     assign tc_pc[i]          = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, addr[i]};
     assign tc_instr[i]       = instr[i];
     assign tc_is_branch[i]   = is_branch[i] | is_jump[i] | is_jalr[i] | is_return[i] | is_call[i];
@@ -728,7 +726,6 @@ module frontend
     end
   end
 
-  // Lookup only when the consumed window contains a taken branch.
   logic consumed_has_taken_branch;
   always_comb begin
     consumed_has_taken_branch = 1'b0;
@@ -776,16 +773,16 @@ module frontend
     .branch_taken_i         (tc_taken),
     .branch_target_i        (tc_target),
     .serving_unaligned_i    (serving_unaligned),
-    .flush_i                (flush_i || is_mispredict),
-    .instr_queue_ready_i    (instr_queue_ready),
-    .instr_queue_consumed_i (instr_queue_consumed),
-    .branch_predictions_i   (tc_branch_predictions),
-    .lookup_num_branches_i  (tc_lookup_num_branches),
-    .resolved_branch_valid_i      (resolved_branch_i.valid),
+    .flush_i                (flush_i || is_mispredict || !tc_enable),
+    .instr_queue_ready_i    (instr_queue_ready && tc_enable),
+    .instr_queue_consumed_i (tc_enable ? instr_queue_consumed : '0),
+    .branch_predictions_i   (tc_enable ? tc_branch_predictions : '0),
+    .lookup_num_branches_i  (tc_enable ? tc_lookup_num_branches : '0),
+    .resolved_branch_valid_i      (tc_enable && resolved_branch_i.valid),
     .resolved_branch_pc_i         (resolved_branch_i.pc),
     .resolved_branch_is_taken_i   (resolved_branch_i.is_taken),
     .resolved_branch_is_mispredict_i (resolved_branch_i.is_mispredict),
-    .lookup_valid_i         (tc_lookup_cond),
+    .lookup_valid_i         (tc_enable && tc_lookup_cond),
     .lookup_pc_i            (trace_cache_pkg::pc_align_16(tc_pc[0])),
     .trace_hit_o            (tc_trace_hit),
     .trace_instructions_o   (tc_trace_instructions),
@@ -793,8 +790,8 @@ module frontend
     .trace_chunks_o         (tc_trace_chunks),
     .trace_valid_chunks_o   (tc_trace_valid_chunks),
     .trace_pcs_o            (tc_trace_pcs),
-    .trace_branch_flags_o  (tc_trace_branch_flags),
-    .trace_num_branches_o  (tc_trace_num_branches),
+    .trace_branch_flags_o   (tc_trace_branch_flags),
+    .trace_num_branches_o   (tc_trace_num_branches),
     .trace_next_pc_o        (tc_trace_next_pc),
     .tc_miss_total_o        (tc_miss_total),
     .tc_miss_empty_o        (tc_miss_empty),
@@ -831,13 +828,14 @@ module frontend
                       && !tc_feeding_q;
 
 // pragma translate_off
-  logic         tc_feeding_q_prev;
+  logic tc_feeding_q_prev;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni)
       tc_feeding_q_prev <= 1'b0;
     else
       tc_feeding_q_prev <= tc_feeding_q;
   end
+
   `ifdef TRACE_CACHE_DEBUG_VERBOSE
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (rst_ni && tc_feeding_q && !tc_feeding_q_prev)
@@ -845,6 +843,7 @@ module frontend
                tc_feeding_len_q, tc_feeding_next_pc_q, $time);
   end
   `endif
+
   logic         counting_active;
   logic         stats_printed;
   int unsigned  taken_hist        [SLOTS_PER_CYCLE+1];
@@ -880,19 +879,19 @@ module frontend
         not_taken_hist[i]    <= 0;
         total_branch_hist[i] <= 0;
       end
-      window_count     <= 0;
-      tc_hits          <= 0;
-      tc_misses        <= 0;
-      tc_taken_lookups <= 0;
-      tc_taken_hits    <= 0;
-      tc_global_hits   <= 0;
-      tc_global_misses <= 0;
-      tc_fe_miss_empty <= 0;
-      tc_fe_miss_pc    <= 0;
-      tc_fe_miss_path  <= 0;
+      window_count       <= 0;
+      tc_hits            <= 0;
+      tc_misses          <= 0;
+      tc_taken_lookups   <= 0;
+      tc_taken_hits      <= 0;
+      tc_global_hits     <= 0;
+      tc_global_misses   <= 0;
+      tc_fe_miss_empty   <= 0;
+      tc_fe_miss_pc      <= 0;
+      tc_fe_miss_path    <= 0;
       tc_feeds_completed <= 0;
       tc_feed_cycles_total <= 0;
-      tc_commit_count_q <= 0;
+      tc_commit_count_q  <= 0;
     end else begin
       if (pc_commit_i == 64'h80001568) begin
         counting_active <= 1'b1;
@@ -954,7 +953,7 @@ module frontend
 
       if (tc_lookup_result_valid) begin
         if (tc_trace_hit)
-          tc_global_hits   <= tc_global_hits + 1;
+          tc_global_hits <= tc_global_hits + 1;
         else begin
           tc_global_misses <= tc_global_misses + 1;
           if (tc_miss_reason_empty) tc_fe_miss_empty <= tc_fe_miss_empty + 1;
@@ -996,6 +995,7 @@ module frontend
     if (tc_feeding_done) begin
       $display("[TC-FEED-DONE]  #%0d next_pc=0x%h @ %0t",
                tc_feeds_completed + 1, tc_feeding_next_pc_q, $time);
+    end
     `endif
     if (tc_feeding_done && (tc_feeds_completed + 1) % 100 == 0) begin
       $display("[TC-PERIODIC] feeds=%0d global_hits=%0d global_misses=%0d hit_rate=%0d%% feed_cycles=%0d @ %0t",

@@ -373,14 +373,14 @@ module trace_cache_top #(
       if (taken && is_jalr && (i == int'(instr_count) - 1))
         pc = hit_trace.target_addr;
       else if (taken && is_cf) begin
-        if (!is_rvc && instr[6:0] == OpcodeBranch)   // B-type (sb_imm)
+        if (!is_rvc && instr[6:0] == OpcodeBranch)
           imm_signed = {{(PC_WIDTH-13){instr[31]}}, instr[31], instr[7], instr[30:25], instr[11:8], 1'b0};
-        else if (!is_rvc && instr[6:0] == OpcodeJal) // JAL (uj_imm)
+        else if (!is_rvc && instr[6:0] == OpcodeJal)
           imm_signed = {{(PC_WIDTH-21){instr[31]}}, instr[31], instr[19:12], instr[20], instr[30:21], 1'b0};
-        else if (is_rvc && instr[15:13] == OpcodeC1J) // C.jal (two encodings: instr[14] selects format, same as instr_scan rvc_imm_o)
+        else if (is_rvc && instr[15:13] == OpcodeC1J)
           imm_signed = instr[14] ? {{(PC_WIDTH-9){instr[12]}}, instr[6:5], instr[2], instr[11:10], instr[4:3], 1'b0}
                         : {{(PC_WIDTH-12){instr[12]}}, instr[8], instr[10:9], instr[6], instr[7], instr[2], instr[11], instr[5:3], 1'b0};
-        else  // RVC beqz/bnez
+        else
           imm_signed = {{(PC_WIDTH-9){instr[12]}}, instr[6:5], instr[2], instr[11:10], instr[4:3], 1'b0};
         pc = pc + imm_signed;
       end else
@@ -403,13 +403,12 @@ module trace_cache_top #(
     end
   end
 
-// Miss breakdown: use MODEL_TECH (Questa/ModelSim) so it runs in sim even if SYNTHESIS is set by the build
 `ifdef MODEL_TECH
   initial $display("[TC-DEBUG] trace_cache_top: miss breakdown ACTIVE (MODEL_TECH defined)");
 
-  int unsigned tc_miss_empty;   // set had no valid trace
-  int unsigned tc_miss_pc;      // set had valid trace(s) but no base_pc match (wrong/evicted)
-  int unsigned tc_miss_path;    // set had valid trace with same base_pc but branch_flags mismatch
+  int unsigned tc_miss_empty;
+  int unsigned tc_miss_pc;
+  int unsigned tc_miss_path;
   int unsigned tc_miss_total;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -442,7 +441,6 @@ module trace_cache_top #(
 `endif
 
 `ifndef SYNTHESIS
-  // +define+TRACE_CACHE_DEBUG_VERBOSE for per-lookup prints
   `ifdef TRACE_CACHE_DEBUG_VERBOSE
   always_ff @(posedge clk_i) begin
     if (lookup_valid_q) begin
