@@ -238,6 +238,7 @@ module trace_cache_top #(
   end
 
   trace_data_t trace_read [NUM_WAYS];
+  logic [NUM_WAYS-1:0] way_valid;
   logic [NUM_WAYS-1:0] pc_match;
   logic [NUM_WAYS-1:0] branch_count_match;
   logic [NUM_WAYS-1:0] branch_flags_match;
@@ -245,20 +246,25 @@ module trace_cache_top #(
 
   for (genvar w = 0; w < NUM_WAYS; w++) begin : gen_tag_cmp
     assign trace_read[w] = mem_rdata[w];
-    assign pc_match[w]   = (trace_read[w].base_pc == lookup_pc_q);
-    assign branch_count_match[w] = (trace_read[w].lookup_num_branches == lookup_num_branches_q);
+    assign way_valid[w]  = (trace_read[w].valid === 1'b1);
+    assign pc_match[w]   = way_valid[w] && (trace_read[w].base_pc == lookup_pc_q);
+    assign branch_count_match[w] = way_valid[w]
+                                && (trace_read[w].lookup_num_branches == lookup_num_branches_q);
 
     always_comb begin
-      branch_flags_match[w] = 1'b1;
-      for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
-        if (i < int'(trace_read[w].lookup_num_branches)) begin
-          if (branch_predictions_q[i] != trace_read[w].lookup_branch_flags[i])
-            branch_flags_match[w] = 1'b0;
+      branch_flags_match[w] = 1'b0;
+      if (way_valid[w]) begin
+        branch_flags_match[w] = 1'b1;
+        for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
+          if (i < int'(trace_read[w].lookup_num_branches)) begin
+            if (branch_predictions_q[i] != trace_read[w].lookup_branch_flags[i])
+              branch_flags_match[w] = 1'b0;
+          end
         end
       end
     end
 
-    assign way_hit[w] = trace_read[w].valid
+    assign way_hit[w] = way_valid[w]
                      && pc_match[w]
                      && branch_count_match[w]
                      && branch_flags_match[w]
@@ -276,8 +282,8 @@ module trace_cache_top #(
     any_valid_in_set = 1'b0;
     any_pc_match_in_set = 1'b0;
     for (int w = 0; w < NUM_WAYS; w++) begin
-      if (trace_read[w].valid) any_valid_in_set = 1'b1;
-      if (trace_read[w].valid && pc_match[w]) any_pc_match_in_set = 1'b1;
+      if (way_valid[w]) any_valid_in_set = 1'b1;
+      if (way_valid[w] && pc_match[w]) any_pc_match_in_set = 1'b1;
     end
   end
   assign miss_reason_empty_o = lookup_valid_q && !trace_hit && !any_valid_in_set;
@@ -293,12 +299,16 @@ module trace_cache_top #(
   end
 
   trace_data_t hit_trace;
-  assign hit_trace            = trace_read[hit_way_idx];
-  assign trace_next_pc_o      = hit_trace.target_addr;
-  assign trace_chunks_o       = trace_hit ? hit_trace.chunks : '0;
-  assign trace_valid_chunks_o = trace_hit ? hit_trace.valid_chunks : '0;
-  assign trace_branch_flags_o  = trace_hit ? hit_trace.branch_flags : '0;
-  assign trace_num_branches_o  = trace_hit ? hit_trace.num_branches : '0;
+  always_comb begin
+    hit_trace = '0;
+    if (trace_hit)
+      hit_trace = trace_read[hit_way_idx];
+  end
+  assign trace_next_pc_o       = hit_trace.target_addr;
+  assign trace_chunks_o        = hit_trace.chunks;
+  assign trace_valid_chunks_o  = hit_trace.valid_chunks;
+  assign trace_branch_flags_o  = hit_trace.branch_flags;
+  assign trace_num_branches_o  = hit_trace.num_branches;
 
   logic [TRACE_LEN_WIDTH-1:0] instr_count;
   always_comb begin
