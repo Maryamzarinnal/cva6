@@ -8,484 +8,358 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 //
-// Author: Florian Zaruba, ETH Zurich
-// Date: 26.10.2018
+// Author: Florian Zaruba <zarubaf@iis.ee.ethz.ch>
+// Description: Instruction Re-aligner
 //
-// Description: Instruction Queue with per-slot address FIFOs for trace cache support.
-//   Modified: predict_address_i is now per-slot [INSTR_PER_FETCH][VLEN].
-//   4 address FIFOs (one per instruction slot) replace the single address FIFO.
-//   tc_feeding_i bypasses branch_mask so all valid trace instructions pass through.
+// This module takes cache blocks and extracts the instructions.
+// As we are supporting the compressed instruction set extension, in a 32 bit instruction word
+// are up to 2 compressed instructions.
+// Furthermore those instructions can be arbitrarily interleaved which makes it possible to fetch
+// only the lower part of a 32 bit instruction.
+// Furthermore we need to handle the case if we want to start fetching from an unaligned
+// instruction e.g. a branch.
 
-module instr_queue
+module instr_realign
   import ariane_pkg::*;
 #(
-    parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty,
-    parameter type fetch_entry_t = logic
+    parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty
 ) (
+    // Subsystem Clock - SUBSYSTEM
     input logic clk_i,
+    // Asynchronous reset active low - SUBSYSTEM
     input logic rst_ni,
+    // Fetch flush request - CONTROLLER
     input logic flush_i,
-    input logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0] instr_i,
-    input logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] addr_i,
-    input logic [CVA6Cfg.INSTR_PER_FETCH-1:0] valid_i,
-    output logic ready_o,
-    output logic [CVA6Cfg.INSTR_PER_FETCH-1:0] consumed_o,
-    input ariane_pkg::frontend_exception_t exception_i,
-    input logic [CVA6Cfg.VLEN-1:0] exception_addr_i,
-    input logic [CVA6Cfg.GPLEN-1:0] exception_gpaddr_i,
-    input logic [31:0] exception_tinst_i,
-    input logic exception_gva_i,
-    // Per-slot predict address (normal: all same; trace: per-CF target)
-    input logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] predict_address_i,
-    input ariane_pkg::cf_t [CVA6Cfg.INSTR_PER_FETCH-1:0] cf_type_i,
-    // Trace cache: bypass branch_mask so multiple CFs pass through
-    input logic tc_feeding_i,
-    output logic replay_o,
-    output logic [CVA6Cfg.VLEN-1:0] replay_addr_o,
-    output fetch_entry_t [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_o,
-    output logic [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_valid_o,
-    input logic [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_ready_i
+    // 32-bit block is valid - CACHE
+    input logic valid_i,
+    // Instruction is unaligned - FRONTEND
+    output logic serving_unaligned_o,
+    // 32-bit block address - CACHE
+    input logic [CVA6Cfg.VLEN-1:0] address_i,
+    // 32-bit block - CACHE
+    input logic [CVA6Cfg.FETCH_WIDTH-1:0] data_i,
+    // instruction is valid - FRONTEND
+    output logic [CVA6Cfg.INSTR_PER_FETCH-1:0] valid_o,
+    // Instruction address - FRONTEND
+    output logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] addr_o,
+    // Instruction - instr_scan&instr_queue
+    output logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0] instr_o
 );
+  // as a maximum we support a fetch width of 64-bit, hence there can be 4 compressed instructions
+  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] instr_is_compressed;
 
-  localparam NID = CVA6Cfg.SuperscalarEn ? 1 : 0;
-
-  typedef struct packed {
-    logic [31:0]                     instr;
-    ariane_pkg::cf_t                 cf;
-    ariane_pkg::frontend_exception_t ex;
-    logic [CVA6Cfg.VLEN-1:0]         ex_vaddr;
-    logic [CVA6Cfg.GPLEN-1:0]        ex_gpaddr;
-    logic [31:0]                     ex_tinst;
-    logic                            ex_gva;
-  } instr_data_t;
-
-  logic [CVA6Cfg.LOG2_INSTR_PER_FETCH-1:0] branch_index;
-  instr_data_t [CVA6Cfg.INSTR_PER_FETCH-1:0] instr_data_in, instr_data_out;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] push_instr, push_instr_fifo;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] pop_instr;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] instr_queue_full;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] instr_queue_empty;
-  logic                               instr_overflow;
-  // Per-slot address FIFOs
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] addr_data_out;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] push_addr, pop_addr;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] full_addr;
-  logic [CVA6Cfg.VLEN-1:0]            address_out;
-  logic                               push_address;
-  logic                               full_address;
-  logic                               address_overflow;
-
-  logic [CVA6Cfg.LOG2_INSTR_PER_FETCH-1:0] idx_is_d, idx_is_q;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] idx_ds_d, idx_ds_q;
-  logic [CVA6Cfg.NrIssuePorts:0][CVA6Cfg.INSTR_PER_FETCH-1:0] idx_ds;
-
-  logic [CVA6Cfg.VLEN-1:0] pc_d, pc_q;
-  logic [CVA6Cfg.NrIssuePorts:0][CVA6Cfg.VLEN-1:0] pc_j;
-  logic reset_address_d, reset_address_q;
-
-  logic [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_is_cf, fetch_entry_fire;
-
-  logic [CVA6Cfg.INSTR_PER_FETCH*2-2:0] branch_mask_extended;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] branch_mask;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] taken;
-  logic [CVA6Cfg.LOG2_INSTR_PER_FETCH:0] popcount;
-  logic [CVA6Cfg.LOG2_INSTR_PER_FETCH-1:0] shamt;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] valid;
-  logic [CVA6Cfg.INSTR_PER_FETCH*2-1:0] consumed_extended;
-  logic [CVA6Cfg.INSTR_PER_FETCH*2-1:0] fifo_pos_extended;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] fifo_pos;
-  logic [CVA6Cfg.INSTR_PER_FETCH*2-1:0][31:0] instr;
-  ariane_pkg::cf_t [CVA6Cfg.INSTR_PER_FETCH*2-1:0] cf;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] instr_overflow_fifo;
-
-  // Duplicate & rotate predict addresses (same rotation as instructions)
-  logic [CVA6Cfg.INSTR_PER_FETCH*2-1:0][CVA6Cfg.VLEN-1:0] pred_addr_dup;
-
-  // address_out: select from the FIFO matching the current output slot
-  always_comb begin
-    address_out = '0;
-    for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++)
-      if (idx_ds[0][i]) address_out = addr_data_out[i];
+  for (genvar i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
+    // LSB != 2'b11
+    assign instr_is_compressed[i] = ~&data_i[i*16+:2];
   end
 
-  // full_address: no longer used for ready_o gating.
-  // With per-slot FIFOs, |full_addr is too conservative (one full FIFO blocks everything).
-  // Instead, address_overflow triggers replay ONLY when we actually try to push to a full FIFO.
-  assign full_address = |full_addr;
-  assign ready_o = ~(|instr_queue_full) & ~full_address;  // address overflow handled by replay path
+  // save the unaligned part of the instruction to this ff
+  logic [15:0] unaligned_instr_d, unaligned_instr_q;
+  // the last instruction was unaligned
+  logic unaligned_d, unaligned_q;
+  // register to save the unaligned address
+  logic [CVA6Cfg.VLEN-1:0] unaligned_address_d, unaligned_address_q;
+  // we have an unaligned instruction
+  assign serving_unaligned_o = unaligned_q;
 
-  if (CVA6Cfg.RVC) begin : gen_multiple_instr_per_fetch_with_C
+  // Instruction re-alignment
+  if (CVA6Cfg.FETCH_WIDTH == 32) begin : realign_bp_32
+    always_comb begin : re_align
+      unaligned_d = unaligned_q;
+      unaligned_address_d = {address_i[CVA6Cfg.VLEN-1:2], 2'b10};
+      unaligned_instr_d = data_i[31:16];
 
-    for (genvar i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin : gen_unpack_taken
-      assign taken[i] = cf_type_i[i] != ariane_pkg::NoCF;
-    end
+      valid_o[0] = valid_i;
+      instr_o[0] = unaligned_q ? {data_i[15:0], unaligned_instr_q} : data_i[31:0];
+      addr_o[0] = unaligned_q ? unaligned_address_q : address_i;
 
-    lzc #(
-        .WIDTH(CVA6Cfg.INSTR_PER_FETCH),
-        .MODE (0)
-    ) i_lzc_branch_index (
-        .in_i   (taken),
-        .cnt_o  (branch_index),
-        .empty_o()
-    );
-
-    assign branch_mask_extended = {{{CVA6Cfg.INSTR_PER_FETCH-1}{1'b0}}, {{CVA6Cfg.INSTR_PER_FETCH}{1'b1}}} << branch_index;
-    assign branch_mask = branch_mask_extended[CVA6Cfg.INSTR_PER_FETCH * 2 - 2:CVA6Cfg.INSTR_PER_FETCH - 1];
-
-    // tc_feeding_i: bypass branch_mask so ALL valid trace instructions pass through
-    assign valid = tc_feeding_i ? valid_i : (valid_i & branch_mask);
-
-    assign consumed_extended = {push_instr_fifo, push_instr_fifo} >> idx_is_q;
-    assign consumed_o = consumed_extended[CVA6Cfg.INSTR_PER_FETCH-1:0];
-
-    popcount #(
-        .INPUT_WIDTH(CVA6Cfg.INSTR_PER_FETCH)
-    ) i_popcount (
-        .data_i    (push_instr_fifo),
-        .popcount_o(popcount)
-    );
-    assign shamt = popcount[$bits(shamt)-1:0];
-    assign idx_is_d = idx_is_q + shamt;
-
-    assign fifo_pos_extended = {valid, valid} << idx_is_q;
-    assign fifo_pos = fifo_pos_extended[CVA6Cfg.INSTR_PER_FETCH*2-1:CVA6Cfg.INSTR_PER_FETCH];
-    assign push_instr = fifo_pos & ~instr_queue_full;
-
-    for (genvar i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin : gen_duplicate_instr_input
-      assign instr[i] = instr_i[i];
-      assign instr[i+CVA6Cfg.INSTR_PER_FETCH] = instr_i[i];
-      assign cf[i] = cf_type_i[i];
-      assign cf[i+CVA6Cfg.INSTR_PER_FETCH] = cf_type_i[i];
-      // Duplicate predict addresses for rotation
-      assign pred_addr_dup[i] = predict_address_i[i];
-      assign pred_addr_dup[i+CVA6Cfg.INSTR_PER_FETCH] = predict_address_i[i];
-    end
-
-    for (genvar i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin : gen_fifo_input_select
-      /* verilator lint_off WIDTH */
-      assign instr_data_in[i].instr = instr[CVA6Cfg.INSTR_PER_FETCH+i-idx_is_q];
-      assign instr_data_in[i].cf = cf[CVA6Cfg.INSTR_PER_FETCH+i-idx_is_q];
-      assign instr_data_in[i].ex = exception_i;
-      assign instr_data_in[i].ex_vaddr = exception_addr_i;
-      if (CVA6Cfg.RVH) begin : gen_hyp_ex_with_C
-        assign instr_data_in[i].ex_gpaddr = exception_gpaddr_i;
-        assign instr_data_in[i].ex_tinst = exception_tinst_i;
-        assign instr_data_in[i].ex_gva = exception_gva_i;
-      end else begin : gen_no_hyp_ex_with_C
-        assign instr_data_in[i].ex_gpaddr = '0;
-        assign instr_data_in[i].ex_tinst = '0;
-        assign instr_data_in[i].ex_gva = 1'b0;
+      if (CVA6Cfg.INSTR_PER_FETCH != 1) begin
+        valid_o[CVA6Cfg.INSTR_PER_FETCH-1] = 1'b0;
+        instr_o[CVA6Cfg.INSTR_PER_FETCH-1] = '0;
+        addr_o[CVA6Cfg.INSTR_PER_FETCH-1]  = {address_i[CVA6Cfg.VLEN-1:2], 2'b10};
       end
-      /* verilator lint_on WIDTH */
-    end
-  end else begin : gen_multiple_instr_per_fetch_without_C
-    assign taken = '0;
-    assign branch_index = '0;
-    assign branch_mask_extended = '0;
-    assign branch_mask = '0;
-    assign consumed_extended = '0;
-    assign fifo_pos_extended = '0;
-    assign fifo_pos = '0;
-    assign instr = '0;
-    assign popcount = '0;
-    assign shamt = '0;
-    assign valid = '0;
-    assign pred_addr_dup = '0;
-    assign consumed_o = push_instr_fifo[0];
-    assign push_instr = valid_i & ~instr_queue_full;
-    /* verilator lint_off WIDTH */
-    assign instr_data_in[0].instr = instr_i[0];
-    assign instr_data_in[0].cf = cf_type_i[0];
-    assign instr_data_in[0].ex = exception_i;
-    assign instr_data_in[0].ex_vaddr = exception_addr_i;
-    if (CVA6Cfg.RVH) begin : gen_hyp_ex_without_C
-      assign instr_data_in[0].ex_gpaddr = exception_gpaddr_i;
-      assign instr_data_in[0].ex_tinst = exception_tinst_i;
-      assign instr_data_in[0].ex_gva = exception_gva_i;
-    end else begin : gen_no_hyp_ex_without_C
-      assign instr_data_in[0].ex_gpaddr = '0;
-      assign instr_data_in[0].ex_tinst = '0;
-      assign instr_data_in[0].ex_gva = 1'b0;
-    end
-    /* verilator lint_on WIDTH */
-  end
-
-  // ----------------------
-  // Replay Logic
-  // ----------------------
-  if (CVA6Cfg.RVC == 1'b1) begin : gen_instr_overflow_fifo_with_C
-    assign instr_overflow_fifo = instr_queue_full & fifo_pos;
-  end else begin : gen_instr_overflow_fifo_without_C
-    assign instr_overflow_fifo = instr_queue_full & valid_i;
-  end
-  assign instr_overflow = |instr_overflow_fifo;
-
-  // Per-slot address push attempt (before overflow check)
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] push_addr_attempt;
-  always_comb begin
-    push_address = 1'b0;
-    for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
-      push_addr_attempt[i] = push_instr[i] & (instr_data_in[i].cf != ariane_pkg::NoCF);
-      push_address |= push_addr_attempt[i];
-    end
-  end
-  assign address_overflow = |(push_addr_attempt & full_addr);
-  assign replay_o = instr_overflow | address_overflow;
-
-  if (CVA6Cfg.RVC) begin : gen_replay_addr_o_with_c
-    assign replay_addr_o = (address_overflow) ? addr_i[0] : addr_i[shamt];
-  end else begin : gen_replay_addr_o_without_C
-    assign replay_addr_o = addr_i[0];
-  end
-
-  // ----------------------
-  // Downstream interface
-  // ----------------------
-  assign fetch_entry_valid_o[0] = ~(&instr_queue_empty);
-  if (CVA6Cfg.SuperscalarEn) begin : gen_fetch_entry_valid_1
-    assign fetch_entry_valid_o[NID] = ~|(instr_queue_empty & idx_ds[1]) & ~(&fetch_entry_is_cf);
-  end
-
-  assign idx_ds[0] = idx_ds_q;
-  for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
-    if (CVA6Cfg.INSTR_PER_FETCH > 1) begin
-      assign idx_ds[i+1] = {
-        idx_ds[i][CVA6Cfg.INSTR_PER_FETCH-2:0], idx_ds[i][CVA6Cfg.INSTR_PER_FETCH-1]
-      };
-    end else begin
-      assign idx_ds[i+1] = idx_ds[i];
-    end
-  end
-
-  if (CVA6Cfg.RVC) begin : gen_downstream_itf_with_c
-    always_comb begin
-      idx_ds_d  = idx_ds_q;
-      pop_instr = '0;
-      for (int unsigned i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
-        fetch_entry_o[i].instruction = '0;
-        fetch_entry_o[i].address = pc_j[i];
-        fetch_entry_o[i].ex.valid = 1'b0;
-        fetch_entry_o[i].ex.cause = '0;
-        fetch_entry_o[i].ex.tval = '0;
-        fetch_entry_o[i].ex.tval2 = '0;
-        fetch_entry_o[i].ex.gva = 1'b0;
-        fetch_entry_o[i].ex.tinst = '0;
-        fetch_entry_o[i].branch_predict.predict_address = address_out;
-        fetch_entry_o[i].branch_predict.cf = ariane_pkg::NoCF;
-      end
-      for (int unsigned i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
-        if (idx_ds[0][i]) begin
-          if (instr_data_out[i].ex == ariane_pkg::FE_INSTR_ACCESS_FAULT) begin
-            fetch_entry_o[0].ex.cause = riscv::INSTR_ACCESS_FAULT;
-          end else if (CVA6Cfg.RVH && instr_data_out[i].ex == ariane_pkg::FE_INSTR_GUEST_PAGE_FAULT) begin
-            fetch_entry_o[0].ex.cause = riscv::INSTR_GUEST_PAGE_FAULT;
-          end else begin
-            fetch_entry_o[0].ex.cause = riscv::INSTR_PAGE_FAULT;
-          end
-          fetch_entry_o[0].instruction = instr_data_out[i].instr;
-          fetch_entry_o[0].ex.valid = instr_data_out[i].ex != ariane_pkg::FE_NONE;
-          if (CVA6Cfg.TvalEn)
-            fetch_entry_o[0].ex.tval = {
-              {(CVA6Cfg.XLEN - CVA6Cfg.VLEN) {1'b0}}, instr_data_out[i].ex_vaddr
-            };
-          if (CVA6Cfg.RVH) begin
-            fetch_entry_o[0].ex.tval2 = instr_data_out[i].ex_gpaddr;
-            fetch_entry_o[0].ex.tinst = instr_data_out[i].ex_tinst;
-            fetch_entry_o[0].ex.gva   = instr_data_out[i].ex_gva;
-          end
-          fetch_entry_o[0].branch_predict.cf = instr_data_out[i].cf;
-          fetch_entry_o[0].branch_predict.predict_address = addr_data_out[i];
-          pop_instr[i] = fetch_entry_fire[0];
+      // this instruction is compressed or the last instruction was unaligned
+      if (instr_is_compressed[0] || unaligned_q) begin
+        // check if this is instruction is still unaligned e.g.: it is not compressed
+        // if its compressed re-set unaligned flag
+        // for 32 bit we can simply check the next instruction and whether it is compressed or not
+        // if it is compressed the next fetch will contain an aligned instruction
+        // is instruction 1 also compressed
+        // yes? -> no problem, no -> we've got an unaligned instruction
+        if (instr_is_compressed[CVA6Cfg.INSTR_PER_FETCH-1] && CVA6Cfg.RVC) begin
+          unaligned_d = 1'b0;
+          valid_o[CVA6Cfg.INSTR_PER_FETCH-1] = valid_i;
+          instr_o[CVA6Cfg.INSTR_PER_FETCH-1] = {16'b0, data_i[31:16]};
+        end else begin
+          // save the upper bits for next cycle
+          unaligned_d = 1'b1;
+          unaligned_instr_d = data_i[31:16];
+          unaligned_address_d = {address_i[CVA6Cfg.VLEN-1:2], 2'b10};
         end
-        if (CVA6Cfg.SuperscalarEn) begin
-          if (idx_ds[1][i]) begin
-            if (instr_data_out[i].ex == ariane_pkg::FE_INSTR_ACCESS_FAULT) begin
-              fetch_entry_o[NID].ex.cause = riscv::INSTR_ACCESS_FAULT;
+      end  // else -> normal fetch
+
+      // we started to fetch on a unaligned boundary with a whole instruction -> wait until we've
+      // received the next instruction
+      if (valid_i && address_i[1]) begin
+        // the instruction is not compressed so we can't do anything in this cycle
+        if (!instr_is_compressed[0]) begin
+          valid_o = '0;
+          unaligned_d = 1'b1;
+          unaligned_address_d = {address_i[CVA6Cfg.VLEN-1:2], 2'b10};
+          unaligned_instr_d = data_i[15:0];
+          // the instruction isn't compressed but only the lower is ready
+        end else begin
+          valid_o = {{CVA6Cfg.INSTR_PER_FETCH - 1{1'b0}}, 1'b1};
+        end
+      end
+    end
+  end else if (CVA6Cfg.FETCH_WIDTH == 64) begin : realign_bp_64
+    always_comb begin : re_align
+      unaligned_d         = 1'b0;
+      unaligned_address_d = unaligned_address_q;
+      unaligned_instr_d   = unaligned_instr_q;
+
+      valid_o             = '0;
+      instr_o[0]          = '0;
+      addr_o[0]           = '0;
+      instr_o[1]          = '0;
+      addr_o[1]           = '0;
+      instr_o[2]          = '0;
+      addr_o[2]           = '0;
+      instr_o[3]          = {16'b0, data_i[63:48]};
+      addr_o[3]           = {address_i[CVA6Cfg.VLEN-1:3], 3'b110};
+
+      case (address_i[2:1])
+        2'b00: begin
+          valid_o[0]  = valid_i;
+          valid_o[1]  = valid_i;
+
+          unaligned_d = unaligned_q;
+
+          // last instruction was unaligned
+          // TODO how are jumps + unaligned managed?
+          if (unaligned_q) begin
+            // for 64 bit there exist the following options:
+            //     64  48  32  16  0
+            //     | 3 | 2 | 1 | 0 | <- instruction slot
+            // |   I   |   I   |   U   | -> again unaligned
+            // | * | C |   I   |   U   | -> aligned
+            // | * |   I   | C |   U   | -> aligned
+            // |   I   | C | C |   U   | -> again unaligned
+            // | * | C | C | C |   U   | -> aligned
+            // Legend: C = compressed, I = 32 bit instruction, U = unaligned upper half
+
+            instr_o[0] = {data_i[15:0], unaligned_instr_q};
+            addr_o[0]  = unaligned_address_q;
+
+            instr_o[1] = data_i[47:16];
+            addr_o[1]  = {address_i[CVA6Cfg.VLEN-1:3], 3'b010};
+
+            if (instr_is_compressed[1]) begin
+              instr_o[2] = data_i[63:32];
+              addr_o[2]  = {address_i[CVA6Cfg.VLEN-1:3], 3'b100};
+              valid_o[2] = valid_i;
+
+              if (instr_is_compressed[2]) begin
+                if (instr_is_compressed[3]) begin
+                  unaligned_d = 1'b0;
+                  valid_o[3]  = valid_i;
+                end else begin
+                  unaligned_instr_d   = instr_o[3];
+                  unaligned_address_d = addr_o[3];
+                end
+              end else begin
+                unaligned_d = 1'b0;
+                valid_o[2]  = valid_i;
+              end
             end else begin
-              fetch_entry_o[NID].ex.cause = riscv::INSTR_PAGE_FAULT;
+              instr_o[2] = instr_o[3];
+              addr_o[2]  = addr_o[3];
+              if (instr_is_compressed[3]) begin
+                unaligned_d = 1'b0;
+                valid_o[2]  = valid_i;
+              end else begin
+                unaligned_instr_d   = instr_o[3];
+                unaligned_address_d = addr_o[3];
+              end
             end
-            fetch_entry_o[NID].instruction = instr_data_out[i].instr;
-            fetch_entry_o[NID].ex.valid = instr_data_out[i].ex != ariane_pkg::FE_NONE;
-            fetch_entry_o[NID].ex.tval = {{64 - CVA6Cfg.VLEN{1'b0}}, instr_data_out[i].ex_vaddr};
-            fetch_entry_o[NID].branch_predict.cf = instr_data_out[i].cf;
-            fetch_entry_o[NID].branch_predict.predict_address = addr_data_out[i];
-            pop_instr[i] = fetch_entry_fire[NID];
+          end else begin
+            instr_o[0] = data_i[31:0];
+            addr_o[0]  = address_i;
+
+            if (instr_is_compressed[0]) begin
+              instr_o[1] = data_i[47:16];
+              addr_o[1]  = {address_i[CVA6Cfg.VLEN-1:3], 3'b010};
+
+              //     64  48  32  16  0
+              //     | 3 | 2 | 1 | 0 | <- instruction slot
+              // |   I   |   I   | C | -> again unaligned
+              // | * | C |   I   | C | -> aligned
+              // | * |   I   | C | C | -> aligned
+              // |   I   | C | C | C | -> again unaligned
+              // | * | C | C | C | C | -> aligned
+              if (instr_is_compressed[1]) begin
+                instr_o[2] = data_i[63:32];
+                addr_o[2]  = {address_i[CVA6Cfg.VLEN-1:3], 3'b100};
+                valid_o[2] = valid_i;
+
+                if (instr_is_compressed[2]) begin
+                  if (instr_is_compressed[3]) begin
+                    valid_o[3] = valid_i;
+                  end else begin
+                    unaligned_d         = 1'b1;
+                    unaligned_instr_d   = instr_o[3];
+                    unaligned_address_d = addr_o[3];
+                  end
+                end
+              end else begin
+                instr_o[2] = instr_o[3];
+                addr_o[2]  = addr_o[3];
+
+                if (instr_is_compressed[3]) begin
+                  valid_o[2] = valid_i;
+                end else begin
+                  unaligned_d         = 1'b1;
+                  unaligned_instr_d   = instr_o[3];
+                  unaligned_address_d = addr_o[3];
+                end
+              end
+            end else begin
+              //     64     32       0
+              //     | 3 | 2 | 1 | 0 | <- instruction slot
+              // |   I   | C |   I   |
+              // | * | C | C |   I   |
+              // | * |   I   |   I   |
+              instr_o[1] = data_i[63:32];
+              addr_o[1]  = {address_i[CVA6Cfg.VLEN-1:3], 3'b100};
+
+              instr_o[2] = instr_o[3];
+              addr_o[2]  = addr_o[3];
+
+              if (instr_is_compressed[2]) begin
+                if (instr_is_compressed[3]) begin
+                  valid_o[2] = valid_i;
+                end else begin
+                  unaligned_d         = 1'b1;
+                  unaligned_instr_d   = instr_o[3];
+                  unaligned_address_d = addr_o[3];
+                end
+              end
+            end
           end
         end
-      end
-      if (fetch_entry_fire[0]) begin
-        if (CVA6Cfg.SuperscalarEn) begin
-          idx_ds_d = fetch_entry_fire[NID] ? idx_ds[2] : idx_ds[1];
-        end else begin
-          idx_ds_d = idx_ds[1];
+        // this means the previous instruction was either compressed or unaligned
+        // in any case we don't care
+        // TODO input is actually right-shifted so the code below is wrong
+        2'b01: begin
+          // 64  48  32  16  0
+          // | 3 | 2 | 1 | 0 | <- instruction slot
+          // |   I   |   I   | -> again unaligned
+          // | * | C |   I   | -> aligned
+          // | * |   I   | C | -> aligned
+          // |   I   | C | C | -> again unaligned
+          // | * | C | C | C | -> aligned
+          //   000 110 100 010 <- unaligned address
+
+          instr_o[0] = data_i[31:0];
+          addr_o[0]  = {address_i[CVA6Cfg.VLEN-1:3], 3'b010};
+          valid_o[0] = valid_i;
+
+          instr_o[2] = data_i[63:32];
+          addr_o[2]  = {address_i[CVA6Cfg.VLEN-1:3], 3'b110};
+
+          if (instr_is_compressed[0]) begin
+            instr_o[1] = data_i[47:16];
+            addr_o[1]  = {address_i[CVA6Cfg.VLEN-1:3], 3'b100};
+            valid_o[1] = valid_i;
+
+            if (instr_is_compressed[1]) begin
+              if (instr_is_compressed[2]) begin
+                valid_o[2] = valid_i;
+              end else begin
+                unaligned_d         = 1'b1;
+                unaligned_instr_d   = instr_o[2];
+                unaligned_address_d = addr_o[2];
+              end
+            end
+          end else begin
+            instr_o[1] = instr_o[2];
+            addr_o[1]  = addr_o[2];
+
+            if (instr_is_compressed[2]) begin
+              valid_o[1] = valid_i;
+            end else begin
+              unaligned_d         = 1'b1;
+              unaligned_instr_d   = instr_o[2];
+              unaligned_address_d = addr_o[2];
+            end
+          end
         end
-      end
-    end
-  end else begin : gen_downstream_itf_without_c
-    always_comb begin
-      idx_ds_d = '0;
-      idx_is_d = '0;
-      fetch_entry_o[0].instruction = instr_data_out[0].instr;
-      fetch_entry_o[0].address = pc_q;
-      fetch_entry_o[0].ex.valid = instr_data_out[0].ex != ariane_pkg::FE_NONE;
-      if (instr_data_out[0].ex == ariane_pkg::FE_INSTR_ACCESS_FAULT) begin
-        fetch_entry_o[0].ex.cause = riscv::INSTR_ACCESS_FAULT;
-      end else begin
-        fetch_entry_o[0].ex.cause = riscv::INSTR_PAGE_FAULT;
-      end
-      if (CVA6Cfg.TvalEn)
-        fetch_entry_o[0].ex.tval = {{64 - CVA6Cfg.VLEN{1'b0}}, instr_data_out[0].ex_vaddr};
-      else fetch_entry_o[0].ex.tval = '0;
-      if (CVA6Cfg.RVH) begin
-        fetch_entry_o[0].ex.tval2 = instr_data_out[0].ex_gpaddr;
-        fetch_entry_o[0].ex.tinst = instr_data_out[0].ex_tinst;
-        fetch_entry_o[0].ex.gva   = instr_data_out[0].ex_gva;
-      end else begin
-        fetch_entry_o[0].ex.tval2 = '0;
-        fetch_entry_o[0].ex.tinst = '0;
-        fetch_entry_o[0].ex.gva   = 1'b0;
-      end
-      fetch_entry_o[0].branch_predict.predict_address = addr_data_out[0];
-      fetch_entry_o[0].branch_predict.cf = instr_data_out[0].cf;
-      pop_instr[0] = fetch_entry_valid_o[0] & fetch_entry_ready_i[0];
-    end
-  end
+        2'b10: begin
+          // 64  48  32  16  0
+          // | 3 | 2 | 1 | 0 | <- instruction slot
+          // | * |   I   | C | <- unaligned
+          // |   *   | C | C | <- aligned
+          // |   *   |   I   | <- aligned
+          //      1000 110 100 <- unaligned address
 
-  for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
-    assign fetch_entry_is_cf[i] = fetch_entry_o[i].branch_predict.cf != ariane_pkg::NoCF;
-    assign fetch_entry_fire[i]  = fetch_entry_valid_o[i] & fetch_entry_ready_i[i];
-  end
+          instr_o[0] = data_i[31:0];
+          addr_o[0]  = {address_i[CVA6Cfg.VLEN-1:3], 3'b100};
+          valid_o[0] = valid_i;
 
-  // Per-slot address pop: pop when the output slot has a CF and fires
-  always_comb begin
-    for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
-      pop_addr[i] = 1'b0;
-      if (idx_ds[0][i] && instr_data_out[i].cf != ariane_pkg::NoCF && fetch_entry_fire[0])
-        pop_addr[i] = 1'b1;
-      if (CVA6Cfg.SuperscalarEn && idx_ds[1][i] && instr_data_out[i].cf != ariane_pkg::NoCF && fetch_entry_fire[NID])
-        pop_addr[i] = 1'b1;
-    end
-  end
+          instr_o[1] = data_i[47:16];
+          addr_o[1]  = {address_i[CVA6Cfg.VLEN-1:3], 3'b110};
 
-  // ----------------------
-  // Calculate (Next) PC
-  // ----------------------
-  assign pc_j[0] = pc_q;
-  for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
-    assign pc_j[i+1] = fetch_entry_is_cf[i] ? address_out : (
-      pc_j[i] + ((fetch_entry_o[i].instruction[1:0] != 2'b11) ? 'd2 : 'd4)
-    );
-  end
-
-  always_comb begin
-    pc_d = pc_q;
-    reset_address_d = flush_i ? 1'b1 : reset_address_q;
-    if (fetch_entry_fire[0]) begin
-      pc_d = pc_j[1];
-      if (CVA6Cfg.SuperscalarEn) begin
-        if (fetch_entry_fire[NID]) pc_d = pc_j[2];
-      end
-    end
-    if (valid_i[0] && reset_address_q) begin
-      pc_d = addr_i[0];
-      reset_address_d = 1'b0;
-    end
-  end
-
-  // ----------------------
-  // Instruction FIFOs (unchanged)
-  // ----------------------
-  for (genvar i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin : gen_instr_fifo
-    assign push_instr_fifo[i] = push_instr[i] & ~address_overflow;
-    cva6_fifo_v3 #(
-        .FPGA_ALTERA(CVA6Cfg.FpgaAlteraEn),
-        .DEPTH(ariane_pkg::FETCH_FIFO_DEPTH),
-        .dtype(instr_data_t),
-        .FPGA_EN(CVA6Cfg.FpgaEn)
-    ) i_fifo_instr_data (
-        .clk_i, .rst_ni, .flush_i,
-        .testmode_i(1'b0),
-        .full_o (instr_queue_full[i]),
-        .empty_o(instr_queue_empty[i]),
-        .usage_o(),
-        .data_i (instr_data_in[i]),
-        .push_i (push_instr_fifo[i]),
-        .data_o (instr_data_out[i]),
-        .pop_i  (pop_instr[i])
-    );
-  end
-
-  // ----------------------
-  // Per-slot Address FIFOs (4 FIFOs, one per instruction slot)
-  // ----------------------
-  for (genvar i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin : gen_addr_fifo
-    // Push when this slot's instruction is a CF and was successfully pushed
-    assign push_addr[i] = push_instr_fifo[i] & (instr_data_in[i].cf != ariane_pkg::NoCF);
-
-    cva6_fifo_v3 #(
-        .FPGA_ALTERA(CVA6Cfg.FpgaAlteraEn),
-        .DEPTH      (ariane_pkg::FETCH_ADDR_FIFO_DEPTH),
-        .DATA_WIDTH (CVA6Cfg.VLEN),
-        .FPGA_EN    (CVA6Cfg.FpgaEn)
-    ) i_fifo_address (
-        .clk_i, .rst_ni, .flush_i,
-        .testmode_i(1'b0),
-        .full_o (full_addr[i]),
-        .empty_o(),
-        .usage_o(),
-        /* verilator lint_off WIDTH */
-        .data_i (CVA6Cfg.RVC ? pred_addr_dup[CVA6Cfg.INSTR_PER_FETCH+i-idx_is_q] : predict_address_i[0]),
-        /* verilator lint_on WIDTH */
-        .push_i (push_addr[i]),
-        .data_o (addr_data_out[i]),
-        .pop_i  (pop_addr[i])
-    );
-  end
-
-  unread i_unread_branch_mask (.d_i(|branch_mask_extended));
-  unread i_unread_fifo_pos (.d_i(|fifo_pos_extended));
-
-  if (CVA6Cfg.RVC) begin : gen_pc_q_with_c
-    always_ff @(posedge clk_i or negedge rst_ni) begin
-      if (!rst_ni) begin
-        idx_ds_q        <= 'b1;
-        idx_is_q        <= '0;
-        pc_q            <= '0;
-        reset_address_q <= 1'b1;
-      end else begin
-        pc_q            <= pc_d;
-        reset_address_q <= reset_address_d;
-        if (flush_i) begin
-          idx_ds_q        <= 'b1;
-          idx_is_q        <= '0;
-          reset_address_q <= 1'b1;
-        end else begin
-          idx_ds_q <= idx_ds_d;
-          idx_is_q <= idx_is_d;
+          if (instr_is_compressed[0]) begin
+            if (instr_is_compressed[1]) begin
+              valid_o[1] = valid_i;
+            end else begin
+              unaligned_d         = 1'b1;
+              unaligned_instr_d   = instr_o[1];
+              unaligned_address_d = addr_o[1];
+            end
+          end
         end
-      end
-    end
-  end else begin : gen_pc_q_without_C
-    assign idx_ds_q = '0;
-    assign idx_is_q = '0;
-    always_ff @(posedge clk_i or negedge rst_ni) begin
-      if (!rst_ni) begin
-        pc_q            <= '0;
-        reset_address_q <= 1'b1;
-      end else begin
-        pc_q            <= pc_d;
-        reset_address_q <= reset_address_d;
-        if (flush_i) reset_address_q <= 1'b1;
-      end
+        // we started to fetch on a unaligned boundary with a whole instruction -> wait until we've
+        // received the next instruction
+        2'b11: begin
+          //     64  48  32  16  0
+          // | 3 | 2 | 1 | 0 | <- instruction slot
+          // |   *   |   I   | <- unaligned
+          // |     *     | C | <- aligned
+          //          1000 110 <- unaligned address
+
+          instr_o[0] = data_i[31:0];
+          addr_o[0]  = {address_i[CVA6Cfg.VLEN-1:3], 3'b110};
+
+          if (instr_is_compressed[0]) begin
+            valid_o[0] = valid_i;
+          end else begin
+            unaligned_d         = 1'b1;
+            unaligned_instr_d   = instr_o[0];
+            unaligned_address_d = addr_o[0];
+          end
+        end
+      endcase
     end
   end
 
-  // pragma translate_off
-  output_select_onehot :
-  assert property (@(posedge clk_i) $onehot0(idx_ds_q))
-  else begin
-    $error("Output select should be one-hot encoded");
-    $stop();
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (~rst_ni) begin
+      unaligned_q         <= 1'b0;
+      unaligned_address_q <= '0;
+      unaligned_instr_q   <= '0;
+    end else begin
+      if (valid_i) begin
+        unaligned_address_q <= unaligned_address_d;
+        unaligned_instr_q   <= unaligned_instr_d;
+      end
+
+      if (flush_i) begin
+        unaligned_q <= 1'b0;
+      end else if (valid_i) begin
+        unaligned_q <= unaligned_d;
+      end
+    end
   end
-  // pragma translate_on
 endmodule

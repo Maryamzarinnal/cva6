@@ -167,6 +167,8 @@ module trace_builder #(
       case (state_q)
 
         IDLE: begin
+          // Unaligned windows are currently unsafe for TC tags/data because the 64-bit
+          // instr_realign path still has known-bad address/instruction reconstruction.
           if (|instr_i.consumed && !instr_i.serving_unaligned) begin
             for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
               if (instr_i.valid[i] && instr_i.is_branch[i] && instr_i.taken[i] && !found_taken) begin
