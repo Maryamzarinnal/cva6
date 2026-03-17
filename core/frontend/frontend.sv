@@ -126,6 +126,7 @@ module frontend
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]                   replay_valid_iq;
   cf_t  [CVA6Cfg.INSTR_PER_FETCH-1:0]                   replay_cf_type_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] replay_predict_addr_iq;
+  logic [CVA6Cfg.INSTR_PER_FETCH-1:0][TRACE_LEN_WIDTH-1:0] replay_orig_idx_iq;
 
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0]             instr_to_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] addr_to_iq;
@@ -352,44 +353,55 @@ module frontend
 
   // -- Present trace instructions to the instruction queue --
   always_comb begin
+    int out_idx;
     replay_instr_iq        = '0;
     replay_addr_iq         = '0;
     replay_valid_iq        = '0;
     replay_predict_addr_iq = '0;
-    for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++) begin
-      if (s < int'(tc_feeding_len_q) && is_trace_cf[s] && is_trace_taken[s]) begin
-        if (s + 1 < int'(tc_feeding_len_q))
-          replay_predict_addr_iq[s] = tc_feeding_pcs_q[s + 1];
-        else
-          replay_predict_addr_iq[s] = tc_feeding_next_pc_q;
-      end else
-        replay_predict_addr_iq[s] = '0;
-    end
+    replay_orig_idx_iq     = '0;
     for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++)
       replay_cf_type_iq[s] = ariane_pkg::NoCF;
 
-    for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++) begin
+    // Pack remaining trace instructions densely from slot 0. Sparse replay slots
+    // let instr_queue reconstruct PCs from the wrong base, which can pair a valid
+    // instruction with the wrong address after some trace slots have already been
+    // consumed.
+    out_idx = 0;
+    for (int s = 0; s < TRACE_LEN && out_idx < CVA6Cfg.INSTR_PER_FETCH; s++) begin
       if (s < int'(tc_feeding_len_q) && !tc_feeding_consumed_q[s]) begin
-        replay_valid_iq[s] = 1'b1;
-        replay_instr_iq[s] = tc_feeding_instr_q[s];
-        replay_addr_iq[s]  = tc_feeding_pcs_q[s];
-        if (is_trace_cf[s] && is_trace_taken[s])
-          replay_cf_type_iq[s] = decode_trace_cf(tc_feeding_instr_q[s]);
+        replay_orig_idx_iq[out_idx] = TRACE_LEN_WIDTH'(s);
+        replay_valid_iq[out_idx]    = 1'b1;
+        replay_instr_iq[out_idx]    = tc_feeding_instr_q[s];
+        replay_addr_iq[out_idx]     = tc_feeding_pcs_q[s];
+        if (is_trace_cf[s] && is_trace_taken[s]) begin
+          replay_cf_type_iq[out_idx] = decode_trace_cf(tc_feeding_instr_q[s]);
+          if (s + 1 < int'(tc_feeding_len_q))
+            replay_predict_addr_iq[out_idx] = tc_feeding_pcs_q[s + 1];
+          else
+            replay_predict_addr_iq[out_idx] = tc_feeding_next_pc_q;
+        end
+        out_idx++;
       end
     end
   end
 
   // -- Consumed mask + feeding done --
   always_comb begin
+    int out_idx;
     tc_feeding_consumed_d = tc_feeding_consumed_q;
     tc_feeding_done       = 1'b0;
 
     if (flush_i || is_mispredict || set_pc_commit_i || ex_valid_i || eret_i) begin
       tc_feeding_consumed_d = '0;
     end else if (tc_feeding_q && tc_feeding_len_q != 0) begin
-      for (int j = 0; j < TRACE_LEN; j++)
-        if (j < int'(tc_feeding_len_q) && instr_queue_consumed[j])
-          tc_feeding_consumed_d[j] = 1'b1;
+      out_idx = 0;
+      for (int j = 0; j < TRACE_LEN && out_idx < CVA6Cfg.INSTR_PER_FETCH; j++) begin
+        if (j < int'(tc_feeding_len_q) && !tc_feeding_consumed_q[j]) begin
+          if (instr_queue_consumed[out_idx])
+            tc_feeding_consumed_d[j] = 1'b1;
+          out_idx++;
+        end
+      end
       tc_feeding_done = 1'b1;
       for (int j = 0; j < TRACE_LEN; j++)
         if (j < int'(tc_feeding_len_q) && !tc_feeding_consumed_d[j])
