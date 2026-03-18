@@ -57,6 +57,7 @@ module instr_queue
     logic [CVA6Cfg.GPLEN-1:0]        ex_gpaddr;
     logic [31:0]                     ex_tinst;
     logic                            ex_gva;
+    logic                            replay_addr;
   } instr_data_t;
 
   logic [CVA6Cfg.LOG2_INSTR_PER_FETCH-1:0] branch_index;
@@ -104,18 +105,7 @@ module instr_queue
   // Duplicate & rotate predict addresses (same rotation as instructions)
   logic [CVA6Cfg.INSTR_PER_FETCH*2-1:0][CVA6Cfg.VLEN-1:0] pred_addr_dup;
 
-  // In normal execution, preserve the original CVA6 behavior with a single
-  // branch-target FIFO. Only TC replay needs the per-slot FIFOs because it can
-  // inject multiple control-flow instructions in one window.
-  always_comb begin
-    address_out = '0;
-    if (!tc_feeding_i) begin
-      address_out = addr_data_out_single;
-    end else begin
-      for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++)
-        if (idx_ds[0][i]) address_out = addr_data_out[i];
-    end
-  end
+  assign address_out = addr_data_out_single;
 
   assign full_address = tc_feeding_i ? |full_addr : full_address_single;
   assign ready_o = ~(|instr_queue_full) & ~(tc_feeding_i ? 1'b0 : full_address_single);
@@ -173,6 +163,7 @@ module instr_queue
       assign instr_data_in[i].cf = cf[CVA6Cfg.INSTR_PER_FETCH+i-idx_is_q];
       assign instr_data_in[i].ex = exception_i;
       assign instr_data_in[i].ex_vaddr = exception_addr_i;
+      assign instr_data_in[i].replay_addr = tc_feeding_i;
       if (CVA6Cfg.RVH) begin : gen_hyp_ex_with_C
         assign instr_data_in[i].ex_gpaddr = exception_gpaddr_i;
         assign instr_data_in[i].ex_tinst = exception_tinst_i;
@@ -204,6 +195,7 @@ module instr_queue
     assign instr_data_in[0].cf = cf_type_i[0];
     assign instr_data_in[0].ex = exception_i;
     assign instr_data_in[0].ex_vaddr = exception_addr_i;
+    assign instr_data_in[0].replay_addr = tc_feeding_i;
     if (CVA6Cfg.RVH) begin : gen_hyp_ex_without_C
       assign instr_data_in[0].ex_gpaddr = exception_gpaddr_i;
       assign instr_data_in[0].ex_tinst = exception_tinst_i;
@@ -301,7 +293,7 @@ module instr_queue
             fetch_entry_o[0].ex.gva   = instr_data_out[i].ex_gva;
           end
           fetch_entry_o[0].branch_predict.cf = instr_data_out[i].cf;
-          fetch_entry_o[0].branch_predict.predict_address = tc_feeding_i ? addr_data_out[i] : address_out;
+          fetch_entry_o[0].branch_predict.predict_address = instr_data_out[i].replay_addr ? addr_data_out[i] : address_out;
           pop_instr[i] = fetch_entry_fire[0];
         end
         if (CVA6Cfg.SuperscalarEn) begin
@@ -315,7 +307,7 @@ module instr_queue
             fetch_entry_o[NID].ex.valid = instr_data_out[i].ex != ariane_pkg::FE_NONE;
             fetch_entry_o[NID].ex.tval = {{64 - CVA6Cfg.VLEN{1'b0}}, instr_data_out[i].ex_vaddr};
             fetch_entry_o[NID].branch_predict.cf = instr_data_out[i].cf;
-            fetch_entry_o[NID].branch_predict.predict_address = tc_feeding_i ? addr_data_out[i] : address_out;
+            fetch_entry_o[NID].branch_predict.predict_address = instr_data_out[i].replay_addr ? addr_data_out[i] : address_out;
             pop_instr[i] = fetch_entry_fire[NID];
           end
         end
@@ -352,7 +344,7 @@ module instr_queue
         fetch_entry_o[0].ex.tinst = '0;
         fetch_entry_o[0].ex.gva   = 1'b0;
       end
-      fetch_entry_o[0].branch_predict.predict_address = tc_feeding_i ? addr_data_out[0] : address_out;
+      fetch_entry_o[0].branch_predict.predict_address = instr_data_out[0].replay_addr ? addr_data_out[0] : address_out;
       fetch_entry_o[0].branch_predict.cf = instr_data_out[0].cf;
       pop_instr[0] = fetch_entry_valid_o[0] & fetch_entry_ready_i[0];
     end
@@ -367,13 +359,21 @@ module instr_queue
   always_comb begin
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
       pop_addr[i] = 1'b0;
-      if (tc_feeding_i && idx_ds[0][i] && instr_data_out[i].cf != ariane_pkg::NoCF && fetch_entry_fire[0])
+      if (idx_ds[0][i] && instr_data_out[i].replay_addr && instr_data_out[i].cf != ariane_pkg::NoCF && fetch_entry_fire[0])
         pop_addr[i] = 1'b1;
-      if (tc_feeding_i && CVA6Cfg.SuperscalarEn && idx_ds[1][i] && instr_data_out[i].cf != ariane_pkg::NoCF && fetch_entry_fire[NID])
+      if (CVA6Cfg.SuperscalarEn && idx_ds[1][i] && instr_data_out[i].replay_addr && instr_data_out[i].cf != ariane_pkg::NoCF && fetch_entry_fire[NID])
         pop_addr[i] = 1'b1;
     end
   end
-  assign pop_address_single = !tc_feeding_i && |(fetch_entry_is_cf & fetch_entry_fire);
+  always_comb begin
+    pop_address_single = 1'b0;
+    for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
+      if (idx_ds[0][i] && !instr_data_out[i].replay_addr && instr_data_out[i].cf != ariane_pkg::NoCF && fetch_entry_fire[0])
+        pop_address_single = 1'b1;
+      if (CVA6Cfg.SuperscalarEn && idx_ds[1][i] && !instr_data_out[i].replay_addr && instr_data_out[i].cf != ariane_pkg::NoCF && fetch_entry_fire[NID])
+        pop_address_single = 1'b1;
+    end
+  end
 
   // ----------------------
   // Calculate (Next) PC
