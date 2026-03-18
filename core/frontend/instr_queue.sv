@@ -380,11 +380,7 @@ module instr_queue
   // ----------------------
   assign pc_j[0] = pc_q;
   for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
-    // Advance with the predict address of the control-flow instruction that
-    // actually issued on this port. Using the shared address_out here can pick
-    // the wrong slot's target once the queue rotates or when the second issued
-    // instruction is a control-flow op.
-    assign pc_j[i+1] = fetch_entry_is_cf[i] ? fetch_entry_o[i].branch_predict.predict_address : (
+    assign pc_j[i+1] = fetch_entry_is_cf[i] ? address_out : (
       pc_j[i] + ((fetch_entry_o[i].instruction[1:0] != 2'b11) ? 'd2 : 'd4)
     );
   end
