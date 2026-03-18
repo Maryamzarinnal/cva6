@@ -70,6 +70,9 @@ module instr_queue
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] addr_data_out;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] push_addr, pop_addr;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] full_addr;
+  logic [CVA6Cfg.VLEN-1:0]            addr_data_out_single;
+  logic                               pop_address_single;
+  logic                               full_address_single;
   logic [CVA6Cfg.VLEN-1:0]            address_out;
   logic                               push_address;
   logic                               full_address;
@@ -101,18 +104,21 @@ module instr_queue
   // Duplicate & rotate predict addresses (same rotation as instructions)
   logic [CVA6Cfg.INSTR_PER_FETCH*2-1:0][CVA6Cfg.VLEN-1:0] pred_addr_dup;
 
-  // address_out: select from the FIFO matching the current output slot
+  // In normal execution, preserve the original CVA6 behavior with a single
+  // branch-target FIFO. Only TC replay needs the per-slot FIFOs because it can
+  // inject multiple control-flow instructions in one window.
   always_comb begin
     address_out = '0;
-    for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++)
-      if (idx_ds[0][i]) address_out = addr_data_out[i];
+    if (!tc_feeding_i) begin
+      address_out = addr_data_out_single;
+    end else begin
+      for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++)
+        if (idx_ds[0][i]) address_out = addr_data_out[i];
+    end
   end
 
-  // full_address: no longer used for ready_o gating.
-  // With per-slot FIFOs, |full_addr is too conservative (one full FIFO blocks everything).
-  // Instead, address_overflow triggers replay ONLY when we actually try to push to a full FIFO.
-  assign full_address = |full_addr;
-  assign ready_o = ~(|instr_queue_full);  // address overflow handled by replay path
+  assign full_address = tc_feeding_i ? |full_addr : full_address_single;
+  assign ready_o = ~(|instr_queue_full) & ~(tc_feeding_i ? 1'b0 : full_address_single);
 
   if (CVA6Cfg.RVC) begin : gen_multiple_instr_per_fetch_with_C
 
@@ -229,7 +235,8 @@ module instr_queue
       push_address |= push_addr_attempt[i];
     end
   end
-  assign address_overflow = |(push_addr_attempt & full_addr);
+  assign address_overflow = tc_feeding_i ? |(push_addr_attempt & full_addr)
+                                         : (push_address & full_address_single);
   assign replay_o = instr_overflow | address_overflow;
 
   if (CVA6Cfg.RVC) begin : gen_replay_addr_o_with_c
@@ -294,7 +301,7 @@ module instr_queue
             fetch_entry_o[0].ex.gva   = instr_data_out[i].ex_gva;
           end
           fetch_entry_o[0].branch_predict.cf = instr_data_out[i].cf;
-          fetch_entry_o[0].branch_predict.predict_address = addr_data_out[i];
+          fetch_entry_o[0].branch_predict.predict_address = tc_feeding_i ? addr_data_out[i] : address_out;
           pop_instr[i] = fetch_entry_fire[0];
         end
         if (CVA6Cfg.SuperscalarEn) begin
@@ -308,7 +315,7 @@ module instr_queue
             fetch_entry_o[NID].ex.valid = instr_data_out[i].ex != ariane_pkg::FE_NONE;
             fetch_entry_o[NID].ex.tval = {{64 - CVA6Cfg.VLEN{1'b0}}, instr_data_out[i].ex_vaddr};
             fetch_entry_o[NID].branch_predict.cf = instr_data_out[i].cf;
-            fetch_entry_o[NID].branch_predict.predict_address = addr_data_out[i];
+            fetch_entry_o[NID].branch_predict.predict_address = tc_feeding_i ? addr_data_out[i] : address_out;
             pop_instr[i] = fetch_entry_fire[NID];
           end
         end
@@ -345,7 +352,7 @@ module instr_queue
         fetch_entry_o[0].ex.tinst = '0;
         fetch_entry_o[0].ex.gva   = 1'b0;
       end
-      fetch_entry_o[0].branch_predict.predict_address = addr_data_out[0];
+      fetch_entry_o[0].branch_predict.predict_address = tc_feeding_i ? addr_data_out[0] : address_out;
       fetch_entry_o[0].branch_predict.cf = instr_data_out[0].cf;
       pop_instr[0] = fetch_entry_valid_o[0] & fetch_entry_ready_i[0];
     end
@@ -360,12 +367,13 @@ module instr_queue
   always_comb begin
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
       pop_addr[i] = 1'b0;
-      if (idx_ds[0][i] && instr_data_out[i].cf != ariane_pkg::NoCF && fetch_entry_fire[0])
+      if (tc_feeding_i && idx_ds[0][i] && instr_data_out[i].cf != ariane_pkg::NoCF && fetch_entry_fire[0])
         pop_addr[i] = 1'b1;
-      if (CVA6Cfg.SuperscalarEn && idx_ds[1][i] && instr_data_out[i].cf != ariane_pkg::NoCF && fetch_entry_fire[NID])
+      if (tc_feeding_i && CVA6Cfg.SuperscalarEn && idx_ds[1][i] && instr_data_out[i].cf != ariane_pkg::NoCF && fetch_entry_fire[NID])
         pop_addr[i] = 1'b1;
     end
   end
+  assign pop_address_single = !tc_feeding_i && |(fetch_entry_is_cf & fetch_entry_fire);
 
   // ----------------------
   // Calculate (Next) PC
@@ -419,12 +427,31 @@ module instr_queue
     );
   end
 
+  cva6_fifo_v3 #(
+      .FPGA_ALTERA(CVA6Cfg.FpgaAlteraEn),
+      .DEPTH      (ariane_pkg::FETCH_ADDR_FIFO_DEPTH),
+      .DATA_WIDTH (CVA6Cfg.VLEN),
+      .FPGA_EN    (CVA6Cfg.FpgaEn)
+  ) i_fifo_address_single (
+      .clk_i     (clk_i),
+      .rst_ni    (rst_ni),
+      .flush_i   (flush_i),
+      .testmode_i(1'b0),
+      .full_o    (full_address_single),
+      .empty_o   (),
+      .usage_o   (),
+      .data_i    (predict_address_i[0]),
+      .push_i    (push_address & ~full_address_single & ~tc_feeding_i),
+      .data_o    (addr_data_out_single),
+      .pop_i     (pop_address_single)
+  );
+
   // ----------------------
   // Per-slot Address FIFOs (4 FIFOs, one per instruction slot)
   // ----------------------
   for (genvar i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin : gen_addr_fifo
     // Push when this slot's instruction is a CF and was successfully pushed
-    assign push_addr[i] = push_instr_fifo[i] & (instr_data_in[i].cf != ariane_pkg::NoCF);
+    assign push_addr[i] = tc_feeding_i & push_instr_fifo[i] & (instr_data_in[i].cf != ariane_pkg::NoCF);
 
     cva6_fifo_v3 #(
         .FPGA_ALTERA(CVA6Cfg.FpgaAlteraEn),
