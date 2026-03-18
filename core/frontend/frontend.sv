@@ -121,12 +121,13 @@ module frontend
   logic [TRACE_LEN-1:0]                   is_trace_cf;
   logic [TRACE_LEN-1:0]                   is_trace_taken;
 
+  // TC feeding replay signals
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0]             replay_instr_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] replay_addr_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]                   replay_valid_iq;
   cf_t  [CVA6Cfg.INSTR_PER_FETCH-1:0]                   replay_cf_type_iq;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] replay_predict_addr_iq;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0][TRACE_LEN_WIDTH-1:0] replay_orig_idx_iq;
+  // The single address FIFO uses predict_addr_to_iq[0]
+  logic [CVA6Cfg.VLEN-1:0]                              replay_predict_addr_slot0;
 
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0]             instr_to_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] addr_to_iq;
@@ -217,8 +218,8 @@ module frontend
     taken_rvc_cf    = '0;
     predict_address = '0;
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) cf_type[i] = ariane_pkg::NoCF;
-    ras_push = 1'b0;
-    ras_pop  = 1'b0;
+    ras_push   = 1'b0;
+    ras_pop    = 1'b0;
     ras_update = '0;
 
     for (int i = CVA6Cfg.INSTR_PER_FETCH - 1; i >= 0; i--) begin
@@ -229,7 +230,7 @@ module frontend
           ras_push = 1'b0;
           if (CVA6Cfg.BTBEntries != 0 && btb_prediction_shifted[i].valid) begin
             predict_address = btb_prediction_shifted[i].target_address;
-            cf_type[i] = ariane_pkg::JumpR;
+            cf_type[i]      = ariane_pkg::JumpR;
           end
         end
         4'b0010: begin
@@ -237,7 +238,7 @@ module frontend
           ras_push        = 1'b0;
           taken_rvi_cf[i] = rvi_jump[i];
           taken_rvc_cf[i] = rvc_jump[i];
-          cf_type[i]      = ariane_pkg::Jump;
+          cf_type[i]      = ariane_pkg::Branch;
         end
         4'b0100: begin
           ras_pop         = ras_predict.valid & instr_queue_consumed[i];
@@ -272,7 +273,8 @@ module frontend
   always_comb begin
     bp_valid = 1'b0;
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++)
-      bp_valid |= ((cf_type[i] != NoCF & cf_type[i] != Return) | ((cf_type[i] == Return) & ras_predict.valid));
+      bp_valid |= ((cf_type[i] != NoCF & cf_type[i] != Return) |
+                   ((cf_type[i] == Return) & ras_predict.valid));
   end
 
   assign is_mispredict = resolved_branch_i.valid & resolved_branch_i.is_mispredict;
@@ -286,7 +288,7 @@ module frontend
   btb_update_t btb_update;
 
   logic speculative_q, speculative_d;
-  assign speculative_d = (speculative_q && !resolved_branch_i.valid || |is_branch || |is_return || |is_jalr) && !flush_i;
+  assign speculative_d      = (speculative_q && !resolved_branch_i.valid || |is_branch || |is_return || |is_jalr) && !flush_i;
   assign icache_dreq_o.spec = speculative_d;
 
   assign bht_update.valid          = resolved_branch_i.valid & (resolved_branch_i.cf_type == ariane_pkg::Branch);
@@ -309,8 +311,8 @@ module frontend
       t_cf = (!t_rvc && (t_instr[6:0] == riscv::OpcodeBranch ||
                          t_instr[6:0] == riscv::OpcodeJal    ||
                          t_instr[6:0] == riscv::OpcodeJalr))
-           || (t_rvc && (t_instr[15:13] == riscv::OpcodeC1J     ||
-                         t_instr[15:13] == riscv::OpcodeC1Beqz  ||
+           || (t_rvc && (t_instr[15:13] == riscv::OpcodeC1J    ||
+                         t_instr[15:13] == riscv::OpcodeC1Beqz ||
                          t_instr[15:13] == riscv::OpcodeC1Bnez))
            || (t_rvc && t_instr[1:0] == riscv::OpcodeC2 &&
                t_instr[15:13] == riscv::OpcodeC2JalrMvAdd &&
@@ -326,82 +328,45 @@ module frontend
     end
   end
 
-  function automatic cf_t decode_trace_cf(input logic [31:0] instr_word);
-    logic is_rvc;
-    decode_trace_cf = ariane_pkg::NoCF;
-    is_rvc = (instr_word[1:0] != 2'b11);
-
-    if (!is_rvc) begin
-      unique case (instr_word[6:0])
-        riscv::OpcodeBranch: decode_trace_cf = ariane_pkg::Branch;
-        riscv::OpcodeJal:    decode_trace_cf = ariane_pkg::Jump;
-        riscv::OpcodeJalr:   decode_trace_cf = ariane_pkg::JumpR;
-        default: ;
-      endcase
-    end else begin
-      if (instr_word[15:13] == riscv::OpcodeC1Beqz || instr_word[15:13] == riscv::OpcodeC1Bnez)
-        decode_trace_cf = ariane_pkg::Branch;
-      else if (instr_word[15:13] == riscv::OpcodeC1J)
-        decode_trace_cf = ariane_pkg::Jump;
-      else if (instr_word[1:0] == riscv::OpcodeC2
-               && instr_word[15:13] == riscv::OpcodeC2JalrMvAdd
-               && instr_word[6:2] == 5'b00000
-               && instr_word[11:7] != 5'b00000)
-        decode_trace_cf = ariane_pkg::JumpR;
-    end
-  endfunction
-
   // -- Present trace instructions to the instruction queue --
+  // The reverted instr_queue has a SINGLE address FIFO that reads predict_address_i[0].
+  // During TC feeding: find the first taken CF and put its target in slot 0.
+  // All other slots carry '0 for predict (they are not CF or not taken).
   always_comb begin
-    int out_idx;
-    replay_instr_iq        = '0;
-    replay_addr_iq         = '0;
-    replay_valid_iq        = '0;
-    replay_predict_addr_iq = '0;
-    replay_orig_idx_iq     = '0;
-    for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++)
-      replay_cf_type_iq[s] = ariane_pkg::NoCF;
+    replay_instr_iq           = '0;
+    replay_addr_iq            = '0;
+    replay_valid_iq           = '0;
+    replay_cf_type_iq         = '{default: ariane_pkg::NoCF};
+    replay_predict_addr_slot0 = tc_feeding_next_pc_q;
 
-    // Pack remaining trace instructions densely from slot 0. Sparse replay slots
-    // let instr_queue reconstruct PCs from the wrong base, which can pair a valid
-    // instruction with the wrong address after some trace slots have already been
-    // consumed.
-    out_idx = 0;
-    for (int s = 0; s < TRACE_LEN && out_idx < CVA6Cfg.INSTR_PER_FETCH; s++) begin
+    for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++) begin
       if (s < int'(tc_feeding_len_q) && !tc_feeding_consumed_q[s]) begin
-        replay_orig_idx_iq[out_idx] = TRACE_LEN_WIDTH'(s);
-        replay_valid_iq[out_idx]    = 1'b1;
-        replay_instr_iq[out_idx]    = tc_feeding_instr_q[s];
-        replay_addr_iq[out_idx]     = tc_feeding_pcs_q[s];
+        replay_valid_iq[s] = 1'b1;
+        replay_instr_iq[s] = tc_feeding_instr_q[s];
+        replay_addr_iq[s]  = tc_feeding_pcs_q[s];
         if (is_trace_cf[s] && is_trace_taken[s]) begin
-          replay_cf_type_iq[out_idx] = decode_trace_cf(tc_feeding_instr_q[s]);
+          replay_cf_type_iq[s] = ariane_pkg::Branch;
+          // Put this CF's target in slot 0 ? the single FIFO reads [0]
           if (s + 1 < int'(tc_feeding_len_q))
-            replay_predict_addr_iq[out_idx] = tc_feeding_pcs_q[s + 1];
+            replay_predict_addr_slot0 = tc_feeding_pcs_q[s + 1];
           else
-            replay_predict_addr_iq[out_idx] = tc_feeding_next_pc_q;
+            replay_predict_addr_slot0 = tc_feeding_next_pc_q;
         end
-        out_idx++;
       end
     end
   end
 
   // -- Consumed mask + feeding done --
   always_comb begin
-    int out_idx;
     tc_feeding_consumed_d = tc_feeding_consumed_q;
     tc_feeding_done       = 1'b0;
 
     if (flush_i || is_mispredict || set_pc_commit_i || ex_valid_i || eret_i) begin
       tc_feeding_consumed_d = '0;
     end else if (tc_feeding_q && tc_feeding_len_q != 0) begin
-      out_idx = 0;
-      for (int j = 0; j < TRACE_LEN && out_idx < CVA6Cfg.INSTR_PER_FETCH; j++) begin
-        if (j < int'(tc_feeding_len_q) && !tc_feeding_consumed_q[j]) begin
-          if (instr_queue_consumed[out_idx])
-            tc_feeding_consumed_d[j] = 1'b1;
-          out_idx++;
-        end
-      end
+      for (int j = 0; j < TRACE_LEN; j++)
+        if (j < int'(tc_feeding_len_q) && instr_queue_consumed[j])
+          tc_feeding_consumed_d[j] = 1'b1;
       tc_feeding_done = 1'b1;
       for (int j = 0; j < TRACE_LEN; j++)
         if (j < int'(tc_feeding_len_q) && !tc_feeding_consumed_d[j])
@@ -464,31 +429,35 @@ module frontend
   end
 
   // MUX: trace-cache feeding vs normal I-cache
+  // predict_addr_to_iq[0] is what the single address FIFO uses.
+  // Normal: all slots = predict_address (same as original CVA6).
+  // TC feeding: slot 0 = taken-branch target.
   always_comb begin
     if (tc_feeding_q) begin
-      instr_to_iq            = replay_instr_iq;
-      addr_to_iq             = replay_addr_iq;
-      valid_to_iq            = replay_valid_iq;
-      cf_type_to_iq          = replay_cf_type_iq;
-      for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++)
-        predict_addr_to_iq[s] = replay_predict_addr_iq[s];
-      exception_to_iq        = ariane_pkg::FE_NONE;
-      exception_addr_to_iq   = '0;
-      exception_gpaddr_to_iq = '0;
-      exception_tinst_to_iq  = '0;
-      exception_gva_to_iq    = 1'b0;
+      instr_to_iq             = replay_instr_iq;
+      addr_to_iq              = replay_addr_iq;
+      valid_to_iq             = replay_valid_iq;
+      cf_type_to_iq           = replay_cf_type_iq;
+      predict_addr_to_iq[0]   = replay_predict_addr_slot0;
+      for (int s = 1; s < CVA6Cfg.INSTR_PER_FETCH; s++)
+        predict_addr_to_iq[s] = '0;
+      exception_to_iq         = ariane_pkg::FE_NONE;
+      exception_addr_to_iq    = '0;
+      exception_gpaddr_to_iq  = '0;
+      exception_tinst_to_iq   = '0;
+      exception_gva_to_iq     = 1'b0;
     end else begin
-      instr_to_iq            = instr;
-      addr_to_iq             = addr;
-      valid_to_iq            = instruction_valid;
-      cf_type_to_iq          = cf_type;
+      instr_to_iq             = instr;
+      addr_to_iq              = addr;
+      valid_to_iq             = instruction_valid;
+      cf_type_to_iq           = cf_type;
       for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++)
         predict_addr_to_iq[s] = predict_address;
-      exception_to_iq        = icache_ex_valid_q;
-      exception_addr_to_iq   = icache_vaddr_q;
-      exception_gpaddr_to_iq = icache_gpaddr_q;
-      exception_tinst_to_iq  = icache_tinst_q;
-      exception_gva_to_iq    = icache_gva_q;
+      exception_to_iq         = icache_ex_valid_q;
+      exception_addr_to_iq    = icache_vaddr_q;
+      exception_gpaddr_to_iq  = icache_gpaddr_q;
+      exception_tinst_to_iq   = icache_tinst_q;
+      exception_gva_to_iq     = icache_gva_q;
     end
   end
 
@@ -506,7 +475,8 @@ module frontend
       npc_d         = predict_address;
     end
     if (if_ready)
-      npc_d = {fetch_address[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] + 1, {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}};
+      npc_d = {fetch_address[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] + 1,
+               {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}};
 
     if (tc_feeding_done && tc_feeding_q)
       npc_d = tc_feeding_next_pc_q;
@@ -593,7 +563,8 @@ module frontend
   end
 
   assign vpc_btb = (CVA6Cfg.FpgaEn) ? icache_dreq_i.vaddr : icache_vaddr_q;
-  assign vpc_bht = (CVA6Cfg.FpgaEn && CVA6Cfg.FpgaAlteraEn && icache_dreq_i.valid) ? icache_dreq_i.vaddr : icache_vaddr_q;
+  assign vpc_bht = (CVA6Cfg.FpgaEn && CVA6Cfg.FpgaAlteraEn && icache_dreq_i.valid) ?
+                   icache_dreq_i.vaddr : icache_vaddr_q;
 
   if (CVA6Cfg.BTBEntries == 0) begin
     assign btb_prediction = '0;
@@ -692,6 +663,9 @@ module frontend
       .fetch_entry_ready_i(fetch_entry_ready_i)
   );
 
+  // -----------------------------------------------------------------------
+  // Trace Cache signals
+  // -----------------------------------------------------------------------
   logic [SLOTS_PER_CYCLE-1:0]               tc_instr_valid;
   logic [SLOTS_PER_CYCLE-1:0][31:0]         tc_instr;
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_pc;
@@ -704,10 +678,7 @@ module frontend
   logic                                     tc_runtime_enable_q;
   logic                                     tc_window_eligible;
 
-  // CoreMark platform init spends time in CLINT/timer calibration loops before the
-  // real workload starts. Keep the trace cache fully disabled until we reach the
-  // benchmark body marker already used by the local TC statistics collection.
-  assign tc_enable = tc_runtime_enable_q && !halt_i && !halt_frontend_i && !debug_mode_i;
+  assign tc_enable          = tc_runtime_enable_q && !halt_i && !halt_frontend_i && !debug_mode_i;
   assign tc_window_eligible = tc_enable && !serving_unaligned;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -733,7 +704,8 @@ module frontend
       else if (is_jalr[i] && btb_prediction_shifted[i].valid)
         tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, btb_prediction_shifted[i].target_address};
       else
-        tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, (addr[i] + (instr[i][1:0] != 2'b11 ? 2 : 4))};
+        tc_target[i] = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}},
+                        (addr[i] + (instr[i][1:0] != 2'b11 ? 2 : 4))};
     end
   end
 
@@ -756,23 +728,23 @@ module frontend
     end
   end
 
-  // Lookup only when the consumed window contains a taken branch.
   logic consumed_has_taken_branch;
   always_comb begin
     consumed_has_taken_branch = 1'b0;
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++)
-      if (instr_queue_consumed[i] && tc_taken[i])
+      if (instr_queue_consumed[i] && tc_is_branch[i] && tc_taken[i])
         consumed_has_taken_branch = 1'b1;
   end
 
   logic tc_lookup_cond;
-  assign tc_lookup_cond = (|instr_queue_consumed) && consumed_has_taken_branch
-                          && !tc_feeding_q
-                          && tc_window_eligible;
+  assign tc_lookup_cond = (|instr_queue_consumed)
+                        && consumed_has_taken_branch
+                        && !tc_feeding_q
+                        && tc_window_eligible;
 
   always_comb begin
     integer br_idx;
-    tc_branch_predictions = '0;
+    tc_branch_predictions  = '0;
     tc_lookup_num_branches = '0;
     br_idx = 0;
     for (int i = 0; i < SLOTS_PER_CYCLE && br_idx < CHUNKS_PER_TRACE; i++) begin
@@ -787,60 +759,69 @@ module frontend
         else
           tc_branch_predictions[br_idx] = bht_prediction_shifted[i].valid ?
                                           bht_prediction_shifted[i].taken :
-                                          (rvi_branch[i] ? rvi_imm[i][CVA6Cfg.VLEN-1] : rvc_imm[i][CVA6Cfg.VLEN-1]);
+                                          (rvi_branch[i] ? rvi_imm[i][CVA6Cfg.VLEN-1] :
+                                                           rvc_imm[i][CVA6Cfg.VLEN-1]);
         br_idx = br_idx + 1;
       end
     end
   end
 
+  logic [PC_WIDTH-1:0] tc_lookup_pc_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni)
+      tc_lookup_pc_q <= '0;
+    else if (tc_lookup_cond && !flush_i)
+      tc_lookup_pc_q <= trace_cache_pkg::pc_align_16(tc_pc[0]);
+  end
+
   trace_cache_top #(
-    .MaxTraceInstr          (CVA6Cfg.INSTR_PER_FETCH)
+    .MaxTraceInstr (CVA6Cfg.INSTR_PER_FETCH)
   ) i_trace_cache_top (
-    .clk_i                  (clk_i),
-    .rst_ni                 (rst_ni),
-    .instr_valid_i          (tc_instr_valid),
-    .instr_i                (tc_instr),
-    .pc_i                   (tc_pc),
-    .is_branch_i            (tc_is_branch),
-    .branch_taken_i         (tc_taken),
-    .branch_target_i        (tc_target),
-    .serving_unaligned_i    (serving_unaligned),
-    .flush_i                (flush_i || is_mispredict || !tc_enable || serving_unaligned),
-    .instr_queue_ready_i    (instr_queue_ready && tc_window_eligible),
-    .instr_queue_consumed_i (tc_window_eligible ? instr_queue_consumed : '0),
-    .branch_predictions_i   (tc_window_eligible ? tc_branch_predictions : '0),
-    .lookup_num_branches_i  (tc_window_eligible ? tc_lookup_num_branches : '0),
-    .resolved_branch_valid_i      (tc_enable && resolved_branch_i.valid),
-    .resolved_branch_pc_i         (resolved_branch_i.pc),
-    .resolved_branch_is_taken_i   (resolved_branch_i.is_taken),
-    .resolved_branch_is_mispredict_i (resolved_branch_i.is_mispredict),
-    .lookup_valid_i         (tc_enable && tc_lookup_cond),
-    .lookup_pc_i            (trace_cache_pkg::pc_align_16(tc_pc[0])),
-    .trace_hit_o            (tc_trace_hit),
-    .trace_instructions_o   (tc_trace_instructions),
-    .trace_length_o         (tc_trace_length),
-    .trace_chunks_o         (tc_trace_chunks),
-    .trace_valid_chunks_o   (tc_trace_valid_chunks),
-    .trace_pcs_o            (tc_trace_pcs),
-    .trace_branch_flags_o  (tc_trace_branch_flags),
-    .trace_num_branches_o  (tc_trace_num_branches),
-    .trace_next_pc_o        (tc_trace_next_pc),
-    .tc_miss_total_o        (tc_miss_total),
-    .tc_miss_empty_o        (tc_miss_empty),
-    .tc_miss_pc_o           (tc_miss_pc),
-    .tc_miss_path_o         (tc_miss_path),
-    .lookup_result_valid_o  (tc_lookup_result_valid),
-    .miss_reason_empty_o    (tc_miss_reason_empty),
-    .miss_reason_pc_o       (tc_miss_reason_pc),
-    .miss_reason_path_o     (tc_miss_reason_path)
+    .clk_i                          (clk_i),
+    .rst_ni                         (rst_ni),
+    .instr_valid_i                  (tc_instr_valid),
+    .instr_i                        (tc_instr),
+    .pc_i                           (tc_pc),
+    .is_branch_i                    (tc_is_branch),
+    .branch_taken_i                 (tc_taken),
+    .branch_target_i                (tc_target),
+    .serving_unaligned_i            (serving_unaligned),
+    .flush_i                        (flush_i || is_mispredict || !tc_enable || serving_unaligned),
+    .instr_queue_ready_i            (instr_queue_ready && tc_window_eligible),
+    .instr_queue_consumed_i         (tc_window_eligible ? instr_queue_consumed : '0),
+    .branch_predictions_i           (tc_window_eligible ? tc_branch_predictions : '0),
+    .lookup_num_branches_i          (tc_window_eligible ? tc_lookup_num_branches : '0),
+    .resolved_branch_valid_i        (tc_enable && resolved_branch_i.valid),
+    .resolved_branch_pc_i           (resolved_branch_i.pc),
+    .resolved_branch_is_taken_i     (resolved_branch_i.is_taken),
+    .resolved_branch_is_mispredict_i(resolved_branch_i.is_mispredict),
+    .lookup_valid_i                 (tc_enable && tc_lookup_cond),
+    .lookup_pc_i                    (trace_cache_pkg::pc_align_16(tc_pc[0])),
+    .trace_hit_o                    (tc_trace_hit),
+    .trace_instructions_o           (tc_trace_instructions),
+    .trace_length_o                 (tc_trace_length),
+    .trace_chunks_o                 (tc_trace_chunks),
+    .trace_valid_chunks_o           (tc_trace_valid_chunks),
+    .trace_pcs_o                    (tc_trace_pcs),
+    .trace_branch_flags_o           (tc_trace_branch_flags),
+    .trace_num_branches_o           (tc_trace_num_branches),
+    .trace_next_pc_o                (tc_trace_next_pc),
+    .tc_miss_total_o                (tc_miss_total),
+    .tc_miss_empty_o                (tc_miss_empty),
+    .tc_miss_pc_o                   (tc_miss_pc),
+    .tc_miss_path_o                 (tc_miss_path),
+    .lookup_result_valid_o          (tc_lookup_result_valid),
+    .miss_reason_empty_o            (tc_miss_reason_empty),
+    .miss_reason_pc_o               (tc_miss_reason_pc),
+    .miss_reason_path_o             (tc_miss_reason_path)
   );
 
   always_comb begin
     tc_trace_starts = '0;
-    for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
+    for (int i = 0; i < CHUNKS_PER_TRACE; i++)
       if (tc_trace_valid_chunks[i])
         tc_trace_starts = tc_trace_starts + TRACE_LEN_WIDTH'(1);
-    end
   end
 
   assign tc_trace_starts_ok = (tc_trace_starts <= TRACE_LEN_WIDTH'(TRACE_LEN));
@@ -867,23 +848,7 @@ module frontend
     else
       tc_feeding_q_prev <= tc_feeding_q;
   end
-  `ifdef TRACE_CACHE_DEBUG_VERBOSE
-  always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (rst_ni && tc_feeding_q && !tc_feeding_q_prev)
-      $display("[TC-FEED-META] len=%0d predict_addr=0x%h @ %0t",
-               tc_feeding_len_q, tc_feeding_next_pc_q, $time);
-  end
-  `endif
-  logic         counting_active;
-  logic         stats_printed;
-  int unsigned  taken_hist        [SLOTS_PER_CYCLE+1];
-  int unsigned  not_taken_hist    [SLOTS_PER_CYCLE+1];
-  int unsigned  total_branch_hist [SLOTS_PER_CYCLE+1];
-  int unsigned  window_count;
-  int unsigned  tc_hits;
-  int unsigned  tc_misses;
-  int unsigned  tc_taken_lookups;
-  int unsigned  tc_taken_hits;
+
   int unsigned  tc_global_hits;
   int unsigned  tc_global_misses;
   int unsigned  tc_fe_miss_empty;
@@ -894,6 +859,10 @@ module frontend
   logic [PC_WIDTH-1:0] tc_last_feed_base_pc_q;
   int unsigned  tc_commit_count_q;
   longint unsigned tc_total_cycles_q;
+  logic         counting_active;
+  logic         stats_printed;
+  int unsigned  tc_hits;
+  int unsigned  tc_misses;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) tc_total_cycles_q <= 0;
@@ -902,26 +871,18 @@ module frontend
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      counting_active  <= 1'b0;
-      stats_printed    <= 1'b0;
-      for (int i = 0; i <= SLOTS_PER_CYCLE; i++) begin
-        taken_hist[i]        <= 0;
-        not_taken_hist[i]    <= 0;
-        total_branch_hist[i] <= 0;
-      end
-      window_count     <= 0;
-      tc_hits          <= 0;
-      tc_misses        <= 0;
-      tc_taken_lookups <= 0;
-      tc_taken_hits    <= 0;
-      tc_global_hits   <= 0;
-      tc_global_misses <= 0;
-      tc_fe_miss_empty <= 0;
-      tc_fe_miss_pc    <= 0;
-      tc_fe_miss_path  <= 0;
-      tc_feeds_completed <= 0;
+      counting_active      <= 1'b0;
+      stats_printed        <= 1'b0;
+      tc_hits              <= 0;
+      tc_misses            <= 0;
+      tc_global_hits       <= 0;
+      tc_global_misses     <= 0;
+      tc_fe_miss_empty     <= 0;
+      tc_fe_miss_pc        <= 0;
+      tc_fe_miss_path      <= 0;
+      tc_feeds_completed   <= 0;
       tc_feed_cycles_total <= 0;
-      tc_commit_count_q <= 0;
+      tc_commit_count_q    <= 0;
     end else begin
       if (pc_commit_i == 64'h80001568) begin
         counting_active <= 1'b1;
@@ -930,57 +891,21 @@ module frontend
       if (pc_commit_i == 64'h80001576 && !stats_printed) begin
         counting_active <= 1'b0;
         stats_printed   <= 1'b1;
-        $display("\n[BENCH-STATS] Branch frequency over %0d windows:", window_count);
-        $display("[BENCH-STATS] Taken branches per window:");
-        for (int i = 0; i <= SLOTS_PER_CYCLE; i++) $display("[BENCH-STATS]   %0d taken: %0d", i, taken_hist[i]);
-        $display("[BENCH-STATS] Not-taken branches per window:");
-        for (int i = 0; i <= SLOTS_PER_CYCLE; i++) $display("[BENCH-STATS]   %0d not-taken: %0d", i, not_taken_hist[i]);
-        $display("[BENCH-STATS] Total branches per window:");
-        for (int i = 0; i <= SLOTS_PER_CYCLE; i++) $display("[BENCH-STATS]   %0d total: %0d", i, total_branch_hist[i]);
         $display("\n[BENCH-TC] === Trace Cache (CoreMark only) ===");
         $display("[BENCH-TC] hits=%0d misses=%0d rate=%0d%%",
                  tc_hits, tc_misses,
                  (tc_hits + tc_misses) > 0 ? (tc_hits * 100) / (tc_hits + tc_misses) : 0);
-        $display("[BENCH-TC] taken_lookups=%0d taken_hits=%0d taken_rate=%0d%%",
-                 tc_taken_lookups, tc_taken_hits,
-                 tc_taken_lookups > 0 ? (tc_taken_hits * 100) / tc_taken_lookups : 0);
       end
-
-      if (counting_active && |tc_instr_valid) begin
-        automatic int unsigned taken_count        = 0;
-        automatic int unsigned not_taken_count    = 0;
-        automatic int unsigned total_branch_count = 0;
-        for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
-          if (tc_instr_valid[i] && tc_is_branch[i]) begin
-            total_branch_count++;
-            if (tc_taken[i]) taken_count++;
-            else             not_taken_count++;
-          end
-        end
-        taken_hist[taken_count]               <= taken_hist[taken_count] + 1;
-        not_taken_hist[not_taken_count]       <= not_taken_hist[not_taken_count] + 1;
-        total_branch_hist[total_branch_count] <= total_branch_hist[total_branch_count] + 1;
-        window_count <= window_count + 1;
-      end
-
       if (counting_active && tc_lookup_result_valid) begin
         if (tc_trace_hit) tc_hits   <= tc_hits + 1;
         else              tc_misses <= tc_misses + 1;
-        tc_taken_lookups <= tc_taken_lookups + 1;
-        if (tc_trace_hit) tc_taken_hits <= tc_taken_hits + 1;
       end
-
       if (i_trace_cache_top.i_trace_builder.commit_valid_q) begin
         tc_commit_count_q <= tc_commit_count_q + 1;
-        if ((tc_commit_count_q + 1) % 500 == 0) begin
-          int unsigned tc_taken_rate;
-          tc_taken_rate = (tc_taken_lookups > 0) ? (tc_taken_hits * 100) / tc_taken_lookups : 0;
-          $display("[TC-STATS] hits=%0d misses=%0d (every 500 commits, #%0d)", tc_hits, tc_misses, tc_commit_count_q + 1);
-          $display("[TC-TAKEN] taken_lookups=%0d taken_hits=%0d rate=%0d%%",
-                   tc_taken_lookups, tc_taken_hits, tc_taken_rate);
-        end
+        if ((tc_commit_count_q + 1) % 500 == 0)
+          $display("[TC-STATS] hits=%0d misses=%0d (every 500 commits, #%0d)",
+                   tc_hits, tc_misses, tc_commit_count_q + 1);
       end
-
       if (tc_lookup_result_valid) begin
         if (tc_trace_hit)
           tc_global_hits   <= tc_global_hits + 1;
@@ -1003,110 +928,36 @@ module frontend
       tc_last_feed_base_pc_q    <= '1;
       tc_same_pc_replay_count_q <= 16'd0;
     end else if (tc_feeding_start) begin
-      if (tc_trace_pcs[0] != tc_last_feed_base_pc_q) begin
-        `ifdef TRACE_CACHE_DEBUG_VERBOSE
-        $display("[TC-HOT-CHANGE] 0x%h -> 0x%h (feed #%0d) @ %0t",
-                 tc_last_feed_base_pc_q, tc_trace_pcs[0], tc_feeds_completed + 1, $time);
-        `endif
+      if (tc_trace_pcs[0] != tc_last_feed_base_pc_q)
         tc_same_pc_replay_count_q <= 16'd1;
-      end else begin
+      else
         tc_same_pc_replay_count_q <= tc_same_pc_replay_count_q + 1'b1;
-      end
       tc_last_feed_base_pc_q <= tc_trace_pcs[0];
     end
   end
 
   always_ff @(posedge clk_i) begin
-    `ifdef TRACE_CACHE_DEBUG_VERBOSE
-    if (tc_feeding_start) begin
-      $display("[TC-FEED-START] #%0d base_pc=0x%h len=%0d next_pc=0x%h @ %0t",
-               tc_feeds_completed + 1, tc_trace_pcs[0], tc_trace_length, tc_trace_next_pc, $time);
-    end
-    if (tc_feeding_done) begin
-      $display("[TC-FEED-DONE]  #%0d next_pc=0x%h @ %0t",
-               tc_feeds_completed + 1, tc_feeding_next_pc_q, $time);
-    `endif
-    if (tc_feeding_done && (tc_feeds_completed + 1) % 100 == 0) begin
-      $display("[TC-PERIODIC] feeds=%0d global_hits=%0d global_misses=%0d hit_rate=%0d%% feed_cycles=%0d @ %0t",
+    if (tc_feeding_done && (tc_feeds_completed + 1) % 100 == 0)
+      $display("[TC-PERIODIC] feeds=%0d hits=%0d misses=%0d hit_rate=%0d%% @ %0t",
                tc_feeds_completed + 1, tc_global_hits, tc_global_misses,
-               (tc_global_hits + tc_global_misses) > 0 ? (tc_global_hits * 100) / (tc_global_hits + tc_global_misses) : 0,
-               tc_feed_cycles_total, $time);
-      $display("[TC-MISS-BREAKDOWN] total_misses=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why we miss)",
-               tc_global_misses, tc_fe_miss_empty, tc_fe_miss_pc, tc_fe_miss_path);
-    end
-    if (tc_feeding_done && (tc_feeds_completed + 1) % 5000 == 0) begin
-      automatic int tot, pct, fetch_pct;
-      tot = tc_global_hits + tc_global_misses;
-      pct = (tot > 0) ? (tc_global_hits * 100) / tot : 0;
-      fetch_pct = (tc_total_cycles_q > 0) ? (int'(tc_feed_cycles_total) * 100 / int'(tc_total_cycles_q)) : 0;
-      $display("[TC-SUMMARY] ========== (every 5000 feeds, feeds=%0d) ==========", tc_feeds_completed + 1);
-      $display("[TC-SUMMARY] lookups: %0d (hits=%0d misses=%0d) hit_rate=%0d%%",
-               tot, tc_global_hits, tc_global_misses, pct);
-      $display("[TC-SUMMARY] feeds_completed=%0d feed_cycles=%0d",
-               tc_feeds_completed + 1, tc_feed_cycles_total);
-      $display("[TC-SUMMARY] total_cycles=%0d -> %0d%% of run fetch from trace (fetch improvement)",
-               tc_total_cycles_q, fetch_pct);
-      $display("[TC-SUMMARY] ========================================");
-    end
-  end
-
-  always_ff @(posedge clk_i) begin
-    `ifdef TRACE_CACHE_DEBUG_VERBOSE
-    if (icache_valid_q && tc_active_hit) begin
-      $display("[TC-DEBUG] fetch=0x%h valid=%b is_branch=%b taken=%b pred=%b",
-               icache_vaddr_q, instruction_valid, tc_is_branch, tc_taken, tc_branch_predictions);
-    end
-
-    if (tc_active_hit) begin
-      int starts;
-      starts = 0;
-      for (int k = 0; k < CHUNKS_PER_TRACE; k++)
-        if (tc_trace_valid_chunks[k]) starts++;
-      $display("[TC-ACTIVE-CAND] pc=0x%h len=%0d next=0x%h",
-               tc_trace_pcs[0], tc_trace_length, tc_trace_next_pc);
-      $display("[TC-ACTIVE-CHUNKS] vmask=%b starts=%0d", tc_trace_valid_chunks, starts);
-      $display("[TC-ACTIVE-CHUNKS] c0=%h c1=%h c2=%h c3=%h c4=%h c5=%h c6=%h c7=%h",
-               tc_trace_chunks[0], tc_trace_chunks[1], tc_trace_chunks[2], tc_trace_chunks[3],
-               tc_trace_chunks[4], tc_trace_chunks[5], tc_trace_chunks[6], tc_trace_chunks[7]);
-    end
-
-    if (tc_active_hit && !tc_active_use) begin
-      $display("[TC-ACTIVE-BLOCK] pc=0x%h self=%0b feeding=%0b len=%0d next=0x%h",
-               tc_trace_pcs[0],
-               (tc_trace_next_pc == tc_trace_pcs[0]),
-               tc_feeding_q,
-               tc_trace_length,
-               tc_trace_next_pc);
-    end
-
-    if (tc_active_use)
-      $display("[TC-ACTIVE-USE] pc=0x%h -> next=0x%h", tc_trace_pcs[0], tc_trace_next_pc);
-    if (tc_feeding_done) begin
-      $display("[TC-FEED-FINISH] next_pc=0x%h", tc_feeding_next_pc_q);
-    end
-    `endif
+               (tc_global_hits + tc_global_misses) > 0 ?
+                 (tc_global_hits * 100) / (tc_global_hits + tc_global_misses) : 0,
+               $time);
   end
 
   final begin
-    int tc_total_lookups;
-    int tc_hit_pct;
-    int tc_fetch_from_trace_pct;
+    int tc_total_lookups, tc_hit_pct, tc_fetch_pct;
     tc_total_lookups = tc_global_hits + tc_global_misses;
-    tc_hit_pct = (tc_total_lookups > 0) ? (tc_global_hits * 100) / tc_total_lookups : 0;
-    tc_fetch_from_trace_pct = (tc_total_cycles_q > 0) ? (int'(tc_feed_cycles_total) * 100 / int'(tc_total_cycles_q)) : 0;
+    tc_hit_pct   = (tc_total_lookups > 0) ? (tc_global_hits * 100) / tc_total_lookups : 0;
+    tc_fetch_pct = (tc_total_cycles_q > 0) ?
+                   (int'(tc_feed_cycles_total) * 100 / int'(tc_total_cycles_q)) : 0;
     $display("[TC-FINAL] ========== Trace Cache summary ==========");
-    $display("[TC-FINAL] lookups: %0d (hits=%0d misses=%0d) -> hit_rate=%0d%%",
+    $display("[TC-FINAL] lookups=%0d hits=%0d misses=%0d hit_rate=%0d%%",
              tc_total_lookups, tc_global_hits, tc_global_misses, tc_hit_pct);
-    $display("[TC-FINAL] feeds_completed=%0d  feed_cycles=%0d (cycles fed from trace, no icache fetch)",
-             tc_feeds_completed, tc_feed_cycles_total);
-    $display("[TC-FINAL] miss_breakdown: total=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why lookups missed)",
-             tc_global_misses, tc_fe_miss_empty, tc_fe_miss_pc, tc_fe_miss_path);
-    $display("[TC-FINAL] --- Fetch improvement (did the trace cache help?) ---");
-    $display("[TC-FINAL] total_cycles=%0d  feed_cycles=%0d  -> %0d%% of run fetch was from trace (i-cache not used)",
-             tc_total_cycles_q, tc_feed_cycles_total, tc_fetch_from_trace_pct);
-    $display("[TC-FINAL] So: trace cache served fetch for %0d%% of simulation; rest used normal i-cache.",
-             tc_fetch_from_trace_pct);
-    $display("[TC-FINAL] To measure run-time speedup: run same workload with TC disabled, compare total_cycles.");
+    $display("[TC-FINAL] feeds=%0d feed_cycles=%0d -> %0d%% of run from trace",
+             tc_feeds_completed, tc_feed_cycles_total, tc_fetch_pct);
+    $display("[TC-FINAL] miss_breakdown: empty=%0d pc=%0d path=%0d",
+             tc_fe_miss_empty, tc_fe_miss_pc, tc_fe_miss_path);
     $display("[TC-FINAL] ========================================");
   end
 
