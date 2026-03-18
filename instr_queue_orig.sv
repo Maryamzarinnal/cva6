@@ -384,7 +384,7 @@ module instr_queue
     // actually issued on this port. Using the shared address_out here can pick
     // the wrong slot's target once the queue rotates or when the second issued
     // instruction is a control-flow op.
-    assign pc_j[i+1] = fetch_entry_is_cf[i] ? address_out : (
+    assign pc_j[i+1] = fetch_entry_is_cf[i] ? fetch_entry_o[i].branch_predict.predict_address : (
       pc_j[i] + ((fetch_entry_o[i].instruction[1:0] != 2'b11) ? 'd2 : 'd4)
     );
   end
