@@ -248,9 +248,9 @@ module instr_queue
       end
     end
   end
-  assign push_addr_single = !tc_feeding_i && push_address;
   assign address_overflow = tc_feeding_i ? |(push_addr_attempt & full_addr)
-                                         : (push_addr_single & full_addr_single);
+                                         : (push_address & full_addr_single);
+  assign push_addr_single = !tc_feeding_i && push_address && !full_addr_single;
   assign replay_o = instr_overflow | address_overflow;
 
   if (CVA6Cfg.RVC) begin : gen_replay_addr_o_with_c
