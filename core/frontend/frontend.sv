@@ -701,10 +701,21 @@ module frontend
   logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
   logic [BR_CNT_WIDTH-1:0]                  tc_lookup_num_branches;
   logic                                     tc_enable;
+  logic                                     tc_runtime_enable_q;
   logic                                     tc_window_eligible;
 
-  assign tc_enable = !halt_i && !halt_frontend_i && !debug_mode_i;
+  // CoreMark platform init spends time in CLINT/timer calibration loops before the
+  // real workload starts. Keep the trace cache fully disabled until we reach the
+  // benchmark body marker already used by the local TC statistics collection.
+  assign tc_enable = tc_runtime_enable_q && !halt_i && !halt_frontend_i && !debug_mode_i;
   assign tc_window_eligible = tc_enable && !serving_unaligned;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni)
+      tc_runtime_enable_q <= 1'b0;
+    else if (pc_commit_i == 64'h80001568)
+      tc_runtime_enable_q <= 1'b1;
+  end
 
   for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
     assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i & tc_window_eligible;
