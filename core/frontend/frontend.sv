@@ -390,31 +390,20 @@ module frontend
   // During TC feeding: suppress icache data by presenting valid=0
   // predict_addr_to_iq[0] carries the taken-branch target for the address FIFO
   // -----------------------------------------------------------------------
-  always_comb begin
-    if (tc_feeding_q) begin
-      instr_to_iq             = replay_instr_iq;
-      addr_to_iq              = replay_addr_iq;
-      valid_to_iq             = replay_valid_iq;
-      cf_type_to_iq           = replay_cf_type_iq;
-      predict_addr_to_iq[0]   = replay_predict_addr_slot0;
-      for (int s = 1; s < CVA6Cfg.INSTR_PER_FETCH; s++) predict_addr_to_iq[s] = '0;
-      exception_to_iq         = ariane_pkg::FE_NONE;
-      exception_addr_to_iq    = '0;
-      exception_gpaddr_to_iq  = '0;
-      exception_tinst_to_iq   = '0;
-      exception_gva_to_iq     = 1'b0;
-    end else begin
-      instr_to_iq             = instr;
-      addr_to_iq              = addr;
-      valid_to_iq             = instruction_valid;
-      cf_type_to_iq           = cf_type;
-      for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++) predict_addr_to_iq[s] = predict_address;
-      exception_to_iq         = icache_ex_valid_q;
-      exception_addr_to_iq    = icache_vaddr_q;
-      exception_gpaddr_to_iq  = icache_gpaddr_q;
-      exception_tinst_to_iq   = icache_tinst_q;
-      exception_gva_to_iq     = icache_gva_q;
-    end
+  assign instr_to_iq            = tc_feeding_q ? replay_instr_iq   : instr;
+  assign addr_to_iq             = tc_feeding_q ? replay_addr_iq    : addr;
+  assign valid_to_iq            = tc_feeding_q ? replay_valid_iq   : instruction_valid;
+  assign cf_type_to_iq          = tc_feeding_q ? replay_cf_type_iq : cf_type;
+  assign exception_to_iq        = tc_feeding_q ? ariane_pkg::FE_NONE   : icache_ex_valid_q;
+  assign exception_addr_to_iq   = tc_feeding_q ? '0                    : icache_vaddr_q;
+  assign exception_gpaddr_to_iq = tc_feeding_q ? '0                    : icache_gpaddr_q;
+  assign exception_tinst_to_iq  = tc_feeding_q ? '0                    : icache_tinst_q;
+  assign exception_gva_to_iq    = tc_feeding_q ? 1'b0                  : icache_gva_q;
+
+  // predict_addr_to_iq: slot 0 carries branch target during TC feeding,
+  // or predict_address during normal fetch. Slots 1+ always carry predict_address.
+  for (genvar s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++) begin : gen_predict_addr_mux
+    assign predict_addr_to_iq[s] = (tc_feeding_q && s == 0) ? replay_predict_addr_slot0 : predict_address;
   end
 
   // -----------------------------------------------------------------------
