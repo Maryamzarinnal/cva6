@@ -121,12 +121,10 @@ module frontend
   logic [TRACE_LEN-1:0]                   is_trace_cf;
   logic [TRACE_LEN-1:0]                   is_trace_taken;
 
-  // TC feeding replay signals
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0]             replay_instr_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] replay_addr_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]                   replay_valid_iq;
   cf_t  [CVA6Cfg.INSTR_PER_FETCH-1:0]                   replay_cf_type_iq;
-  // The single address FIFO uses predict_addr_to_iq[0]
   logic [CVA6Cfg.VLEN-1:0]                              replay_predict_addr_slot0;
 
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0]             instr_to_iq;
@@ -238,7 +236,7 @@ module frontend
           ras_push        = 1'b0;
           taken_rvi_cf[i] = rvi_jump[i];
           taken_rvc_cf[i] = rvc_jump[i];
-          cf_type[i]      = ariane_pkg::Branch;
+          cf_type[i]      = ariane_pkg::Jump;
         end
         4'b0100: begin
           ras_pop         = ras_predict.valid & instr_queue_consumed[i];
@@ -329,10 +327,14 @@ module frontend
   end
 
   // -- Present trace instructions to the instruction queue --
-  // The reverted instr_queue has a SINGLE address FIFO that reads predict_address_i[0].
-  // During TC feeding: find the first taken CF and put its target in slot 0.
-  // All other slots carry '0 for predict (they are not CF or not taken).
+  // KEY CONSTRAINT: single address FIFO can only hold ONE address per push.
+  // We mark ONLY the first taken CF as Branch; all subsequent CFs are NoCF.
+  // This matches the original CVA6 branch_mask behavior.
+  // Instructions after the first taken CF will cause a mispredict flush when
+  // the backend reaches them ? they will be re-fetched via normal i-cache.
   always_comb begin
+    logic first_cf_done;
+    first_cf_done             = 1'b0;
     replay_instr_iq           = '0;
     replay_addr_iq            = '0;
     replay_valid_iq           = '0;
@@ -344,13 +346,13 @@ module frontend
         replay_valid_iq[s] = 1'b1;
         replay_instr_iq[s] = tc_feeding_instr_q[s];
         replay_addr_iq[s]  = tc_feeding_pcs_q[s];
-        if (is_trace_cf[s] && is_trace_taken[s]) begin
-          replay_cf_type_iq[s] = ariane_pkg::Branch;
-          // Put this CF's target in slot 0 ? the single FIFO reads [0]
-          if (s + 1 < int'(tc_feeding_len_q))
-            replay_predict_addr_slot0 = tc_feeding_pcs_q[s + 1];
-          else
-            replay_predict_addr_slot0 = tc_feeding_next_pc_q;
+        // Only mark the FIRST taken CF ? subsequent CFs get NoCF
+        if (is_trace_cf[s] && is_trace_taken[s] && !first_cf_done) begin
+          replay_cf_type_iq[s]      = ariane_pkg::Branch;
+          replay_predict_addr_slot0 = (s + 1 < int'(tc_feeding_len_q))
+                                      ? tc_feeding_pcs_q[s+1]
+                                      : tc_feeding_next_pc_q;
+          first_cf_done = 1'b1;
         end
       end
     end
@@ -430,8 +432,6 @@ module frontend
 
   // MUX: trace-cache feeding vs normal I-cache
   // predict_addr_to_iq[0] is what the single address FIFO uses.
-  // Normal: all slots = predict_address (same as original CVA6).
-  // TC feeding: slot 0 = taken-branch target.
   always_comb begin
     if (tc_feeding_q) begin
       instr_to_iq             = replay_instr_iq;
@@ -674,21 +674,11 @@ module frontend
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
   logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
   logic [BR_CNT_WIDTH-1:0]                  tc_lookup_num_branches;
-  logic                                     tc_enable;
-  logic                                     tc_runtime_enable_q;
   logic                                     tc_window_eligible;
 
-  assign tc_enable          = tc_runtime_enable_q && !halt_i && !halt_frontend_i && !debug_mode_i;
-  assign tc_window_eligible = tc_enable && !serving_unaligned;
-
-  always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni)
-      tc_runtime_enable_q <= 1'b0;
-    else if (pc_commit_i == 64'h80001568)
-      tc_runtime_enable_q <= 1'b1;
-    else if (pc_commit_i == 64'h80001576)
-      tc_runtime_enable_q <= 1'b0;
-  end
+  // TC only eligible when not serving unaligned and not in debug/halt
+  assign tc_window_eligible = !serving_unaligned && !halt_i &&
+                              !halt_frontend_i && !debug_mode_i;
 
   for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
     assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i & tc_window_eligible;
@@ -769,7 +759,6 @@ module frontend
   end
 
   logic [PC_WIDTH-1:0] tc_lookup_pc_q;
-
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni)
       tc_lookup_pc_q <= '0;
@@ -789,16 +778,16 @@ module frontend
     .branch_taken_i                 (tc_taken),
     .branch_target_i                (tc_target),
     .serving_unaligned_i            (serving_unaligned),
-    .flush_i                        (flush_i || is_mispredict || !tc_enable || serving_unaligned),
+    .flush_i                        (flush_i || is_mispredict || serving_unaligned),
     .instr_queue_ready_i            (instr_queue_ready && tc_window_eligible),
     .instr_queue_consumed_i         (tc_window_eligible ? instr_queue_consumed : '0),
     .branch_predictions_i           (tc_window_eligible ? tc_branch_predictions : '0),
     .lookup_num_branches_i          (tc_window_eligible ? tc_lookup_num_branches : '0),
-    .resolved_branch_valid_i        (tc_enable && resolved_branch_i.valid),
+    .resolved_branch_valid_i        (resolved_branch_i.valid),
     .resolved_branch_pc_i           (resolved_branch_i.pc),
     .resolved_branch_is_taken_i     (resolved_branch_i.is_taken),
     .resolved_branch_is_mispredict_i(resolved_branch_i.is_mispredict),
-    .lookup_valid_i                 (tc_enable && tc_lookup_cond),
+    .lookup_valid_i                 (tc_lookup_cond),
     .lookup_pc_i                    (trace_cache_pkg::pc_align_16(tc_pc[0])),
     .trace_hit_o                    (tc_trace_hit),
     .trace_instructions_o           (tc_trace_instructions),
@@ -837,12 +826,13 @@ module frontend
   localparam int unsigned TC_SAME_PC_REPLAY_CAP = 256;
   logic [15:0] tc_same_pc_replay_count_q;
 
+  // PC guard: only feed traces for addresses in the application region (>= 0x80001000)
+  // This prevents boot-time loops from being served by the TC
   assign tc_active_use = tc_active_hit
                       && tc_trace_starts_ok
                       && (tc_trace_next_pc != tc_trace_pcs[0])
                       && !tc_feeding_q
                       && (tc_trace_pcs[0] >= PC_WIDTH'(64'h80001000));
-
 
 // pragma translate_off
   logic         tc_feeding_q_prev;
