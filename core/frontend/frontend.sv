@@ -686,6 +686,8 @@ module frontend
       tc_runtime_enable_q <= 1'b0;
     else if (pc_commit_i == 64'h80001568)
       tc_runtime_enable_q <= 1'b1;
+    else if (pc_commit_i == 64'h80001576)
+      tc_runtime_enable_q <= 1'b0;
   end
 
   for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
