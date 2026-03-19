@@ -837,11 +837,11 @@ module frontend
   localparam int unsigned TC_SAME_PC_REPLAY_CAP = 256;
   logic [15:0] tc_same_pc_replay_count_q;
 
-//  assign tc_active_use = tc_active_hit
-//                      && tc_trace_starts_ok
-//                      && (tc_trace_next_pc != tc_trace_pcs[0])
-//                      && !tc_feeding_q;
-  assign tc_active_use = 1'b0;
+  assign tc_active_use = tc_active_hit
+                      && tc_trace_starts_ok
+                      && (tc_trace_next_pc != tc_trace_pcs[0])
+                      && !tc_feeding_q
+                      && (tc_trace_pcs[0] >= PC_WIDTH'(64'h80001000));
 
 
 // pragma translate_off
