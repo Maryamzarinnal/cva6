@@ -11,10 +11,9 @@
 // Author: Florian Zaruba, ETH Zurich
 // Date: 26.10.2018
 //
-// Description: Instruction Queue - original CVA6 with minimal TC support.
-//   TC changes vs original:
-//   1. predict_address_i is per-slot [INSTR_PER_FETCH][VLEN] (was scalar VLEN)
-//   2. tc_feeding_i input: bypasses branch_mask so all trace slots pass through
+// Description: Instruction Queue - original CVA6 with ONE change:
+//   predict_address_i is now per-slot [INSTR_PER_FETCH][VLEN] instead of scalar.
+//   The single address FIFO still uses predict_address_i[0] (slot 0).
 //   Everything else is identical to the original CVA6 instr_queue.
 
 module instr_queue
@@ -36,12 +35,12 @@ module instr_queue
     input logic [CVA6Cfg.GPLEN-1:0] exception_gpaddr_i,
     input logic [31:0] exception_tinst_i,
     input logic exception_gva_i,
-    // Per-slot predict address: during normal fetch all slots carry the same
-    // predict_address; during TC feeding slot 0 carries the relevant target.
+    // CHANGED: per-slot array instead of scalar.
+    // Slot 0 is used for the single address FIFO (same as original scalar).
+    // Normal fetch: all slots carry the same predict_address.
+    // TC feeding: slot 0 carries the taken-branch target.
     input logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] predict_address_i,
     input ariane_pkg::cf_t [CVA6Cfg.INSTR_PER_FETCH-1:0] cf_type_i,
-    // TC feeding: bypass branch_mask so all valid trace slots pass through
-    input logic tc_feeding_i,
     output logic replay_o,
     output logic [CVA6Cfg.VLEN-1:0] replay_addr_o,
     output fetch_entry_t [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_o,
@@ -51,7 +50,6 @@ module instr_queue
 
   localparam NID = CVA6Cfg.SuperscalarEn ? 1 : 0;
 
-  // Original instr_data_t - NO replay_addr field
   typedef struct packed {
     logic [31:0]                     instr;
     ariane_pkg::cf_t                 cf;
@@ -69,24 +67,18 @@ module instr_queue
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] instr_queue_full;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] instr_queue_empty;
   logic                               instr_overflow;
-
-  // Single address FIFO - original design
-  logic [CVA6Cfg.VLEN-1:0] address_out;
-  logic                     pop_address;
-  logic                     push_address;
-  logic                     full_address;
-  logic                     address_overflow;
-
+  logic [CVA6Cfg.VLEN-1:0]            address_out;
+  logic                               pop_address;
+  logic                               push_address;
+  logic                               full_address;
+  logic                               address_overflow;
   logic [CVA6Cfg.LOG2_INSTR_PER_FETCH-1:0] idx_is_d, idx_is_q;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] idx_ds_d, idx_ds_q;
   logic [CVA6Cfg.NrIssuePorts:0][CVA6Cfg.INSTR_PER_FETCH-1:0] idx_ds;
-
   logic [CVA6Cfg.VLEN-1:0] pc_d, pc_q;
   logic [CVA6Cfg.NrIssuePorts:0][CVA6Cfg.VLEN-1:0] pc_j;
   logic reset_address_d, reset_address_q;
-
   logic [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_is_cf, fetch_entry_fire;
-
   logic [CVA6Cfg.INSTR_PER_FETCH*2-2:0] branch_mask_extended;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] branch_mask;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] taken;
@@ -100,7 +92,7 @@ module instr_queue
   ariane_pkg::cf_t [CVA6Cfg.INSTR_PER_FETCH*2-1:0] cf;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] instr_overflow_fifo;
 
-  // Original ready: gated by instruction FIFOs and address FIFO
+  // Original ready_o - unchanged
   assign ready_o = ~(|instr_queue_full) & ~full_address;
 
   if (CVA6Cfg.RVC) begin : gen_multiple_instr_per_fetch_with_C
@@ -121,8 +113,8 @@ module instr_queue
     assign branch_mask_extended = {{{CVA6Cfg.INSTR_PER_FETCH-1}{1'b0}}, {{CVA6Cfg.INSTR_PER_FETCH}{1'b1}}} << branch_index;
     assign branch_mask = branch_mask_extended[CVA6Cfg.INSTR_PER_FETCH * 2 - 2:CVA6Cfg.INSTR_PER_FETCH - 1];
 
-    // TC: bypass branch_mask during trace feeding so all slots pass through
-    assign valid = tc_feeding_i ? valid_i : (valid_i & branch_mask);
+    // Original: no tc_feeding bypass - branch_mask always applied
+    assign valid = valid_i & branch_mask;
 
     assign consumed_extended = {push_instr_fifo, push_instr_fifo} >> idx_is_q;
     assign consumed_o = consumed_extended[CVA6Cfg.INSTR_PER_FETCH-1:0];
@@ -133,7 +125,7 @@ module instr_queue
         .data_i    (push_instr_fifo),
         .popcount_o(popcount)
     );
-    assign shamt = popcount[$bits(shamt)-1:0];
+    assign shamt    = popcount[$bits(shamt)-1:0];
     assign idx_is_d = idx_is_q + shamt;
 
     assign fifo_pos_extended = {valid, valid} << idx_is_q;
@@ -203,9 +195,9 @@ module instr_queue
   end else begin : gen_instr_overflow_fifo_without_C
     assign instr_overflow_fifo = instr_queue_full & valid_i;
   end
-  assign instr_overflow    = |instr_overflow_fifo;
-  assign address_overflow  = full_address & push_address;
-  assign replay_o          = instr_overflow | address_overflow;
+  assign instr_overflow   = |instr_overflow_fifo;
+  assign address_overflow = full_address & push_address;
+  assign replay_o         = instr_overflow | address_overflow;
 
   if (CVA6Cfg.RVC) begin : gen_replay_addr_o_with_c
     assign replay_addr_o = (address_overflow) ? addr_i[0] : addr_i[shamt];
@@ -267,8 +259,7 @@ module instr_queue
             fetch_entry_o[0].ex.tinst = instr_data_out[i].ex_tinst;
             fetch_entry_o[0].ex.gva   = instr_data_out[i].ex_gva;
           end
-          fetch_entry_o[0].branch_predict.cf = instr_data_out[i].cf;
-          // address_out is always correct: single FIFO holds the right target
+          fetch_entry_o[0].branch_predict.cf              = instr_data_out[i].cf;
           fetch_entry_o[0].branch_predict.predict_address = address_out;
           pop_instr[i] = fetch_entry_fire[0];
         end
@@ -329,7 +320,7 @@ module instr_queue
     assign fetch_entry_fire[i]  = fetch_entry_valid_o[i] & fetch_entry_ready_i[i];
   end
 
-  // Original single pop_address signal
+  // Original pop_address - unchanged
   assign pop_address = |(fetch_entry_is_cf & fetch_entry_fire);
 
   // ----------------------
@@ -380,15 +371,14 @@ module instr_queue
     );
   end
 
-  // Single address FIFO - original
-  // During TC feeding, predict_address_i[0] holds the relevant branch target.
-  // During normal fetch, all slots carry the same predict_address so [0] is correct.
+  // Original push_address - unchanged
   always_comb begin
     push_address = 1'b0;
     for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++)
       push_address |= push_instr[i] & (instr_data_in[i].cf != ariane_pkg::NoCF);
   end
 
+  // Single address FIFO - original, uses predict_address_i[0]
   cva6_fifo_v3 #(
       .FPGA_ALTERA(CVA6Cfg.FpgaAlteraEn),
       .DEPTH      (ariane_pkg::FETCH_ADDR_FIFO_DEPTH),
@@ -400,7 +390,7 @@ module instr_queue
       .full_o (full_address),
       .empty_o(),
       .usage_o(),
-      // slot 0 always carries the relevant predict address for both normal and TC paths
+      // Use slot 0: normal fetch all slots same; TC feeding puts target in slot 0
       .data_i (predict_address_i[0]),
       .push_i (push_address & ~full_address),
       .data_o (address_out),
