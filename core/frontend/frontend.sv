@@ -252,8 +252,8 @@ module frontend
 
   // Original icache req - NOT gated by tc_feeding_q
   // TC feeding gates by presenting zeros via valid_to_iq when active
-  assign icache_dreq_o.req     = instr_queue_ready & ~halt_frontend_i;
-  assign if_ready              = icache_dreq_i.ready & instr_queue_ready & ~halt_frontend_i;
+  assign icache_dreq_o.req     = instr_queue_ready & ~halt_frontend_i & ~tc_feeding_q;;
+  assign if_ready              = icache_dreq_i.ready & instr_queue_ready & ~halt_frontend_i & ~tc_feeding_q;
   assign icache_dreq_o.kill_s1 = is_mispredict | flush_i | replay;
   assign icache_dreq_o.kill_s2 = icache_dreq_o.kill_s1 | bp_valid;
 
