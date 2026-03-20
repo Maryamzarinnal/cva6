@@ -749,7 +749,7 @@ module frontend
     tc_trace_taken_count = '0;
     for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
       if ((i < int'(tc_trace_num_branches)) && tc_trace_branch_flags[i]) begin
-        c_trace_taken_count = tc_trace_taken_count + BR_CNT_WIDTH'(1);
+        tc_trace_taken_count = tc_trace_taken_count + BR_CNT_WIDTH'(1);
       end
     end
   end
