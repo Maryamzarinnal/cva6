@@ -173,7 +173,7 @@ module frontend
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] addr_to_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]                   valid_to_iq;
   cf_t  [CVA6Cfg.INSTR_PER_FETCH-1:0]                   cf_type_to_iq;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] predict_addr_to_iq;
+  logic [CVA6Cfg.VLEN-1:0]                              predict_addr_to_iq;
   ariane_pkg::frontend_exception_t                      exception_to_iq;
   logic [CVA6Cfg.VLEN-1:0]                              exception_addr_to_iq;
   logic [CVA6Cfg.GPLEN-1:0]                             exception_gpaddr_to_iq;
@@ -492,9 +492,7 @@ module frontend
 
   // predict_addr_to_iq: slot 0 carries branch target during TC feeding,
   // or predict_address during normal fetch. Slots 1+ always carry predict_address.
-  for (genvar s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++) begin : gen_predict_addr_mux
-    assign predict_addr_to_iq[s] = (tc_feeding_q && s == 0) ? replay_predict_addr_slot0 : predict_address;
-  end
+  assign predict_addr_to_iq = tc_feeding_q ? replay_predict_addr_slot0 : predict_address;
 
   // -----------------------------------------------------------------------
   // NPC select - original logic + TC feeding done redirect
