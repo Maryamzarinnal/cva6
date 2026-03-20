@@ -631,6 +631,9 @@ module frontend
   logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
   logic [BR_CNT_WIDTH-1:0]                  tc_lookup_num_branches;
   logic                                     tc_window_eligible;
+  logic [BR_CNT_WIDTH-1:0]                  tc_trace_num_taken;
+  logic [CHUNKS_PER_TRACE-1:0][PC_WIDTH-1:0] tc_trace_taken_targets;
+  logic                                       tc_trace_single_taken_ok;
 
   // TC eligible when not serving unaligned and not in debug/halt
   assign tc_window_eligible = !serving_unaligned && !halt_i && !halt_frontend_i && !debug_mode_i;
@@ -728,6 +731,8 @@ module frontend
     .trace_pcs_o                    (tc_trace_pcs),
     .trace_branch_flags_o           (tc_trace_branch_flags),
     .trace_num_branches_o           (tc_trace_num_branches),
+    .trace_num_taken_o              (tc_trace_num_taken),
+    .trace_taken_targets_o          (tc_trace_taken_targets),
     .trace_next_pc_o                (tc_trace_next_pc),
     .tc_miss_total_o                (tc_miss_total),
     .tc_miss_empty_o                (tc_miss_empty),
@@ -739,11 +744,16 @@ module frontend
     .miss_reason_path_o             (tc_miss_reason_path)
   );
 
+  assign tc_trace_single_taken_ok = (tc_trace_num_taken <= BR_CNT_WIDTH'(1));
+
   always_comb begin
     tc_trace_starts = '0;
     for (int i = 0; i < CHUNKS_PER_TRACE; i++)
-      if (tc_trace_valid_chunks[i]) tc_trace_starts = tc_trace_starts + TRACE_LEN_WIDTH'(1);
+      if (tc_trace_valid_chunks[i])
+        tc_trace_starts = tc_trace_starts + TRACE_LEN_WIDTH'(1);
   end
+
+
   assign tc_trace_starts_ok = (tc_trace_starts <= TRACE_LEN_WIDTH'(TRACE_LEN));
   always_comb begin
     tc_trace_taken_count = '0;
@@ -765,6 +775,7 @@ assign tc_trace_single_taken_ok = (tc_trace_taken_count <= BR_CNT_WIDTH'(1));
   // PC guard: only feed traces for application region (>= 0x80001000)
   assign tc_active_use = tc_active_hit
                       && tc_trace_starts_ok
+                      && tc_trace_single_taken_ok
                       && (tc_trace_next_pc != tc_trace_pcs[0])
                       && !tc_feeding_q
                       && (tc_trace_pcs[0] >= PC_WIDTH'(64'h80001000));
