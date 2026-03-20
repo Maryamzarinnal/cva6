@@ -100,6 +100,8 @@ module frontend
   logic                                    tc_active_hit;
   logic [TRACE_LEN_WIDTH-1:0]              tc_trace_starts;
   logic                                    tc_trace_starts_ok;
+  logic [BR_CNT_WIDTH-1:0]                 tc_trace_taken_count;
+  logic                                    tc_trace_single_taken_ok;
 
   // TC feeding registers
   logic                                    tc_feeding_q, tc_feeding_d;
@@ -743,6 +745,16 @@ module frontend
       if (tc_trace_valid_chunks[i]) tc_trace_starts = tc_trace_starts + TRACE_LEN_WIDTH'(1);
   end
   assign tc_trace_starts_ok = (tc_trace_starts <= TRACE_LEN_WIDTH'(TRACE_LEN));
+  always_comb begin
+    tc_trace_taken_count = '0;
+    for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
+      if ((i < int'(tc_trace_num_branches)) && tc_trace_branch_flags[i]) begin
+        c_trace_taken_count = tc_trace_taken_count + BR_CNT_WIDTH'(1);
+      end
+    end
+  end
+
+assign tc_trace_single_taken_ok = (tc_trace_taken_count <= BR_CNT_WIDTH'(1));
 
   assign tc_active_hit = tc_lookup_result_valid && tc_trace_hit
                        && (tc_trace_length != '0) && !flush_i && !is_mispredict;
@@ -751,12 +763,11 @@ module frontend
   logic [15:0] tc_same_pc_replay_count_q;
 
   // PC guard: only feed traces for application region (>= 0x80001000)
-  //assign tc_active_use = tc_active_hit
-  //                    && tc_trace_starts_ok
-  //                    && (tc_trace_next_pc != tc_trace_pcs[0])
-  //                    && !tc_feeding_q
-  //                    && (tc_trace_pcs[0] >= PC_WIDTH'(64'h80001000));
-  assign tc_active_use = 1'b0;
+  assign tc_active_use = tc_active_hit
+                      && tc_trace_starts_ok
+                      && (tc_trace_next_pc != tc_trace_pcs[0])
+                      && !tc_feeding_q
+                      && (tc_trace_pcs[0] >= PC_WIDTH'(64'h80001000));
 
 // pragma translate_off
   logic tc_feeding_q_prev;
