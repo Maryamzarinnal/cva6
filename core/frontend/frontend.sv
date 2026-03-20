@@ -124,7 +124,50 @@ module frontend
   cf_t  [CVA6Cfg.INSTR_PER_FETCH-1:0]                   replay_cf_type_iq;
   // predict_address slot 0 goes to the single address FIFO
   logic [CVA6Cfg.VLEN-1:0]                              replay_predict_addr_slot0;
+  
+  // map packed replay slots back to the original trace index
+  logic [CVA6Cfg.INSTR_PER_FETCH-1:0][TRACE_LEN_WIDTH-1:0] replay_trace_idx_map;
 
+  
+  
+  function automatic cf_t tc_replay_cf_type(input logic [31:0] instr_i);
+    logic is_rvc;
+    begin
+      tc_replay_cf_type = ariane_pkg::NoCF;
+      is_rvc = (instr_i[1:0] != 2'b11);
+
+      if (!is_rvc) begin
+        unique case (instr_i[6:0])
+          riscv::OpcodeBranch: tc_replay_cf_type = ariane_pkg::Branch;
+          riscv::OpcodeJal:    tc_replay_cf_type = ariane_pkg::Jump;
+          riscv::OpcodeJalr: begin
+            if (((instr_i[19:15] == 5'd1) || (instr_i[19:15] == 5'd5)) &&
+                (instr_i[19:15] != instr_i[11:7]))
+              tc_replay_cf_type = ariane_pkg::Return;
+            else
+              tc_replay_cf_type = ariane_pkg::JumpR;
+          end
+          default: ;
+        endcase
+      end else begin
+        if ((instr_i[15:13] == riscv::OpcodeC1Beqz) ||
+            (instr_i[15:13] == riscv::OpcodeC1Bnez)) begin
+          tc_replay_cf_type = ariane_pkg::Branch;
+        end else if ((instr_i[15:13] == riscv::OpcodeC1J) ||
+                     ((CVA6Cfg.XLEN == 32) && (instr_i[15:13] == riscv::OpcodeC1Jal))) begin
+          tc_replay_cf_type = ariane_pkg::Jump;
+        end else if ((instr_i[1:0] == riscv::OpcodeC2) &&
+                     (instr_i[15:13] == riscv::OpcodeC2JalrMvAdd) &&
+                     (instr_i[6:2] == 5'b00000)) begin
+          if (!instr_i[12] &&
+              ((instr_i[11:7] == 5'd1) || (instr_i[11:7] == 5'd5)))
+            tc_replay_cf_type = ariane_pkg::Return;
+          else
+            tc_replay_cf_type = ariane_pkg::JumpR;
+        end
+      end
+    end
+  endfunction
   // MUX outputs to instr_queue
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0]             instr_to_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] addr_to_iq;
@@ -291,50 +334,97 @@ module frontend
   end
 
   // -----------------------------------------------------------------------
-  // TC: Present trace to instr_queue
-  // KEY: only mark FIRST taken CF as Branch (single address FIFO constraint)
+  // TC: build one packed replay segment
+  // - pack from slot 0
+  // - stop at the first taken CF
+  // - use one target for this segment
   // -----------------------------------------------------------------------
   always_comb begin
-    logic first_cf_done;
-    first_cf_done             = 1'b0;
+    logic found_start;
+    logic stop_after_cf;
+    int   start_idx;
+    int   pack_idx;
+
     replay_instr_iq           = '0;
     replay_addr_iq            = '0;
     replay_valid_iq           = '0;
     replay_cf_type_iq         = '{default: ariane_pkg::NoCF};
+    replay_trace_idx_map      = '0;
     replay_predict_addr_slot0 = tc_feeding_next_pc_q;
-    for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++) begin
-      if (s < int'(tc_feeding_len_q) && !tc_feeding_consumed_q[s]) begin
-        replay_valid_iq[s] = 1'b1;
-        replay_instr_iq[s] = tc_feeding_instr_q[s];
-        replay_addr_iq[s]  = tc_feeding_pcs_q[s];
-        if (is_trace_cf[s] && is_trace_taken[s] && !first_cf_done) begin
-          replay_cf_type_iq[s]      = ariane_pkg::Branch;
-          replay_predict_addr_slot0 = (s + 1 < int'(tc_feeding_len_q)) ? tc_feeding_pcs_q[s+1] : tc_feeding_next_pc_q;
-          first_cf_done = 1'b1;
+
+    found_start   = 1'b0;
+    stop_after_cf = 1'b0;
+    start_idx     = 0;
+    pack_idx      = 0;
+
+    if (tc_feeding_q) begin
+      // find the first remaining trace instruction
+      for (int j = 0; j < TRACE_LEN; j++) begin
+        if (j < int'(tc_feeding_len_q) &&
+            !tc_feeding_consumed_q[j] &&
+            !found_start) begin
+          found_start = 1'b1;
+          start_idx   = j;
+        end
+      end
+
+      // pack one segment into slots 0..N-1
+      for (int src = start_idx; src < TRACE_LEN; src++) begin
+        if (src < int'(tc_feeding_len_q) &&
+            !tc_feeding_consumed_q[src] &&
+            !stop_after_cf &&
+            pack_idx < CVA6Cfg.INSTR_PER_FETCH) begin
+
+          replay_trace_idx_map[pack_idx] = TRACE_LEN_WIDTH'(src);
+          replay_valid_iq[pack_idx]      = 1'b1;
+          replay_instr_iq[pack_idx]      = tc_feeding_instr_q[src];
+          replay_addr_iq[pack_idx]       = tc_feeding_pcs_q[src];
+
+          if (is_trace_cf[src] && is_trace_taken[src]) begin
+            replay_cf_type_iq[pack_idx] = tc_replay_cf_type(tc_feeding_instr_q[src]);
+
+            if (src + 1 < int'(tc_feeding_len_q))
+              replay_predict_addr_slot0 = tc_feeding_pcs_q[src+1];
+            else
+              replay_predict_addr_slot0 = tc_feeding_next_pc_q;
+
+            stop_after_cf = 1'b1;
+          end
+
+          pack_idx++;
         end
       end
     end
   end
 
   // -----------------------------------------------------------------------
-  // TC: Consumed mask + feeding done
+  // TC: update consumed mask using packed-slot -> trace-index mapping
   // -----------------------------------------------------------------------
   always_comb begin
     tc_feeding_consumed_d = tc_feeding_consumed_q;
     tc_feeding_done       = 1'b0;
+
     if (flush_i || is_mispredict || set_pc_commit_i || ex_valid_i || eret_i) begin
       tc_feeding_consumed_d = '0;
-    end else if (tc_feeding_q && tc_feeding_len_q != 0) begin
-      for (int j = 0; j < TRACE_LEN; j++)
-        if (j < int'(tc_feeding_len_q) && instr_queue_consumed[j])
-          tc_feeding_consumed_d[j] = 1'b1;
-      tc_feeding_done = 1'b1;
-      for (int j = 0; j < TRACE_LEN; j++)
-        if (j < int'(tc_feeding_len_q) && !tc_feeding_consumed_d[j])
-          tc_feeding_done = 1'b0;
-      if (tc_feeding_done) tc_feeding_consumed_d = '0;
-    end else if (tc_feeding_start) begin
-      tc_feeding_consumed_d = '0;
+    end else begin
+      if (tc_feeding_start)
+        tc_feeding_consumed_d = '0;
+
+      if (tc_feeding_q) begin
+        for (int p = 0; p < CVA6Cfg.INSTR_PER_FETCH; p++) begin
+          if (replay_valid_iq[p] && instr_queue_consumed[p])
+            tc_feeding_consumed_d[replay_trace_idx_map[p]] = 1'b1;
+        end
+
+        tc_feeding_done = 1'b1;
+        for (int j = 0; j < TRACE_LEN; j++) begin
+          if (j < int'(tc_feeding_len_q) && !tc_feeding_consumed_d[j])
+            tc_feeding_done = 1'b0;
+        end
+
+        if (tc_feeding_done)
+          tc_feeding_consumed_d = '0;
+      end
     end
   end
 

@@ -31,14 +31,14 @@ module trace_cache_top #(
   input  logic [BR_CNT_WIDTH-1:0]     lookup_num_branches_i,
 
   // Resolved branch (from backend): correct-path outcomes to store as path tag, matching Rotenberg fill-at-retire semantics
-  input  logic                resolved_branch_valid_i,
-  input  logic [PC_WIDTH-1:0]  resolved_branch_pc_i,
-  input  logic                resolved_branch_is_taken_i,
-  input  logic                resolved_branch_is_mispredict_i,
+  input  logic                         resolved_branch_valid_i,
+  input  logic [PC_WIDTH-1:0]          resolved_branch_pc_i,
+  input  logic                         resolved_branch_is_taken_i,
+  input  logic                         resolved_branch_is_mispredict_i,
 
   // Lookup interface
-  input  logic                lookup_valid_i,
-  input  logic [PC_WIDTH-1:0] lookup_pc_i,
+  input  logic                         lookup_valid_i,
+  input  logic [PC_WIDTH-1:0]          lookup_pc_i,
 
   // Lookup results
   output logic                                        trace_hit_o,
@@ -50,6 +50,10 @@ module trace_cache_top #(
   output logic [TRACE_LEN-1:0][PC_WIDTH-1:0]         trace_pcs_o,
   output logic [CHUNKS_PER_TRACE-1:0]                trace_branch_flags_o,
   output logic [BR_CNT_WIDTH-1:0]                    trace_num_branches_o,
+
+  // New: ordered targets of taken control-flow instructions in this trace
+  output logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]         trace_taken_targets_o,
+  output logic [TAKEN_CNT_WIDTH-1:0]                 trace_num_taken_o,
 
   // High when this cycle's trace_hit_o is for a lookup we actually did (we fired); use for hit/miss counting
   output logic                                        lookup_result_valid_o,
@@ -126,7 +130,7 @@ module trace_cache_top #(
         resolved_table_q[i] <= '0;
     end else if (resolved_branch_valid_i && !resolved_branch_is_mispredict_i) begin
       resolved_table_q[resolved_wr_idx].valid <= 1'b1;
-      resolved_table_q[resolved_wr_idx].pc_hi  <= resolved_branch_pc_i[PC_WIDTH-1:10];
+      resolved_table_q[resolved_wr_idx].pc_hi <= resolved_branch_pc_i[PC_WIDTH-1:10];
       resolved_table_q[resolved_wr_idx].taken <= resolved_branch_is_taken_i;
     end
   end
@@ -136,12 +140,13 @@ module trace_cache_top #(
     trace_data_t w;
     logic [RESOLVED_ADDRW-1:0] idx;
     w = trace_data_t'(mem_wdata_builder);
-    for (int i = 0; i < CHUNKS_PER_TRACE; i++)
+    for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
       if (i < int'(w.num_branches)) begin
         idx = mem_branch_pcs_builder[i][RESOLVED_ADDRW+3:4];
         if (resolved_table_q[idx].valid && resolved_table_q[idx].pc_hi == mem_branch_pcs_builder[i][PC_WIDTH-1:10])
           w.branch_flags[i] = resolved_table_q[idx].taken;
       end
+    end
     mem_wdata_final = w;
   end
 
@@ -171,23 +176,24 @@ module trace_cache_top #(
   logic [TRACE_ADDRW-1:0]      lookup_set_q;
 
   assign lookup_fire = lookup_valid_i && !mem_req_builder;
-  assign lookup_result_valid_o = lookup_valid_q;  // high when trace_hit_o is for a lookup we actually did
+  assign lookup_result_valid_o = lookup_valid_q;
+
   logic [PC_WIDTH-1:0] lookup_base;
   assign lookup_base = pc_align_16(lookup_pc_i);
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      lookup_valid_q       <= 1'b0;
-      lookup_pc_q          <= '0;
-      branch_predictions_q <= '0;
+      lookup_valid_q        <= 1'b0;
+      lookup_pc_q           <= '0;
+      branch_predictions_q  <= '0;
       lookup_num_branches_q <= '0;
-      lookup_set_q         <= '0;
+      lookup_set_q          <= '0;
     end else begin
-      lookup_valid_q       <= lookup_fire;
-      lookup_pc_q          <= lookup_base;
-      branch_predictions_q <= branch_predictions_i;
+      lookup_valid_q        <= lookup_fire;
+      lookup_pc_q           <= lookup_base;
+      branch_predictions_q  <= branch_predictions_i;
       lookup_num_branches_q <= lookup_num_branches_i;
-      lookup_set_q         <= tc_index(lookup_base, branch_predictions_i);
+      lookup_set_q          <= tc_index(lookup_base, branch_predictions_i);
     end
   end
 
@@ -286,6 +292,7 @@ module trace_cache_top #(
       if (way_valid[w] && pc_match[w]) any_pc_match_in_set = 1'b1;
     end
   end
+
   assign miss_reason_empty_o = lookup_valid_q && !trace_hit && !any_valid_in_set;
   assign miss_reason_pc_o    = lookup_valid_q && !trace_hit && any_valid_in_set && !any_pc_match_in_set;
   assign miss_reason_path_o  = lookup_valid_q && !trace_hit && any_valid_in_set && any_pc_match_in_set;
@@ -304,11 +311,14 @@ module trace_cache_top #(
     if (trace_hit)
       hit_trace = trace_read[hit_way_idx];
   end
-  assign trace_next_pc_o       = hit_trace.target_addr;
-  assign trace_chunks_o        = hit_trace.chunks;
-  assign trace_valid_chunks_o  = hit_trace.valid_chunks;
-  assign trace_branch_flags_o  = hit_trace.branch_flags;
-  assign trace_num_branches_o  = hit_trace.num_branches;
+
+  assign trace_next_pc_o      = hit_trace.target_addr;
+  assign trace_chunks_o       = hit_trace.chunks;
+  assign trace_valid_chunks_o = hit_trace.valid_chunks;
+  assign trace_branch_flags_o = hit_trace.branch_flags;
+  assign trace_num_branches_o = hit_trace.num_branches;
+  assign trace_taken_targets_o = hit_trace.taken_targets;
+  assign trace_num_taken_o     = hit_trace.num_taken;
 
   logic [TRACE_LEN_WIDTH-1:0] instr_count;
   always_comb begin
@@ -343,51 +353,65 @@ module trace_cache_top #(
     end
   end
 
-  // Reconstruct PCs from base_pc, expanded instructions, and branch_flags. Fall-through +2/+4;
-  // taken branches use pc+imm (B/J/RVC); JALR at end uses stored target_addr. Uses riscv:: opcodes.
+  // Reconstruct PCs from base_pc, expanded instructions, and branch_flags.
+  // Instead of trying to recompute taken targets from the instruction type,
+  // use the ordered taken_targets[] list directly.
   logic [TRACE_LEN-1:0][PC_WIDTH-1:0] computed_pcs;
   always_comb begin
     logic [PC_WIDTH-1:0]     pc;
     logic [INSTR_WIDTH-1:0]  instr;
-    logic [PC_WIDTH-1:0]     imm_signed;
-    logic                    is_rvc, is_cf, is_jalr, taken;
+    logic                    is_rvc, is_cf, taken;
     int                      br_idx;
+    int                      taken_idx;
+
     for (int j = 0; j < TRACE_LEN; j++) trace_pcs_o[j] = '0;
+
     if (!trace_hit) begin
-      pc = '0;
-      br_idx = 0;
+      pc        = '0;
+      br_idx    = 0;
+      taken_idx = 0;
     end else begin
-    pc    = hit_trace.base_pc;
-    br_idx = 0;
-    for (int i = 0; i < TRACE_LEN; i++) begin
-      if (i >= int'(instr_count)) break;
-      instr   = trace_instructions_o[i];
-      is_rvc  = (instr[1:0] != 2'b11);
-      is_cf   = (!is_rvc && (instr[6:0] == OpcodeBranch || instr[6:0] == OpcodeJal || instr[6:0] == OpcodeJalr))
-                || (is_rvc && (instr[15:13] == OpcodeC1J || instr[15:13] == OpcodeC1Beqz || instr[15:13] == OpcodeC1Bnez));
-      is_jalr = (!is_rvc && (instr[6:0] == OpcodeJalr))
-                || (is_rvc && instr[15:13] == OpcodeC2JalrMvAdd && instr[6:2] == 5'b00000 && instr[1:0] == OpcodeC2 && instr[12]);
-      taken   = is_cf && (br_idx < int'(hit_trace.num_branches)) && hit_trace.branch_flags[br_idx];
-      if (is_cf) br_idx++;
-      computed_pcs[i] = pc;
-      if (taken && is_jalr && (i == int'(instr_count) - 1))
-        pc = hit_trace.target_addr;
-      else if (taken && is_cf) begin
-        if (!is_rvc && instr[6:0] == OpcodeBranch)
-          imm_signed = {{(PC_WIDTH-13){instr[31]}}, instr[31], instr[7], instr[30:25], instr[11:8], 1'b0};
-        else if (!is_rvc && instr[6:0] == OpcodeJal)
-          imm_signed = {{(PC_WIDTH-21){instr[31]}}, instr[31], instr[19:12], instr[20], instr[30:21], 1'b0};
-        else if (is_rvc && instr[15:13] == OpcodeC1J)
-          imm_signed = instr[14] ? {{(PC_WIDTH-9){instr[12]}}, instr[6:5], instr[2], instr[11:10], instr[4:3], 1'b0}
-                        : {{(PC_WIDTH-12){instr[12]}}, instr[8], instr[10:9], instr[6], instr[7], instr[2], instr[11], instr[5:3], 1'b0};
-        else
-          imm_signed = {{(PC_WIDTH-9){instr[12]}}, instr[6:5], instr[2], instr[11:10], instr[4:3], 1'b0};
-        pc = pc + imm_signed;
-      end else
-        pc = pc + (is_rvc ? PC_WIDTH'(2) : PC_WIDTH'(4));
-    end
-    for (int j = 0; j < TRACE_LEN; j++)
-      trace_pcs_o[j] = (j < int'(instr_count)) ? computed_pcs[j] : '0;
+      pc        = hit_trace.base_pc;
+      br_idx    = 0;
+      taken_idx = 0;
+
+      for (int i = 0; i < TRACE_LEN; i++) begin
+        if (i >= int'(instr_count)) break;
+
+        instr  = trace_instructions_o[i];
+        is_rvc = (instr[1:0] != 2'b11);
+
+        // Count control-flow instructions in the same order as the trace was built.
+        is_cf  = (!is_rvc && (instr[6:0] == OpcodeBranch ||
+                              instr[6:0] == OpcodeJal    ||
+                              instr[6:0] == OpcodeJalr))
+              || ( is_rvc && (
+                     (instr[15:13] == OpcodeC1J)    ||
+                     (instr[15:13] == OpcodeC1Beqz) ||
+                     (instr[15:13] == OpcodeC1Bnez) ||
+                     ((instr[15:13] == OpcodeC2JalrMvAdd) &&
+                      (instr[6:2]   == 5'b00000) &&
+                      (instr[1:0]   == OpcodeC2))
+                   ));
+
+        taken = 1'b0;
+        if (is_cf) begin
+          taken = (br_idx < int'(hit_trace.num_branches)) && hit_trace.branch_flags[br_idx];
+          br_idx++;
+        end
+
+        computed_pcs[i] = pc;
+
+        if (taken && (taken_idx < int'(hit_trace.num_taken))) begin
+          pc = hit_trace.taken_targets[taken_idx];
+          taken_idx++;
+        end else begin
+          pc = pc + (is_rvc ? PC_WIDTH'(2) : PC_WIDTH'(4));
+        end
+      end
+
+      for (int j = 0; j < TRACE_LEN; j++)
+        trace_pcs_o[j] = (j < int'(instr_count)) ? computed_pcs[j] : '0;
     end
   end
 

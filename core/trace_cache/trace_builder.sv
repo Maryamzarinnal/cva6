@@ -32,7 +32,7 @@ module trace_builder #(
   localparam int unsigned CHUNK_PTR_W = $clog2(CHUNKS_PER_TRACE + 1);
   localparam int unsigned BR_CNT_W    = BR_CNT_WIDTH;
   localparam int unsigned START_CNT_W = $clog2(TRACE_LEN + 1);
-  localparam int unsigned MAX_TAKEN   = 3;
+  localparam int unsigned TAKEN_CNT_W = TAKEN_CNT_WIDTH;
 
   typedef enum logic [1:0] {
     IDLE,
@@ -56,7 +56,7 @@ module trace_builder #(
   logic [CHUNKS_PER_TRACE-1:0][PC_WIDTH-1:0] commit_branch_pcs_q, commit_branch_pcs_d;
   logic [GHR_WIDTH-1:0]   trace_start_ghr_q, trace_start_ghr_d;
   logic [CHUNK_PTR_W-1:0] commit_chunk_ptr_q, commit_chunk_ptr_d;
-  logic [1:0]             taken_cnt_q, taken_cnt_d;
+  logic [TAKEN_CNT_W-1:0] taken_cnt_q, taken_cnt_d;
 
   // Per-set duplicate filter: remembers the last committed (pc, flags) per set.
   logic                        dup_valid [(1 << TRACE_ADDRW)];
@@ -68,11 +68,11 @@ module trace_builder #(
   assign mem_req_o     = commit_valid_q;
   assign mem_we_o      = commit_valid_q;
   assign mem_addr_o    = sram_wr_addr_q;
-  assign mem_wdata_o       = commit_data_q;
-  assign mem_be_o          = {BE_WIDTH{1'b1}};
-  assign mem_branch_pcs_o  = commit_branch_pcs_q;
-  assign trace_valid_o     = commit_valid_q;
-  assign trace_data_o      = commit_data_q;
+  assign mem_wdata_o   = commit_data_q;
+  assign mem_be_o      = {BE_WIDTH{1'b1}};
+  assign mem_branch_pcs_o = commit_branch_pcs_q;
+  assign trace_valid_o = commit_valid_q;
+  assign trace_data_o  = commit_data_q;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -118,6 +118,7 @@ module trace_builder #(
     logic [CHUNK_PTR_W-1:0] temp_chunk_ptr;
     logic [BR_CNT_W-1:0]    temp_br_cnt;
     logic [START_CNT_W-1:0] temp_start_cnt;
+    logic [TAKEN_CNT_W-1:0] temp_taken_cnt;
     logic                   is_compressed;
     logic                   has_space;
     logic                   found_taken;
@@ -146,6 +147,7 @@ module trace_builder #(
     temp_chunk_ptr          = '0;
     temp_br_cnt             = '0;
     temp_start_cnt          = '0;
+    temp_taken_cnt          = '0;
     is_compressed           = 1'b0;
     has_space               = 1'b0;
     found_taken             = 1'b0;
@@ -182,6 +184,7 @@ module trace_builder #(
               temp_chunk_ptr          = '0;
               temp_br_cnt             = '0;
               temp_start_cnt          = '0;
+              temp_taken_cnt          = '0;
               chunk_ptr_d             = '0;
               br_cnt_d                = '0;
               instr_start_cnt_d       = '0;
@@ -218,8 +221,15 @@ module trace_builder #(
                     trace_d.lookup_branch_flags[temp_br_cnt] = instr_i.taken[i];
                     trace_d.branch_flags[temp_br_cnt]        = instr_i.taken[i];
                     branch_pcs_d[temp_br_cnt]                = instr_i.pc[i];
-                    if (instr_i.taken[i])
+
+                    if (instr_i.taken[i]) begin
                       last_branch_target_d = instr_i.target[i];
+                      if (temp_taken_cnt < TAKEN_CNT_W'(MAX_TAKEN)) begin
+                        trace_d.taken_targets[temp_taken_cnt] = instr_i.target[i];
+                        temp_taken_cnt = temp_taken_cnt + TAKEN_CNT_W'(1);
+                      end
+                    end
+
                     temp_br_cnt = temp_br_cnt + 1;
                   end
                 end
@@ -227,10 +237,11 @@ module trace_builder #(
 
               trace_d.lookup_num_branches = BR_CNT_W'(temp_br_cnt);
               trace_d.num_branches        = BR_CNT_W'(temp_br_cnt);
+              trace_d.num_taken           = temp_taken_cnt;
               chunk_ptr_d                 = temp_chunk_ptr;
               br_cnt_d                    = temp_br_cnt;
               instr_start_cnt_d           = temp_start_cnt;
-              taken_cnt_d                 = 2'd1;
+              taken_cnt_d                 = temp_taken_cnt;
               state_d                     = ACCUM;
             end
           end
@@ -241,6 +252,7 @@ module trace_builder #(
             temp_chunk_ptr = chunk_ptr_q;
             temp_br_cnt    = br_cnt_q;
             temp_start_cnt = instr_start_cnt_q;
+            temp_taken_cnt = taken_cnt_q;
             hit_taken      = 1'b0;
             trace_full     = 1'b0;
 
@@ -272,11 +284,18 @@ module trace_builder #(
                 if (instr_i.is_branch[i]) begin
                   trace_d.branch_flags[temp_br_cnt] = instr_i.taken[i];
                   branch_pcs_d[temp_br_cnt]         = instr_i.pc[i];
+
                   if (instr_i.taken[i]) begin
                     last_branch_target_d = instr_i.target[i];
-                    taken_cnt_d = taken_cnt_q + 2'd1;
+
+                    if (temp_taken_cnt < TAKEN_CNT_W'(MAX_TAKEN)) begin
+                      trace_d.taken_targets[temp_taken_cnt] = instr_i.target[i];
+                      temp_taken_cnt = temp_taken_cnt + TAKEN_CNT_W'(1);
+                    end
+
                     hit_taken = 1'b1;
                   end
+
                   temp_br_cnt = temp_br_cnt + 1;
                 end
               end else if (instr_i.valid[i] &&
@@ -285,14 +304,16 @@ module trace_builder #(
               end
             end
 
-            chunk_ptr_d       = temp_chunk_ptr;
-            br_cnt_d          = temp_br_cnt;
-            instr_start_cnt_d = temp_start_cnt;
-            trace_d.num_branches = BR_CNT_W'(temp_br_cnt);
+            chunk_ptr_d             = temp_chunk_ptr;
+            br_cnt_d                = temp_br_cnt;
+            instr_start_cnt_d       = temp_start_cnt;
+            taken_cnt_d             = temp_taken_cnt;
+            trace_d.num_branches    = BR_CNT_W'(temp_br_cnt);
+            trace_d.num_taken       = temp_taken_cnt;
 
             if (trace_full ||
                 (temp_start_cnt >= START_CNT_W'(MAX_INSTR_PER_TRACE) && temp_chunk_ptr > 0) ||
-                (taken_cnt_d >= MAX_TAKEN[1:0] && temp_chunk_ptr > 0)) begin
+                (temp_taken_cnt >= TAKEN_CNT_W'(MAX_TAKEN) && temp_chunk_ptr > 0)) begin
               logic [TRACE_ADDRW-1:0] candidate_addr;
               logic                   is_duplicate;
 
@@ -306,14 +327,14 @@ module trace_builder #(
               candidate_addr = tc_index(trace_d.base_pc, trace_d.lookup_branch_flags);
 
               is_duplicate = dup_valid[candidate_addr]
-                           && (trace_d.base_pc      == dup_pc[candidate_addr])
+                           && (trace_d.base_pc             == dup_pc[candidate_addr])
                            && (trace_d.lookup_branch_flags == dup_flags[candidate_addr])
                            && (trace_d.lookup_num_branches == dup_num_branches[candidate_addr]);
 
               if (!is_duplicate) begin
-                sram_wr_addr_d     = candidate_addr;
-                commit_valid_d     = 1'b1;
-                commit_data_d      = trace_d;
+                sram_wr_addr_d      = candidate_addr;
+                commit_valid_d      = 1'b1;
+                commit_data_d       = trace_d;
                 commit_branch_pcs_d = branch_pcs_d;
               end
 
@@ -367,6 +388,7 @@ module trace_builder #(
                sram_wr_addr_q);
       $display("[TC-BUILDER]   target     = 0x%h", dbg.target_addr);
       $display("[TC-BUILDER]   #branches  = %0d", dbg.num_branches);
+      $display("[TC-BUILDER]   #taken     = %0d", dbg.num_taken);
       $display("[TC-BUILDER]   br_flags   = %b", dbg.branch_flags);
       $display("[TC-BUILDER]   chunks used= %0d", commit_chunk_ptr_q);
       for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin

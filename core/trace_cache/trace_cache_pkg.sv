@@ -19,11 +19,18 @@ package trace_cache_pkg;
   localparam int unsigned CHUNKS_PER_TRACE = TRACE_LEN * 2;
   localparam int unsigned BR_CNT_WIDTH = $clog2(CHUNKS_PER_TRACE + 1);
 
-  // PCs are not stored per instruction; on hit we derive them from base_pc + instr + branch_flags
+  // New: keep every taken target in trace order.
+  // For now, max taken CFs per trace = TRACE_LEN.
+  localparam int unsigned MAX_TAKEN = TRACE_LEN;
+  localparam int unsigned TAKEN_CNT_WIDTH = $clog2(MAX_TAKEN + 1);
+
+  // PCs are not stored per instruction; on hit we derive them from base_pc + instr + branch_flags.
+  // We now also store the ordered list of taken targets.
   localparam int unsigned TRACE_WIDTH =
     1 + PC_WIDTH
     + CHUNKS_PER_TRACE + BR_CNT_WIDTH
     + CHUNKS_PER_TRACE + BR_CNT_WIDTH
+    + TAKEN_CNT_WIDTH + (MAX_TAKEN * PC_WIDTH)
     + PC_WIDTH
     + (CHUNKS_PER_TRACE * 16) + CHUNKS_PER_TRACE;
 
@@ -36,7 +43,14 @@ package trace_cache_pkg;
     logic [BR_CNT_WIDTH-1:0]            lookup_num_branches;
     logic [CHUNKS_PER_TRACE-1:0]        branch_flags;
     logic [BR_CNT_WIDTH-1:0]            num_branches;
+
+    // New: ordered targets of taken control-flow instructions in this trace
+    logic [TAKEN_CNT_WIDTH-1:0]         num_taken;
+    logic [MAX_TAKEN-1:0][PC_WIDTH-1:0] taken_targets;
+
+    // Final next PC after the trace ends
     logic [PC_WIDTH-1:0]                target_addr;
+
     logic [CHUNKS_PER_TRACE-1:0][15:0]  chunks;
     logic [CHUNKS_PER_TRACE-1:0]        valid_chunks;
   } trace_data_t;
