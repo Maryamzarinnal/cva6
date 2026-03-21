@@ -1,11 +1,16 @@
 `timescale 1ns/1ps
 import trace_cache_pkg::*;
+import riscv::*;
 
 // Builds a trace from fetch windows: start at the window where a branch is taken, then keep
 // adding instructions from the next window(s) until we hit MAX_INSTR_PER_TRACE (one fetch
 // window worth, e.g. 4). Tag = (base_pc, branch_flags). We fill at fetch; on write we overwrite
 // branch_flags with resolved outcomes when we have them (Rotenberg-style). Stored as 16-bit
 // chunks; valid_chunks marks instruction starts. MAX_INSTR_PER_TRACE must be <= TRACE_LEN.
+//
+// IMPORTANT SAFETY RULE:
+//   Any trace containing indirect control flow (jalr / c.jr / c.jalr) is dropped and never
+//   committed. Those targets are dynamic and not safe to replay from historical trace data.
 
 module trace_builder #(
   parameter int unsigned MAX_INSTR_PER_TRACE = TRACE_LEN
@@ -39,6 +44,28 @@ module trace_builder #(
     ACCUM
   } state_t;
 
+  function automatic logic is_indirect_cf_instr(input logic [INSTR_WIDTH-1:0] instr);
+    logic is_rvc;
+    begin
+      is_rvc = (instr[1:0] != 2'b11);
+
+      // 32-bit jalr
+      if (!is_rvc && (instr[6:0] == OpcodeJalr)) begin
+        is_indirect_cf_instr = 1'b1;
+      end
+      // compressed c.jr / c.jalr family (also catches the same encoding family used earlier)
+      else if (is_rvc &&
+               (instr[15:13] == OpcodeC2JalrMvAdd) &&
+               (instr[6:2]   == 5'b00000) &&
+               (instr[1:0]   == OpcodeC2)) begin
+        is_indirect_cf_instr = 1'b1;
+      end
+      else begin
+        is_indirect_cf_instr = 1'b0;
+      end
+    end
+  endfunction
+
   state_t state_q, state_d;
   trace_data_t trace_q, trace_d;
   logic [CHUNK_PTR_W-1:0] chunk_ptr_q, chunk_ptr_d;
@@ -48,6 +75,7 @@ module trace_builder #(
   logic [PC_WIDTH-1:0]    last_instr_pc_q, last_instr_pc_d;
   logic                   last_instr_compressed_q, last_instr_compressed_d;
   logic                   last_instr_was_taken_q, last_instr_was_taken_d;
+  logic                   has_indirect_cf_q, has_indirect_cf_d;
 
   logic [TRACE_ADDRW-1:0] sram_wr_addr_q, sram_wr_addr_d;
   logic                   commit_valid_q, commit_valid_d;
@@ -85,6 +113,7 @@ module trace_builder #(
       last_instr_pc_q         <= '0;
       last_instr_compressed_q <= 1'b0;
       last_instr_was_taken_q  <= 1'b0;
+      has_indirect_cf_q       <= 1'b0;
       sram_wr_addr_q          <= '0;
       commit_valid_q          <= 1'b0;
       commit_data_q           <= '0;
@@ -103,6 +132,7 @@ module trace_builder #(
       last_instr_pc_q         <= last_instr_pc_d;
       last_instr_compressed_q <= last_instr_compressed_d;
       last_instr_was_taken_q  <= last_instr_was_taken_d;
+      has_indirect_cf_q       <= has_indirect_cf_d;
       sram_wr_addr_q          <= sram_wr_addr_d;
       commit_valid_q          <= commit_valid_d;
       commit_data_q           <= commit_data_d;
@@ -119,6 +149,7 @@ module trace_builder #(
     logic [BR_CNT_W-1:0]    temp_br_cnt;
     logic [START_CNT_W-1:0] temp_start_cnt;
     logic [TAKEN_CNT_W-1:0] temp_taken_cnt;
+    logic                   temp_has_indirect_cf;
     logic                   is_compressed;
     logic                   has_space;
     logic                   found_taken;
@@ -135,6 +166,7 @@ module trace_builder #(
     last_instr_pc_d         = last_instr_pc_q;
     last_instr_compressed_d = last_instr_compressed_q;
     last_instr_was_taken_d  = last_instr_was_taken_q;
+    has_indirect_cf_d       = has_indirect_cf_q;
     sram_wr_addr_d          = sram_wr_addr_q;
     commit_valid_d          = 1'b0;
     commit_data_d           = commit_data_q;
@@ -148,6 +180,7 @@ module trace_builder #(
     temp_br_cnt             = '0;
     temp_start_cnt          = '0;
     temp_taken_cnt          = '0;
+    temp_has_indirect_cf    = has_indirect_cf_q;
     is_compressed           = 1'b0;
     has_space               = 1'b0;
     found_taken             = 1'b0;
@@ -164,6 +197,7 @@ module trace_builder #(
       last_instr_pc_d         = '0;
       last_instr_compressed_d = 1'b0;
       last_instr_was_taken_d  = 1'b0;
+      has_indirect_cf_d       = 1'b0;
       taken_cnt_d             = '0;
     end else begin
       case (state_q)
@@ -185,6 +219,7 @@ module trace_builder #(
               temp_br_cnt             = '0;
               temp_start_cnt          = '0;
               temp_taken_cnt          = '0;
+              temp_has_indirect_cf    = 1'b0;
               chunk_ptr_d             = '0;
               br_cnt_d                = '0;
               instr_start_cnt_d       = '0;
@@ -192,14 +227,17 @@ module trace_builder #(
               last_instr_pc_d         = '0;
               last_instr_compressed_d = 1'b0;
               last_instr_was_taken_d  = 1'b0;
+              has_indirect_cf_d       = 1'b0;
 
               for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
                 if (instr_i.valid[i] && (CHUNK_PTR_W'(i) <= branch_slot) &&
                     (temp_start_cnt < START_CNT_W'(MAX_INSTR_PER_TRACE))) begin
 
-                  // Exact start PC of the trace = first instruction we actually store.
                   if (temp_start_cnt == 0)
                     trace_d.base_pc = instr_i.pc[i];
+
+                  if (is_indirect_cf_instr(instr_i.inst[i]))
+                    temp_has_indirect_cf = 1'b1;
 
                   is_compressed = (instr_i.inst[i][1:0] != 2'b11);
 
@@ -245,6 +283,7 @@ module trace_builder #(
               br_cnt_d                    = temp_br_cnt;
               instr_start_cnt_d           = temp_start_cnt;
               taken_cnt_d                 = temp_taken_cnt;
+              has_indirect_cf_d           = temp_has_indirect_cf;
               state_d                     = ACCUM;
             end
           end
@@ -252,12 +291,13 @@ module trace_builder #(
 
         ACCUM: begin
           if (|instr_i.consumed) begin
-            temp_chunk_ptr = chunk_ptr_q;
-            temp_br_cnt    = br_cnt_q;
-            temp_start_cnt = instr_start_cnt_q;
-            temp_taken_cnt = taken_cnt_q;
-            hit_taken      = 1'b0;
-            trace_full     = 1'b0;
+            temp_chunk_ptr       = chunk_ptr_q;
+            temp_br_cnt          = br_cnt_q;
+            temp_start_cnt       = instr_start_cnt_q;
+            temp_taken_cnt       = taken_cnt_q;
+            temp_has_indirect_cf = has_indirect_cf_q;
+            hit_taken            = 1'b0;
+            trace_full           = 1'b0;
 
             for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
               is_compressed = (instr_i.inst[i][1:0] != 2'b11);
@@ -267,6 +307,10 @@ module trace_builder #(
 
               if (instr_i.valid[i] && has_space && !hit_taken &&
                   (temp_start_cnt < START_CNT_W'(MAX_INSTR_PER_TRACE))) begin
+
+                if (is_indirect_cf_instr(instr_i.inst[i]))
+                  temp_has_indirect_cf = 1'b1;
+
                 last_instr_pc_d         = instr_i.pc[i];
                 last_instr_compressed_d = is_compressed;
                 last_instr_was_taken_d  = instr_i.is_branch[i] && instr_i.taken[i];
@@ -311,6 +355,7 @@ module trace_builder #(
             br_cnt_d                = temp_br_cnt;
             instr_start_cnt_d       = temp_start_cnt;
             taken_cnt_d             = temp_taken_cnt;
+            has_indirect_cf_d       = temp_has_indirect_cf;
             trace_d.num_branches    = BR_CNT_W'(temp_br_cnt);
             trace_d.num_taken       = temp_taken_cnt;
 
@@ -334,7 +379,8 @@ module trace_builder #(
                            && (trace_d.lookup_branch_flags == dup_flags[candidate_addr])
                            && (trace_d.lookup_num_branches == dup_num_branches[candidate_addr]);
 
-              if (!is_duplicate) begin
+              // Drop any trace containing indirect control flow.
+              if (!is_duplicate && !temp_has_indirect_cf) begin
                 sram_wr_addr_d      = candidate_addr;
                 commit_valid_d      = 1'b1;
                 commit_data_d       = trace_d;
@@ -346,6 +392,7 @@ module trace_builder #(
               br_cnt_d                = '0;
               instr_start_cnt_d       = '0;
               taken_cnt_d             = '0;
+              has_indirect_cf_d       = 1'b0;
               trace_d                 = '0;
             end
           end
