@@ -42,18 +42,18 @@ module trace_cache_top #(
 
   // Lookup results
   output logic                                        trace_hit_o,
-  output logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]      trace_instructions_o,
-  output logic [TRACE_LEN_WIDTH-1:0]                 trace_length_o,
-  output logic [PC_WIDTH-1:0]                        trace_next_pc_o,
-  output logic [CHUNKS_PER_TRACE-1:0][15:0]          trace_chunks_o,
-  output logic [CHUNKS_PER_TRACE-1:0]                trace_valid_chunks_o,
-  output logic [TRACE_LEN-1:0][PC_WIDTH-1:0]         trace_pcs_o,
-  output logic [CHUNKS_PER_TRACE-1:0]                trace_branch_flags_o,
-  output logic [BR_CNT_WIDTH-1:0]                    trace_num_branches_o,
+  output logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]       trace_instructions_o,
+  output logic [TRACE_LEN_WIDTH-1:0]                  trace_length_o,
+  output logic [PC_WIDTH-1:0]                         trace_next_pc_o,
+  output logic [CHUNKS_PER_TRACE-1:0][15:0]           trace_chunks_o,
+  output logic [CHUNKS_PER_TRACE-1:0]                 trace_valid_chunks_o,
+  output logic [TRACE_LEN-1:0][PC_WIDTH-1:0]          trace_pcs_o,
+  output logic [CHUNKS_PER_TRACE-1:0]                 trace_branch_flags_o,
+  output logic [BR_CNT_WIDTH-1:0]                     trace_num_branches_o,
 
-  // New: ordered targets of taken control-flow instructions in this trace
-  output logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]         trace_taken_targets_o,
-  output logic [TAKEN_CNT_WIDTH-1:0]                 trace_num_taken_o,
+  // Ordered targets of taken control-flow instructions in this trace
+  output logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]          trace_taken_targets_o,
+  output logic [TAKEN_CNT_WIDTH-1:0]                  trace_num_taken_o,
 
   // High when this cycle's trace_hit_o is for a lookup we actually did (we fired); use for hit/miss counting
   output logic                                        lookup_result_valid_o,
@@ -64,13 +64,12 @@ module trace_cache_top #(
   output logic                                        miss_reason_path_o,
 
   // Miss breakdown for debug (0 in synthesis)
-  output logic [31:0]                                tc_miss_total_o,
-  output logic [31:0]                                tc_miss_empty_o,
-  output logic [31:0]                                tc_miss_pc_o,
-  output logic [31:0]                                tc_miss_path_o
+  output logic [31:0]                                 tc_miss_total_o,
+  output logic [31:0]                                 tc_miss_empty_o,
+  output logic [31:0]                                 tc_miss_pc_o,
+  output logic [31:0]                                 tc_miss_path_o
 );
 
-  // Stored trace length must not exceed structure size
   initial assert (MaxTraceInstr <= TRACE_LEN)
     else $fatal(1, "trace_cache_top: MaxTraceInstr (%0d) must be <= TRACE_LEN (%0d)", MaxTraceInstr, TRACE_LEN);
 
@@ -112,7 +111,6 @@ module trace_cache_top #(
   logic [BE_WIDTH-1:0]    mem_be_builder;
   logic [CHUNKS_PER_TRACE-1:0][PC_WIDTH-1:0] mem_branch_pcs_builder;
 
-  // Resolved-outcome table: on correct-path resolve store (pc_hi, taken); on write override branch_flags => stored path = resolved (Rotenberg)
   localparam int unsigned RESOLVED_ADDRW = 6;
   localparam int unsigned RESOLVED_SIZE  = 1 << RESOLVED_ADDRW;
   typedef struct packed {
@@ -120,6 +118,7 @@ module trace_cache_top #(
     logic [PC_WIDTH-1:10] pc_hi;
     logic                 taken;
   } resolved_entry_t;
+
   resolved_entry_t resolved_table_q [RESOLVED_SIZE];
   logic [RESOLVED_ADDRW-1:0] resolved_wr_idx;
   assign resolved_wr_idx = resolved_branch_pc_i[RESOLVED_ADDRW+3:4];
@@ -139,11 +138,13 @@ module trace_cache_top #(
   always_comb begin
     trace_data_t w;
     logic [RESOLVED_ADDRW-1:0] idx;
+
     w = trace_data_t'(mem_wdata_builder);
     for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
       if (i < int'(w.num_branches)) begin
         idx = mem_branch_pcs_builder[i][RESOLVED_ADDRW+3:4];
-        if (resolved_table_q[idx].valid && resolved_table_q[idx].pc_hi == mem_branch_pcs_builder[i][PC_WIDTH-1:10])
+        if (resolved_table_q[idx].valid &&
+            resolved_table_q[idx].pc_hi == mem_branch_pcs_builder[i][PC_WIDTH-1:10])
           w.branch_flags[i] = resolved_table_q[idx].taken;
       end
     end
@@ -151,21 +152,21 @@ module trace_cache_top #(
   end
 
   trace_builder #(
-    .MAX_INSTR_PER_TRACE  (MaxTraceInstr)
+    .MAX_INSTR_PER_TRACE(MaxTraceInstr)
   ) i_trace_builder (
     .clk_i,
     .rst_ni,
-    .instr_i              (instr_if),
-    .ghr_i                (ghr),
-    .flush_i              (flush_i),
-    .trace_valid_o        (),
-    .trace_data_o         (),
-    .mem_req_o            (mem_req_builder),
-    .mem_we_o             (mem_we_builder),
-    .mem_addr_o           (mem_addr_builder),
-    .mem_wdata_o          (mem_wdata_builder),
-    .mem_be_o             (mem_be_builder),
-    .mem_branch_pcs_o     (mem_branch_pcs_builder)
+    .instr_i          (instr_if),
+    .ghr_i            (ghr),
+    .flush_i          (flush_i),
+    .trace_valid_o    (),
+    .trace_data_o     (),
+    .mem_req_o        (mem_req_builder),
+    .mem_we_o         (mem_we_builder),
+    .mem_addr_o       (mem_addr_builder),
+    .mem_wdata_o      (mem_wdata_builder),
+    .mem_be_o         (mem_be_builder),
+    .mem_branch_pcs_o (mem_branch_pcs_builder)
   );
 
   logic                        lookup_fire;
@@ -175,7 +176,7 @@ module trace_cache_top #(
   logic [BR_CNT_WIDTH-1:0]     lookup_num_branches_q;
   logic [TRACE_ADDRW-1:0]      lookup_set_q;
 
-  assign lookup_fire = lookup_valid_i && !mem_req_builder;
+  assign lookup_fire           = lookup_valid_i && !mem_req_builder;
   assign lookup_result_valid_o = lookup_valid_q;
 
   logic [PC_WIDTH-1:0] lookup_base;
@@ -254,8 +255,8 @@ module trace_cache_top #(
     assign trace_read[w] = mem_rdata[w];
     assign way_valid[w]  = (trace_read[w].valid === 1'b1);
     assign pc_match[w]   = way_valid[w] && (trace_read[w].base_pc == lookup_pc_q);
-    assign branch_count_match[w] = way_valid[w]
-                                && (trace_read[w].lookup_num_branches == lookup_num_branches_q);
+    assign branch_count_match[w] = way_valid[w] &&
+                                   (trace_read[w].lookup_num_branches == lookup_num_branches_q);
 
     always_comb begin
       branch_flags_match[w] = 1'b0;
@@ -270,32 +271,31 @@ module trace_cache_top #(
       end
     end
 
-    assign way_hit[w] = way_valid[w]
-                     && pc_match[w]
-                     && branch_count_match[w]
-                     && branch_flags_match[w]
-                     && lookup_valid_q;
+    assign way_hit[w] = way_valid[w] &&
+                        pc_match[w] &&
+                        branch_count_match[w] &&
+                        branch_flags_match[w] &&
+                        lookup_valid_q;
   end
 
   logic trace_hit;
   assign trace_hit   = |way_hit;
   assign trace_hit_o = trace_hit;
 
-  // Miss reason for this cycle (when lookup_valid_q && !trace_hit): so frontend can count same events as global_misses
   logic any_valid_in_set;
   logic any_pc_match_in_set;
   always_comb begin
-    any_valid_in_set = 1'b0;
+    any_valid_in_set    = 1'b0;
     any_pc_match_in_set = 1'b0;
     for (int w = 0; w < NUM_WAYS; w++) begin
-      if (way_valid[w]) any_valid_in_set = 1'b1;
+      if (way_valid[w])           any_valid_in_set    = 1'b1;
       if (way_valid[w] && pc_match[w]) any_pc_match_in_set = 1'b1;
     end
   end
 
   assign miss_reason_empty_o = lookup_valid_q && !trace_hit && !any_valid_in_set;
-  assign miss_reason_pc_o    = lookup_valid_q && !trace_hit && any_valid_in_set && !any_pc_match_in_set;
-  assign miss_reason_path_o  = lookup_valid_q && !trace_hit && any_valid_in_set && any_pc_match_in_set;
+  assign miss_reason_pc_o    = lookup_valid_q && !trace_hit &&  any_valid_in_set && !any_pc_match_in_set;
+  assign miss_reason_path_o  = lookup_valid_q && !trace_hit &&  any_valid_in_set &&  any_pc_match_in_set;
 
   logic [$clog2(NUM_WAYS)-1:0] hit_way_idx;
   always_comb begin
@@ -312,59 +312,67 @@ module trace_cache_top #(
       hit_trace = trace_read[hit_way_idx];
   end
 
-  assign trace_next_pc_o      = hit_trace.target_addr;
-  assign trace_chunks_o       = hit_trace.chunks;
-  assign trace_valid_chunks_o = hit_trace.valid_chunks;
-  assign trace_branch_flags_o = hit_trace.branch_flags;
-  assign trace_num_branches_o = hit_trace.num_branches;
+  assign trace_next_pc_o       = hit_trace.target_addr;
+  assign trace_chunks_o        = hit_trace.chunks;
+  assign trace_valid_chunks_o  = hit_trace.valid_chunks;
+  assign trace_branch_flags_o  = hit_trace.branch_flags;
+  assign trace_num_branches_o  = hit_trace.num_branches;
   assign trace_taken_targets_o = hit_trace.taken_targets;
   assign trace_num_taken_o     = hit_trace.num_taken;
 
-  logic [TRACE_LEN_WIDTH-1:0] instr_count;
-  always_comb begin
-    instr_count = '0;
-    for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
-      if (hit_trace.valid_chunks[i] && instr_count < TRACE_LEN_WIDTH'(TRACE_LEN))
-        instr_count = instr_count + 1;
-    end
-  end
-  assign trace_length_o = trace_hit ? instr_count : '0;
-
+  // Reconstruct instructions from 16-bit chunks.
+  // For a 32-bit instruction, valid_chunks[k]=1 on the low half and valid_chunks[k+1]=0 on the high half.
+  logic [TRACE_LEN_WIDTH-1:0] trace_instr_count;
   always_comb begin
     int instr_idx;
     int chunk_idx;
+    logic [15:0] low16;
+
     trace_instructions_o = '0;
+    trace_instr_count    = '0;
+
     instr_idx = 0;
     chunk_idx = 0;
-    while (chunk_idx < CHUNKS_PER_TRACE && instr_idx < TRACE_LEN) begin
-      if (hit_trace.valid_chunks[chunk_idx]) begin
-        if (chunk_idx + 1 < CHUNKS_PER_TRACE && !hit_trace.valid_chunks[chunk_idx + 1]) begin
-          trace_instructions_o[instr_idx] = {hit_trace.chunks[chunk_idx + 1],
-                                             hit_trace.chunks[chunk_idx]};
+
+    while ((chunk_idx < CHUNKS_PER_TRACE) && (instr_idx < TRACE_LEN)) begin
+      if (!hit_trace.valid_chunks[chunk_idx]) begin
+        chunk_idx++;
+      end else begin
+        low16 = hit_trace.chunks[chunk_idx];
+
+        // 32-bit instruction
+        if ((low16[1:0] == 2'b11) &&
+            (chunk_idx + 1 < CHUNKS_PER_TRACE) &&
+            (hit_trace.valid_chunks[chunk_idx + 1] === 1'b0)) begin
+          trace_instructions_o[instr_idx] = {hit_trace.chunks[chunk_idx + 1], low16};
+          instr_idx++;
           chunk_idx += 2;
-        end else begin
-          trace_instructions_o[instr_idx] = {16'b0, hit_trace.chunks[chunk_idx]};
+        end
+        // 16-bit compressed instruction
+        else begin
+          trace_instructions_o[instr_idx] = {16'b0, low16};
+          instr_idx++;
           chunk_idx += 1;
         end
-        instr_idx++;
-      end else begin
-        chunk_idx++;
       end
     end
+
+    trace_instr_count = TRACE_LEN_WIDTH'(instr_idx);
   end
 
+  assign trace_length_o = trace_hit ? trace_instr_count : '0;
+
   // Reconstruct PCs from base_pc, expanded instructions, and branch_flags.
-  // Instead of trying to recompute taken targets from the instruction type,
-  // use the ordered taken_targets[] list directly.
   logic [TRACE_LEN-1:0][PC_WIDTH-1:0] computed_pcs;
   always_comb begin
-    logic [PC_WIDTH-1:0]     pc;
-    logic [INSTR_WIDTH-1:0]  instr;
-    logic                    is_rvc, is_cf, taken;
-    int                      br_idx;
-    int                      taken_idx;
+    logic [PC_WIDTH-1:0]    pc;
+    logic [INSTR_WIDTH-1:0] instr;
+    logic                   is_rvc, is_cf, taken;
+    int                     br_idx;
+    int                     taken_idx;
 
-    for (int j = 0; j < TRACE_LEN; j++) trace_pcs_o[j] = '0;
+    computed_pcs = '0;
+    trace_pcs_o  = '0;
 
     if (!trace_hit) begin
       pc        = '0;
@@ -376,12 +384,11 @@ module trace_cache_top #(
       taken_idx = 0;
 
       for (int i = 0; i < TRACE_LEN; i++) begin
-        if (i >= int'(instr_count)) break;
+        if (i >= int'(trace_instr_count)) break;
 
         instr  = trace_instructions_o[i];
         is_rvc = (instr[1:0] != 2'b11);
 
-        // Count control-flow instructions in the same order as the trace was built.
         is_cf  = (!is_rvc && (instr[6:0] == OpcodeBranch ||
                               instr[6:0] == OpcodeJal    ||
                               instr[6:0] == OpcodeJalr))
@@ -411,7 +418,7 @@ module trace_cache_top #(
       end
 
       for (int j = 0; j < TRACE_LEN; j++)
-        trace_pcs_o[j] = (j < int'(instr_count)) ? computed_pcs[j] : '0;
+        trace_pcs_o[j] = (j < int'(trace_instr_count)) ? computed_pcs[j] : '0;
     end
   end
 
@@ -480,7 +487,8 @@ module trace_cache_top #(
           if (trace_read[w].valid && !pc_match[w])
             $display("[TC-LOOKUP] lookup PC 0x%h missed (way %0d had base_pc 0x%h)",
                      lookup_pc_q, w, trace_read[w].base_pc);
-          else if (trace_read[w].valid && pc_match[w] && (!branch_count_match[w] || !branch_flags_match[w]))
+          else if (trace_read[w].valid && pc_match[w] &&
+                   (!branch_count_match[w] || !branch_flags_match[w]))
             $display("[TC-LOOKUP] BR MISS at 0x%h (way %0d): stored=%b lookup=%b stored_num=%0d lookup_num=%0d",
                      lookup_pc_q, w, trace_read[w].lookup_branch_flags,
                      branch_predictions_q, trace_read[w].lookup_num_branches, lookup_num_branches_q);
@@ -520,4 +528,5 @@ module trace_cache_top #(
     `endif
   end
 `endif
+
 endmodule
