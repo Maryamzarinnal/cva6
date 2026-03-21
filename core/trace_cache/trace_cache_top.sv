@@ -179,8 +179,9 @@ module trace_cache_top #(
   assign lookup_fire           = lookup_valid_i && !mem_req_builder;
   assign lookup_result_valid_o = lookup_valid_q;
 
+  // IMPORTANT: exact trace-start PC, not a 16-byte aligned block base.
   logic [PC_WIDTH-1:0] lookup_base;
-  assign lookup_base = pc_align_16(lookup_pc_i);
+  assign lookup_base = lookup_pc_i;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -288,7 +289,7 @@ module trace_cache_top #(
     any_valid_in_set    = 1'b0;
     any_pc_match_in_set = 1'b0;
     for (int w = 0; w < NUM_WAYS; w++) begin
-      if (way_valid[w])           any_valid_in_set    = 1'b1;
+      if (way_valid[w])                any_valid_in_set    = 1'b1;
       if (way_valid[w] && pc_match[w]) any_pc_match_in_set = 1'b1;
     end
   end
@@ -362,7 +363,7 @@ module trace_cache_top #(
 
   assign trace_length_o = trace_hit ? trace_instr_count : '0;
 
-  // Reconstruct PCs from base_pc, expanded instructions, and branch_flags.
+  // Reconstruct PCs from exact start PC, expanded instructions, and branch_flags.
   logic [TRACE_LEN-1:0][PC_WIDTH-1:0] computed_pcs;
   always_comb begin
     logic [PC_WIDTH-1:0]    pc;

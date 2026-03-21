@@ -64,15 +64,15 @@ module trace_builder #(
   logic [CHUNKS_PER_TRACE-1:0] dup_flags [(1 << TRACE_ADDRW)];
   logic [BR_CNT_WIDTH-1:0]     dup_num_branches [(1 << TRACE_ADDRW)];
 
-  assign instr_i.ready = 1'b1;
-  assign mem_req_o     = commit_valid_q;
-  assign mem_we_o      = commit_valid_q;
-  assign mem_addr_o    = sram_wr_addr_q;
-  assign mem_wdata_o   = commit_data_q;
-  assign mem_be_o      = {BE_WIDTH{1'b1}};
-  assign mem_branch_pcs_o = commit_branch_pcs_q;
-  assign trace_valid_o = commit_valid_q;
-  assign trace_data_o  = commit_data_q;
+  assign instr_i.ready      = 1'b1;
+  assign mem_req_o          = commit_valid_q;
+  assign mem_we_o           = commit_valid_q;
+  assign mem_addr_o         = sram_wr_addr_q;
+  assign mem_wdata_o        = commit_data_q;
+  assign mem_be_o           = {BE_WIDTH{1'b1}};
+  assign mem_branch_pcs_o   = commit_branch_pcs_q;
+  assign trace_valid_o      = commit_valid_q;
+  assign trace_data_o       = commit_data_q;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -193,11 +193,14 @@ module trace_builder #(
               last_instr_compressed_d = 1'b0;
               last_instr_was_taken_d  = 1'b0;
 
-              trace_d.base_pc = pc_align_16(instr_i.pc[0]);
-
               for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
                 if (instr_i.valid[i] && (CHUNK_PTR_W'(i) <= branch_slot) &&
                     (temp_start_cnt < START_CNT_W'(MAX_INSTR_PER_TRACE))) begin
+
+                  // Exact start PC of the trace = first instruction we actually store.
+                  if (temp_start_cnt == 0)
+                    trace_d.base_pc = instr_i.pc[i];
+
                   is_compressed = (instr_i.inst[i][1:0] != 2'b11);
 
                   last_instr_pc_d         = instr_i.pc[i];
