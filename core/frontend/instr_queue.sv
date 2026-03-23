@@ -136,6 +136,11 @@ module instr_queue
   // Selected predict address for each issue port (from per-slot FIFOs)
   logic [CVA6Cfg.NrIssuePorts-1:0][CVA6Cfg.VLEN-1:0] selected_predict_addr;
 
+  // Rising-edge detect for no_branch_mask_i (TC feeding start)
+  logic no_branch_mask_q;
+  logic no_branch_mask_rising;
+  assign no_branch_mask_rising = no_branch_mask_i & ~no_branch_mask_q;
+
   logic [CVA6Cfg.INSTR_PER_FETCH*2-2:0] branch_mask_extended;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] branch_mask;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] taken;
@@ -483,6 +488,13 @@ module instr_queue
       pc_d = addr_i[0];
       reset_address_d = 1'b0;
     end
+
+    // TC feeding start: sync pc_q to the trace's starting PC.
+    // The FIFO has 1-cycle latency, so pc_q will be correct by the
+    // time the first TC instruction is popped by the downstream.
+    if (no_branch_mask_rising && valid_i[0]) begin
+      pc_d = addr_i[0];
+    end
   end
 
   // FIFOs
@@ -557,13 +569,15 @@ module instr_queue
   if (CVA6Cfg.RVC) begin : gen_pc_q_with_c
     always_ff @(posedge clk_i or negedge rst_ni) begin
       if (!rst_ni) begin
-        idx_ds_q        <= 'b1;
-        idx_is_q        <= '0;
-        pc_q            <= '0;
-        reset_address_q <= 1'b1;
+        idx_ds_q          <= 'b1;
+        idx_is_q          <= '0;
+        pc_q              <= '0;
+        reset_address_q   <= 1'b1;
+        no_branch_mask_q  <= 1'b0;
       end else begin
-        pc_q            <= pc_d;
-        reset_address_q <= reset_address_d;
+        pc_q              <= pc_d;
+        reset_address_q   <= reset_address_d;
+        no_branch_mask_q  <= no_branch_mask_i;
         if (flush_i) begin
           // one-hot encoded
           idx_ds_q        <= 'b1;
@@ -581,11 +595,13 @@ module instr_queue
     assign idx_is_q = '0;
     always_ff @(posedge clk_i or negedge rst_ni) begin
       if (!rst_ni) begin
-        pc_q            <= '0;
-        reset_address_q <= 1'b1;
+        pc_q              <= '0;
+        reset_address_q   <= 1'b1;
+        no_branch_mask_q  <= 1'b0;
       end else begin
-        pc_q            <= pc_d;
-        reset_address_q <= reset_address_d;
+        pc_q              <= pc_d;
+        reset_address_q   <= reset_address_d;
+        no_branch_mask_q  <= no_branch_mask_i;
         if (flush_i) begin
           reset_address_q <= 1'b1;
         end
