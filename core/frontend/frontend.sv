@@ -848,6 +848,8 @@ module frontend
   int unsigned      tc_use_taken_hist [0:MAX_TAKEN];
   int unsigned      tc_hit_branch_hist [0:CHUNKS_PER_TRACE];
   int unsigned      tc_use_branch_hist [0:CHUNKS_PER_TRACE];
+  longint unsigned  tc_replay_seq_q, tc_replay_active_id_q;
+  int unsigned      tc_replay_cycle_count_q;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -893,8 +895,21 @@ module frontend
         tc_hit_branch_hist[i] <= 0;
         tc_use_branch_hist[i] <= 0;
       end
+      tc_replay_seq_q         <= 0;
+      tc_replay_active_id_q   <= 0;
+      tc_replay_cycle_count_q <= 0;
     end else begin
       tc_total_cycles_q <= tc_total_cycles_q + 1;
+
+      if (tc_feeding_start) begin
+        tc_replay_seq_q         <= tc_replay_seq_q + 1;
+        tc_replay_active_id_q   <= tc_replay_seq_q + 1;
+        tc_replay_cycle_count_q <= 0;
+      end else if (tc_feeding_q) begin
+        tc_replay_cycle_count_q <= tc_replay_cycle_count_q + 1;
+      end else begin
+        tc_replay_cycle_count_q <= 0;
+      end
 
       if (pc_commit_i == TC_BENCH_START_PC) begin
         tc_bench_active_q <= 1'b1;
@@ -997,10 +1012,69 @@ module frontend
     end
   end
 
+  `ifdef TRACE_CACHE_DEBUG_EVENTS
+  always_ff @(posedge clk_i) begin
+    if (tc_feeding_start) begin
+      $display("[TC-USE] id=%0d lookup_pc=0x%h start_pc=0x%h len=%0d branches=%0d taken=%0d next_pc=0x%h",
+               tc_replay_seq_q + 1, tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
+               tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
+      for (int i = 0; i < int'(tc_trace_length); i++) begin
+        $display("[TC-USE] id=%0d slot[%0d] pc=0x%h instr=0x%08h cf=%0d",
+                 tc_replay_seq_q + 1, i, tc_trace_pcs[i], tc_trace_instructions[i],
+                 tc_replay_cf_type(tc_trace_instructions[i]));
+      end
+      for (int i = 0; i < int'(tc_trace_num_taken); i++) begin
+        $display("[TC-USE] id=%0d taken_target[%0d]=0x%h",
+                 tc_replay_seq_q + 1, i, tc_trace_taken_targets[i]);
+      end
+    end
+
+    if (tc_feeding_done && tc_feeding_q) begin
+      $display("[TC-USE-END] id=%0d next_fetch_pc=0x%h feed_cycles=%0d replayed_instr=%0d",
+               tc_replay_active_id_q, tc_feeding_next_pc_q,
+               tc_replay_cycle_count_q + 1, tc_feeding_len_q);
+    end
+  end
+  `endif
+
+  `ifdef TRACE_CACHE_DEBUG_REJECTS
+  always_ff @(posedge clk_i) begin
+    if (tc_active_hit && !tc_active_use) begin
+      if (!tc_trace_starts_ok) begin
+        $display("[TC-REJECT] lookup_pc=0x%h start_pc=0x%h reason=bad_start len=%0d branches=%0d taken=%0d next_pc=0x%h",
+                 tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
+                 tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
+      end else if (tc_trace_num_taken != TAKEN_CNT_WIDTH'(1)) begin
+        $display("[TC-REJECT] lookup_pc=0x%h start_pc=0x%h reason=num_taken len=%0d branches=%0d taken=%0d next_pc=0x%h",
+                 tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
+                 tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
+      end else if (!tc_trace_last_is_taken_cf) begin
+        $display("[TC-REJECT] lookup_pc=0x%h start_pc=0x%h reason=last_not_taken_cf len=%0d branches=%0d taken=%0d next_pc=0x%h",
+                 tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
+                 tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
+      end else if (tc_feeding_q) begin
+        $display("[TC-REJECT] lookup_pc=0x%h start_pc=0x%h reason=busy len=%0d branches=%0d taken=%0d next_pc=0x%h",
+                 tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
+                 tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
+      end else if (tc_trace_pcs[0] < PC_WIDTH'(64'h80001000)) begin
+        $display("[TC-REJECT] lookup_pc=0x%h start_pc=0x%h reason=low_pc len=%0d branches=%0d taken=%0d next_pc=0x%h",
+                 tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
+                 tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
+      end else begin
+        $display("[TC-REJECT] lookup_pc=0x%h start_pc=0x%h reason=other len=%0d branches=%0d taken=%0d next_pc=0x%h",
+                 tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
+                 tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
+      end
+    end
+  end
+  `endif
+
   final begin
     int unsigned tc_hit_rate_pct, tc_active_use_rate_pct, tc_feed_cycle_pct;
     int unsigned tc_hit_br_ge4, tc_use_br_ge4;
     int unsigned tc_bench_hit_rate_pct, tc_bench_use_rate_pct, tc_bench_feed_pct;
+    int unsigned tc_avg_instr_per_use_x100, tc_avg_cycles_per_use_x100, tc_avg_instr_per_feed_cycle_x100;
+    int unsigned tc_bench_avg_instr_per_use_x100, tc_bench_avg_cycles_per_use_x100, tc_bench_avg_instr_per_feed_cycle_x100;
 
     tc_hit_br_ge4 = 0;
     tc_use_br_ge4 = 0;
@@ -1015,6 +1089,12 @@ module frontend
     tc_bench_hit_rate_pct  = (tc_bench_lookup_total > 0) ? ((tc_bench_lookup_hits * 100) / tc_bench_lookup_total) : 0;
     tc_bench_use_rate_pct  = (tc_bench_active_hits > 0) ? ((tc_bench_active_uses * 100) / tc_bench_active_hits) : 0;
     tc_bench_feed_pct      = (tc_bench_cycles_q > 0) ? ((int'(tc_bench_feed_cycles_q) * 100) / int'(tc_bench_cycles_q)) : 0;
+    tc_avg_instr_per_use_x100        = (tc_feed_starts_total > 0) ? ((tc_feed_instr_total * 100) / tc_feed_starts_total) : 0;
+    tc_avg_cycles_per_use_x100       = (tc_feed_starts_total > 0) ? ((tc_feed_cycles_total * 100) / tc_feed_starts_total) : 0;
+    tc_avg_instr_per_feed_cycle_x100 = (tc_feed_cycles_total > 0) ? ((tc_feed_instr_total * 100) / tc_feed_cycles_total) : 0;
+    tc_bench_avg_instr_per_use_x100        = (tc_bench_active_uses > 0) ? ((tc_bench_feed_instr_total * 100) / tc_bench_active_uses) : 0;
+    tc_bench_avg_cycles_per_use_x100       = (tc_bench_active_uses > 0) ? ((int'(tc_bench_feed_cycles_q) * 100) / tc_bench_active_uses) : 0;
+    tc_bench_avg_instr_per_feed_cycle_x100 = (tc_bench_feed_cycles_q > 0) ? ((tc_bench_feed_instr_total * 100) / int'(tc_bench_feed_cycles_q)) : 0;
 
     $display("[TC-FRONT] ===== Frontend / replay summary =====");
     $display("[TC-FRONT] lookups=%0d hits=%0d misses=%0d hit_rate=%0d%%",
@@ -1024,6 +1104,10 @@ module frontend
     $display("[TC-FRONT] feed_starts=%0d completed_feeds=%0d replayed_instr=%0d feed_cycles=%0d (%0d%% of full run)",
              tc_feed_starts_total, tc_feeds_completed, tc_feed_instr_total,
              tc_feed_cycles_total, tc_feed_cycle_pct);
+    $display("[TC-FRONT] replay_efficiency: instr_per_use=%0d.%02d cycles_per_use=%0d.%02d instr_per_feed_cycle=%0d.%02d",
+             tc_avg_instr_per_use_x100/100, tc_avg_instr_per_use_x100%100,
+             tc_avg_cycles_per_use_x100/100, tc_avg_cycles_per_use_x100%100,
+             tc_avg_instr_per_feed_cycle_x100/100, tc_avg_instr_per_feed_cycle_x100%100);
     $display("[TC-FRONT] miss_breakdown: empty=%0d pc=%0d path=%0d",
              tc_miss_empty_total, tc_miss_pc_total, tc_miss_path_total);
     $display("[TC-FRONT] active_hit_rejects: bad_start=%0d num_taken!=1=%0d last_not_taken_cf=%0d busy=%0d low_pc=%0d other=%0d",
@@ -1053,6 +1137,10 @@ module frontend
     $display("[BENCH-TC] active_hits=%0d active_uses=%0d use_rate=%0d%% replayed_instr=%0d feed_cycles=%0d (%0d%% of bench window)",
              tc_bench_active_hits, tc_bench_active_uses, tc_bench_use_rate_pct,
              tc_bench_feed_instr_total, tc_bench_feed_cycles_q, tc_bench_feed_pct);
+    $display("[BENCH-TC] replay_efficiency: instr_per_use=%0d.%02d cycles_per_use=%0d.%02d instr_per_feed_cycle=%0d.%02d",
+             tc_bench_avg_instr_per_use_x100/100, tc_bench_avg_instr_per_use_x100%100,
+             tc_bench_avg_cycles_per_use_x100/100, tc_bench_avg_cycles_per_use_x100%100,
+             tc_bench_avg_instr_per_feed_cycle_x100/100, tc_bench_avg_instr_per_feed_cycle_x100%100);
   end
 // pragma translate_on
 `endif

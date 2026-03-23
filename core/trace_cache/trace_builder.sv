@@ -123,6 +123,8 @@ module trace_builder #(
   int unsigned tc_stat_commit_len_hist    [0:TRACE_LEN];
   int unsigned tc_stat_commit_taken_hist  [0:MAX_TAKEN];
   int unsigned tc_stat_commit_branch_hist [0:CHUNKS_PER_TRACE];
+  longint unsigned tc_stat_commit_seq_q;
+  longint unsigned tc_stat_last_commit_seq_q;
 // pragma translate_on
 `endif
 
@@ -507,6 +509,8 @@ module trace_builder #(
       end
       for (int i = 0; i <= CHUNKS_PER_TRACE; i++)
         tc_stat_commit_branch_hist[i] <= 0;
+      tc_stat_commit_seq_q      <= 0;
+      tc_stat_last_commit_seq_q <= 0;
     end else begin
       if (|instr_i.consumed) begin
         tc_stat_windows_total <= tc_stat_windows_total + 1;
@@ -539,6 +543,8 @@ module trace_builder #(
 
         if (commit_valid_d) begin
           tc_stat_trace_commits <= tc_stat_trace_commits + 1;
+          tc_stat_commit_seq_q  <= tc_stat_commit_seq_q + 1;
+          tc_stat_last_commit_seq_q <= tc_stat_commit_seq_q + 1;
           tc_stat_commit_len_hist[int'(stats_finalize_instrs_d)] <=
             tc_stat_commit_len_hist[int'(stats_finalize_instrs_d)] + 1;
           tc_stat_commit_taken_hist[int'(stats_finalize_taken_d)] <=
@@ -591,6 +597,31 @@ module trace_builder #(
     $display("[TC-BUILD] =================================");
   end
 // pragma translate_on
+
+  `ifdef TRACE_CACHE_DEBUG_EVENTS
+  always_ff @(posedge clk_i) begin
+    if (commit_valid_q) begin
+      trace_data_t dbg;
+      dbg = trace_data_t'(commit_data_q);
+      $display("[TC-REC] id=%0d base_pc=0x%h len=%0d branches=%0d taken=%0d next_pc=0x%h set=%0d flags=%b",
+               tc_stat_last_commit_seq_q, dbg.base_pc,
+               ((dbg.valid_chunks[0] ? 1 : 0) + (dbg.valid_chunks[1] ? 1 : 0) +
+                (dbg.valid_chunks[2] ? 1 : 0) + (dbg.valid_chunks[3] ? 1 : 0) +
+                (dbg.valid_chunks[4] ? 1 : 0) + (dbg.valid_chunks[5] ? 1 : 0) +
+                (dbg.valid_chunks[6] ? 1 : 0) + (dbg.valid_chunks[7] ? 1 : 0)),
+               dbg.num_branches, dbg.num_taken, dbg.target_addr, sram_wr_addr_q,
+               dbg.lookup_branch_flags);
+      for (int i = 0; i < int'(dbg.num_branches); i++) begin
+        $display("[TC-REC] id=%0d branch[%0d]_pc=0x%h stored_taken=%0b",
+                 tc_stat_last_commit_seq_q, i, commit_branch_pcs_q[i], dbg.branch_flags[i]);
+      end
+      for (int i = 0; i < int'(dbg.num_taken); i++) begin
+        $display("[TC-REC] id=%0d taken_target[%0d]=0x%h",
+                 tc_stat_last_commit_seq_q, i, dbg.taken_targets[i]);
+      end
+    end
+  end
+  `endif
 
   `ifdef TRACE_CACHE_DEBUG_VERBOSE
   always_ff @(posedge clk_i) begin
