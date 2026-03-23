@@ -702,7 +702,8 @@ module frontend
       .replay_addr_o      (replay_addr),
       .fetch_entry_o      (fetch_entry_o),
       .fetch_entry_valid_o(fetch_entry_valid_o),
-      .fetch_entry_ready_i(fetch_entry_ready_i)
+      .fetch_entry_ready_i(fetch_entry_ready_i),
+      .no_branch_mask_i   (tc_feeding_q)
   );
 
   // -----------------------------------------------------------------------

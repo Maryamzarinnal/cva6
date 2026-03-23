@@ -84,8 +84,11 @@ module instr_queue
     output fetch_entry_t [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_o,
     // Handshake?s valid with ID_STAGE - ID_STAGE
     output logic [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_valid_o,
-    // Handshake?s ready with ID_STAGE - ID_STAGE
-    input logic [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_ready_i
+    // Handshake's ready with ID_STAGE - ID_STAGE
+    input logic [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_ready_i,
+    // Disable branch mask: when high, don't kill post-branch instructions
+    // (used by trace cache feeding where post-branch instrs are from the correct path)
+    input logic no_branch_mask_i
 );
 
   // Calculate next index based on whether superscalar is enabled or not.
@@ -181,7 +184,9 @@ module instr_queue
     assign branch_mask = branch_mask_extended[CVA6Cfg.INSTR_PER_FETCH * 2 - 2:CVA6Cfg.INSTR_PER_FETCH - 1];
 
     // mask with taken branches to get the actual amount of instructions we want to push
-    assign valid = valid_i & branch_mask;
+    // When no_branch_mask_i is asserted (trace cache feeding), skip masking:
+    // post-branch instructions are from the correct path, not a wrong path.
+    assign valid = no_branch_mask_i ? valid_i : (valid_i & branch_mask);
     // rotate right again
     assign consumed_extended = {push_instr_fifo, push_instr_fifo} >> idx_is_q;
     assign consumed_o = consumed_extended[CVA6Cfg.INSTR_PER_FETCH-1:0];
