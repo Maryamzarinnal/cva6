@@ -70,6 +70,10 @@ module trace_cache_top #(
   output logic [31:0]                                 tc_miss_path_o
 );
 
+`ifndef SYNTHESIS
+  initial $display("[TC-TOP-VERSION] 2026-03-23-stats-v3-runtime-summary");
+`endif
+
   initial assert (MaxTraceInstr <= TRACE_LEN)
     else $fatal(1, "trace_cache_top: MaxTraceInstr (%0d) must be <= TRACE_LEN (%0d)", MaxTraceInstr, TRACE_LEN);
 

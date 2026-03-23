@@ -825,6 +825,7 @@ module frontend
 
 `ifndef SYNTHESIS
 // pragma translate_off
+  initial $display("[TC-FRONT-VERSION] 2026-03-23-stats-v3-runtime-summary");
   localparam logic [63:0] TC_BENCH_START_PC = 64'h80001568;
   localparam logic [63:0] TC_BENCH_END_PC   = 64'h80001576;
 
@@ -916,15 +917,128 @@ module frontend
         tc_bench_done_q   <= 1'b0;
       end
       if ((pc_commit_i == TC_BENCH_END_PC) && !tc_bench_done_q) begin
+        int unsigned tc_commit_br_ge4;
+        int unsigned tc_use_br_ge4;
         tc_bench_active_q <= 1'b0;
         tc_bench_done_q   <= 1'b1;
+
+        tc_commit_br_ge4 = i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[4]
+                         + i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[5]
+                         + i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[6]
+                         + i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[7]
+                         + i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[8];
+        tc_use_br_ge4    = tc_use_branch_hist[4]
+                         + tc_use_branch_hist[5]
+                         + tc_use_branch_hist[6]
+                         + tc_use_branch_hist[7]
+                         + tc_use_branch_hist[8];
+
         $display("\n[BENCH-TC] === Trace Cache (CoreMark only) ===");
         $display("[BENCH-TC] lookups=%0d hits=%0d misses=%0d hit_rate=%0d%%",
                  tc_bench_lookup_total, tc_bench_lookup_hits, tc_bench_lookup_misses,
                  (tc_bench_lookup_total > 0) ? ((tc_bench_lookup_hits * 100) / tc_bench_lookup_total) : 0);
-        $display("[BENCH-TC] active_hits=%0d active_uses=%0d feed_cycles=%0d replayed_instr=%0d",
-                 tc_bench_active_hits, tc_bench_active_uses, tc_bench_feed_cycles_q, tc_bench_feed_instr_total);
-        $display("[BENCH-TC] bench_cycles=%0d", tc_bench_cycles_q);
+        $display("[BENCH-TC] active_hits=%0d active_uses=%0d use_rate=%0d%% replayed_instr=%0d feed_cycles=%0d (%0d%% of bench window)",
+                 tc_bench_active_hits, tc_bench_active_uses,
+                 (tc_bench_active_hits > 0) ? ((tc_bench_active_uses * 100) / tc_bench_active_hits) : 0,
+                 tc_bench_feed_instr_total, tc_bench_feed_cycles_q,
+                 (tc_bench_cycles_q > 0) ? ((int'(tc_bench_feed_cycles_q) * 100) / int'(tc_bench_cycles_q)) : 0);
+        $display("[BENCH-TC] bench_cycles=%0d replay_efficiency: instr_per_use=%0d.%02d cycles_per_use=%0d.%02d instr_per_feed_cycle=%0d.%02d",
+                 tc_bench_cycles_q,
+                 ((tc_bench_active_uses > 0) ? ((tc_bench_feed_instr_total * 100) / tc_bench_active_uses) : 0)/100,
+                 ((tc_bench_active_uses > 0) ? ((tc_bench_feed_instr_total * 100) / tc_bench_active_uses) : 0)%100,
+                 ((tc_bench_active_uses > 0) ? ((int'(tc_bench_feed_cycles_q) * 100) / tc_bench_active_uses) : 0)/100,
+                 ((tc_bench_active_uses > 0) ? ((int'(tc_bench_feed_cycles_q) * 100) / tc_bench_active_uses) : 0)%100,
+                 ((tc_bench_feed_cycles_q > 0) ? ((tc_bench_feed_instr_total * 100) / int'(tc_bench_feed_cycles_q)) : 0)/100,
+                 ((tc_bench_feed_cycles_q > 0) ? ((tc_bench_feed_instr_total * 100) / int'(tc_bench_feed_cycles_q)) : 0)%100);
+
+        $display("[TC-FRONT] ===== Frontend / replay summary =====");
+        $display("[TC-FRONT] lookups=%0d hits=%0d misses=%0d hit_rate=%0d%%",
+                 tc_lookup_total, tc_lookup_hits, tc_lookup_misses,
+                 (tc_lookup_total > 0) ? ((tc_lookup_hits * 100) / tc_lookup_total) : 0);
+        $display("[TC-FRONT] active_hits=%0d active_uses=%0d use_rate_from_active_hits=%0d%%",
+                 tc_active_hit_total, tc_active_use_total,
+                 (tc_active_hit_total > 0) ? ((tc_active_use_total * 100) / tc_active_hit_total) : 0);
+        $display("[TC-FRONT] feed_starts=%0d completed_feeds=%0d replayed_instr=%0d feed_cycles=%0d (%0d%% of full run)",
+                 tc_feed_starts_total, tc_feeds_completed, tc_feed_instr_total,
+                 tc_feed_cycles_total,
+                 (tc_total_cycles_q > 0) ? ((int'(tc_feed_cycles_total) * 100) / int'(tc_total_cycles_q)) : 0);
+        $display("[TC-FRONT] replay_efficiency: instr_per_use=%0d.%02d cycles_per_use=%0d.%02d instr_per_feed_cycle=%0d.%02d",
+                 ((tc_feed_starts_total > 0) ? ((tc_feed_instr_total * 100) / tc_feed_starts_total) : 0)/100,
+                 ((tc_feed_starts_total > 0) ? ((tc_feed_instr_total * 100) / tc_feed_starts_total) : 0)%100,
+                 ((tc_feed_starts_total > 0) ? ((tc_feed_cycles_total * 100) / tc_feed_starts_total) : 0)/100,
+                 ((tc_feed_starts_total > 0) ? ((tc_feed_cycles_total * 100) / tc_feed_starts_total) : 0)%100,
+                 ((tc_feed_cycles_total > 0) ? ((tc_feed_instr_total * 100) / tc_feed_cycles_total) : 0)/100,
+                 ((tc_feed_cycles_total > 0) ? ((tc_feed_instr_total * 100) / tc_feed_cycles_total) : 0)%100);
+        $display("[TC-FRONT] miss_breakdown: empty=%0d pc=%0d path=%0d",
+                 tc_miss_empty_total, tc_miss_pc_total, tc_miss_path_total);
+        $display("[TC-FRONT] active_hit_rejects: bad_start=%0d num_taken!=1=%0d last_not_taken_cf=%0d busy=%0d low_pc=%0d other=%0d",
+                 tc_reject_bad_start, tc_reject_num_taken, tc_reject_last_taken_cf,
+                 tc_reject_busy, tc_reject_low_pc, tc_reject_other);
+        $display("[TC-FRONT] hit_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
+                 tc_hit_len_hist[1], tc_hit_len_hist[2], tc_hit_len_hist[3], tc_hit_len_hist[4]);
+        $display("[TC-FRONT] used_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
+                 tc_use_len_hist[1], tc_use_len_hist[2], tc_use_len_hist[3], tc_use_len_hist[4]);
+        $display("[TC-FRONT] hit_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
+                 tc_hit_taken_hist[0], tc_hit_taken_hist[1], tc_hit_taken_hist[2],
+                 tc_hit_taken_hist[3], tc_hit_taken_hist[4]);
+        $display("[TC-FRONT] used_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
+                 tc_use_taken_hist[0], tc_use_taken_hist[1], tc_use_taken_hist[2],
+                 tc_use_taken_hist[3], tc_use_taken_hist[4]);
+        $display("[TC-FRONT] hit_branch_hist: B0=%0d B1=%0d B2=%0d B3=%0d B4plus=%0d",
+                 tc_hit_branch_hist[0], tc_hit_branch_hist[1], tc_hit_branch_hist[2],
+                 tc_hit_branch_hist[3], tc_hit_branch_hist[4] + tc_hit_branch_hist[5] + tc_hit_branch_hist[6] + tc_hit_branch_hist[7] + tc_hit_branch_hist[8]);
+        $display("[TC-FRONT] used_branch_hist: B0=%0d B1=%0d B2=%0d B3=%0d B4plus=%0d",
+                 tc_use_branch_hist[0], tc_use_branch_hist[1], tc_use_branch_hist[2],
+                 tc_use_branch_hist[3], tc_use_br_ge4);
+        $display("[TC-FRONT] =====================================");
+
+        $display("[TC-BUILD] ===== Trace builder summary =====");
+        $display("[TC-BUILD] windows total=%0d aligned=%0d unaligned=%0d unaligned_with_taken=%0d",
+                 i_trace_cache_top.i_trace_builder.tc_stat_windows_total,
+                 i_trace_cache_top.i_trace_builder.tc_stat_windows_aligned,
+                 i_trace_cache_top.i_trace_builder.tc_stat_windows_unaligned,
+                 i_trace_cache_top.i_trace_builder.tc_stat_windows_unaligned_with_taken);
+        $display("[TC-BUILD] windows_with_taken=%0d trace_start_windows=%0d",
+                 i_trace_cache_top.i_trace_builder.tc_stat_windows_with_taken,
+                 i_trace_cache_top.i_trace_builder.tc_stat_trace_start_windows);
+        $display("[TC-BUILD] finalize_attempts=%0d committed=%0d duplicate_dropped=%0d indirect_dropped=%0d",
+                 i_trace_cache_top.i_trace_builder.tc_stat_trace_finalize_attempts,
+                 i_trace_cache_top.i_trace_builder.tc_stat_trace_commits,
+                 i_trace_cache_top.i_trace_builder.tc_stat_trace_dup_drops,
+                 i_trace_cache_top.i_trace_builder.tc_stat_trace_indirect_drops);
+        $display("[TC-BUILD] end_reasons: full=%0d max_instr=%0d max_taken=%0d",
+                 i_trace_cache_top.i_trace_builder.tc_stat_trace_end_full,
+                 i_trace_cache_top.i_trace_builder.tc_stat_trace_end_max_instr,
+                 i_trace_cache_top.i_trace_builder.tc_stat_trace_end_max_taken);
+        $display("[TC-BUILD] attempted_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
+                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_len_hist[1],
+                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_len_hist[2],
+                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_len_hist[3],
+                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_len_hist[4]);
+        $display("[TC-BUILD] attempted_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
+                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_taken_hist[0],
+                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_taken_hist[1],
+                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_taken_hist[2],
+                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_taken_hist[3],
+                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_taken_hist[4]);
+        $display("[TC-BUILD] committed_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
+                 i_trace_cache_top.i_trace_builder.tc_stat_commit_len_hist[1],
+                 i_trace_cache_top.i_trace_builder.tc_stat_commit_len_hist[2],
+                 i_trace_cache_top.i_trace_builder.tc_stat_commit_len_hist[3],
+                 i_trace_cache_top.i_trace_builder.tc_stat_commit_len_hist[4]);
+        $display("[TC-BUILD] committed_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
+                 i_trace_cache_top.i_trace_builder.tc_stat_commit_taken_hist[0],
+                 i_trace_cache_top.i_trace_builder.tc_stat_commit_taken_hist[1],
+                 i_trace_cache_top.i_trace_builder.tc_stat_commit_taken_hist[2],
+                 i_trace_cache_top.i_trace_builder.tc_stat_commit_taken_hist[3],
+                 i_trace_cache_top.i_trace_builder.tc_stat_commit_taken_hist[4]);
+        $display("[TC-BUILD] committed_branch_hist: B0=%0d B1=%0d B2=%0d B3=%0d B4plus=%0d",
+                 i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[0],
+                 i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[1],
+                 i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[2],
+                 i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[3],
+                 tc_commit_br_ge4);
+        $display("[TC-BUILD] =================================");
       end
 
       if (tc_bench_active_q)
@@ -1069,79 +1183,7 @@ module frontend
   end
   `endif
 
-  final begin
-    int unsigned tc_hit_rate_pct, tc_active_use_rate_pct, tc_feed_cycle_pct;
-    int unsigned tc_hit_br_ge4, tc_use_br_ge4;
-    int unsigned tc_bench_hit_rate_pct, tc_bench_use_rate_pct, tc_bench_feed_pct;
-    int unsigned tc_avg_instr_per_use_x100, tc_avg_cycles_per_use_x100, tc_avg_instr_per_feed_cycle_x100;
-    int unsigned tc_bench_avg_instr_per_use_x100, tc_bench_avg_cycles_per_use_x100, tc_bench_avg_instr_per_feed_cycle_x100;
-
-    tc_hit_br_ge4 = 0;
-    tc_use_br_ge4 = 0;
-    for (int b = 4; b <= CHUNKS_PER_TRACE; b++) begin
-      tc_hit_br_ge4 += tc_hit_branch_hist[b];
-      tc_use_br_ge4 += tc_use_branch_hist[b];
-    end
-
-    tc_hit_rate_pct        = (tc_lookup_total > 0) ? ((tc_lookup_hits * 100) / tc_lookup_total) : 0;
-    tc_active_use_rate_pct = (tc_active_hit_total > 0) ? ((tc_active_use_total * 100) / tc_active_hit_total) : 0;
-    tc_feed_cycle_pct      = (tc_total_cycles_q > 0) ? ((int'(tc_feed_cycles_total) * 100) / int'(tc_total_cycles_q)) : 0;
-    tc_bench_hit_rate_pct  = (tc_bench_lookup_total > 0) ? ((tc_bench_lookup_hits * 100) / tc_bench_lookup_total) : 0;
-    tc_bench_use_rate_pct  = (tc_bench_active_hits > 0) ? ((tc_bench_active_uses * 100) / tc_bench_active_hits) : 0;
-    tc_bench_feed_pct      = (tc_bench_cycles_q > 0) ? ((int'(tc_bench_feed_cycles_q) * 100) / int'(tc_bench_cycles_q)) : 0;
-    tc_avg_instr_per_use_x100        = (tc_feed_starts_total > 0) ? ((tc_feed_instr_total * 100) / tc_feed_starts_total) : 0;
-    tc_avg_cycles_per_use_x100       = (tc_feed_starts_total > 0) ? ((tc_feed_cycles_total * 100) / tc_feed_starts_total) : 0;
-    tc_avg_instr_per_feed_cycle_x100 = (tc_feed_cycles_total > 0) ? ((tc_feed_instr_total * 100) / tc_feed_cycles_total) : 0;
-    tc_bench_avg_instr_per_use_x100        = (tc_bench_active_uses > 0) ? ((tc_bench_feed_instr_total * 100) / tc_bench_active_uses) : 0;
-    tc_bench_avg_cycles_per_use_x100       = (tc_bench_active_uses > 0) ? ((int'(tc_bench_feed_cycles_q) * 100) / tc_bench_active_uses) : 0;
-    tc_bench_avg_instr_per_feed_cycle_x100 = (tc_bench_feed_cycles_q > 0) ? ((tc_bench_feed_instr_total * 100) / int'(tc_bench_feed_cycles_q)) : 0;
-
-    $display("[TC-FRONT] ===== Frontend / replay summary =====");
-    $display("[TC-FRONT] lookups=%0d hits=%0d misses=%0d hit_rate=%0d%%",
-             tc_lookup_total, tc_lookup_hits, tc_lookup_misses, tc_hit_rate_pct);
-    $display("[TC-FRONT] active_hits=%0d active_uses=%0d use_rate_from_active_hits=%0d%%",
-             tc_active_hit_total, tc_active_use_total, tc_active_use_rate_pct);
-    $display("[TC-FRONT] feed_starts=%0d completed_feeds=%0d replayed_instr=%0d feed_cycles=%0d (%0d%% of full run)",
-             tc_feed_starts_total, tc_feeds_completed, tc_feed_instr_total,
-             tc_feed_cycles_total, tc_feed_cycle_pct);
-    $display("[TC-FRONT] replay_efficiency: instr_per_use=%0d.%02d cycles_per_use=%0d.%02d instr_per_feed_cycle=%0d.%02d",
-             tc_avg_instr_per_use_x100/100, tc_avg_instr_per_use_x100%100,
-             tc_avg_cycles_per_use_x100/100, tc_avg_cycles_per_use_x100%100,
-             tc_avg_instr_per_feed_cycle_x100/100, tc_avg_instr_per_feed_cycle_x100%100);
-    $display("[TC-FRONT] miss_breakdown: empty=%0d pc=%0d path=%0d",
-             tc_miss_empty_total, tc_miss_pc_total, tc_miss_path_total);
-    $display("[TC-FRONT] active_hit_rejects: bad_start=%0d num_taken!=1=%0d last_not_taken_cf=%0d busy=%0d low_pc=%0d other=%0d",
-             tc_reject_bad_start, tc_reject_num_taken, tc_reject_last_taken_cf,
-             tc_reject_busy, tc_reject_low_pc, tc_reject_other);
-    $display("[TC-FRONT] hit_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
-             tc_hit_len_hist[1], tc_hit_len_hist[2], tc_hit_len_hist[3], tc_hit_len_hist[4]);
-    $display("[TC-FRONT] used_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
-             tc_use_len_hist[1], tc_use_len_hist[2], tc_use_len_hist[3], tc_use_len_hist[4]);
-    $display("[TC-FRONT] hit_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
-             tc_hit_taken_hist[0], tc_hit_taken_hist[1], tc_hit_taken_hist[2],
-             tc_hit_taken_hist[3], tc_hit_taken_hist[4]);
-    $display("[TC-FRONT] used_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
-             tc_use_taken_hist[0], tc_use_taken_hist[1], tc_use_taken_hist[2],
-             tc_use_taken_hist[3], tc_use_taken_hist[4]);
-    $display("[TC-FRONT] hit_branch_hist: B0=%0d B1=%0d B2=%0d B3=%0d B4plus=%0d",
-             tc_hit_branch_hist[0], tc_hit_branch_hist[1], tc_hit_branch_hist[2],
-             tc_hit_branch_hist[3], tc_hit_br_ge4);
-    $display("[TC-FRONT] used_branch_hist: B0=%0d B1=%0d B2=%0d B3=%0d B4plus=%0d",
-             tc_use_branch_hist[0], tc_use_branch_hist[1], tc_use_branch_hist[2],
-             tc_use_branch_hist[3], tc_use_br_ge4);
-    $display("[TC-FRONT] =====================================");
-
-    $display("[BENCH-TC] bench_cycles=%0d lookups=%0d hits=%0d misses=%0d hit_rate=%0d%%",
-             tc_bench_cycles_q, tc_bench_lookup_total, tc_bench_lookup_hits,
-             tc_bench_lookup_misses, tc_bench_hit_rate_pct);
-    $display("[BENCH-TC] active_hits=%0d active_uses=%0d use_rate=%0d%% replayed_instr=%0d feed_cycles=%0d (%0d%% of bench window)",
-             tc_bench_active_hits, tc_bench_active_uses, tc_bench_use_rate_pct,
-             tc_bench_feed_instr_total, tc_bench_feed_cycles_q, tc_bench_feed_pct);
-    $display("[BENCH-TC] replay_efficiency: instr_per_use=%0d.%02d cycles_per_use=%0d.%02d instr_per_feed_cycle=%0d.%02d",
-             tc_bench_avg_instr_per_use_x100/100, tc_bench_avg_instr_per_use_x100%100,
-             tc_bench_avg_cycles_per_use_x100/100, tc_bench_avg_cycles_per_use_x100%100,
-             tc_bench_avg_instr_per_feed_cycle_x100/100, tc_bench_avg_instr_per_feed_cycle_x100%100);
-  end
+  // Summary prints moved to the benchmark-end event above.
 // pragma translate_on
 `endif
 

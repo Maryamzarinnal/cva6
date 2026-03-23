@@ -105,6 +105,7 @@ module trace_builder #(
 
 `ifndef SYNTHESIS
 // pragma translate_off
+  initial $display("[TC-BUILD-VERSION] 2026-03-23-stats-v3-runtime-summary");
   int unsigned tc_stat_windows_total;
   int unsigned tc_stat_windows_aligned;
   int unsigned tc_stat_windows_unaligned;
@@ -560,42 +561,7 @@ module trace_builder #(
     end
   end
 
-  final begin
-    int unsigned commit_br_ge4;
-    commit_br_ge4 = 0;
-    for (int b = 4; b <= CHUNKS_PER_TRACE; b++)
-      commit_br_ge4 += tc_stat_commit_branch_hist[b];
-
-    $display("[TC-BUILD] ===== Trace builder summary =====");
-    $display("[TC-BUILD] windows total=%0d aligned=%0d unaligned=%0d unaligned_with_taken=%0d",
-             tc_stat_windows_total, tc_stat_windows_aligned, tc_stat_windows_unaligned,
-             tc_stat_windows_unaligned_with_taken);
-    $display("[TC-BUILD] windows_with_taken=%0d trace_start_windows=%0d",
-             tc_stat_windows_with_taken, tc_stat_trace_start_windows);
-    $display("[TC-BUILD] finalize_attempts=%0d committed=%0d duplicate_dropped=%0d indirect_dropped=%0d",
-             tc_stat_trace_finalize_attempts, tc_stat_trace_commits,
-             tc_stat_trace_dup_drops, tc_stat_trace_indirect_drops);
-    $display("[TC-BUILD] end_reasons: full=%0d max_instr=%0d max_taken=%0d",
-             tc_stat_trace_end_full, tc_stat_trace_end_max_instr, tc_stat_trace_end_max_taken);
-    $display("[TC-BUILD] attempted_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
-             tc_stat_attempt_len_hist[1], tc_stat_attempt_len_hist[2],
-             tc_stat_attempt_len_hist[3], tc_stat_attempt_len_hist[4]);
-    $display("[TC-BUILD] attempted_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
-             tc_stat_attempt_taken_hist[0], tc_stat_attempt_taken_hist[1],
-             tc_stat_attempt_taken_hist[2], tc_stat_attempt_taken_hist[3],
-             tc_stat_attempt_taken_hist[4]);
-    $display("[TC-BUILD] committed_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
-             tc_stat_commit_len_hist[1], tc_stat_commit_len_hist[2],
-             tc_stat_commit_len_hist[3], tc_stat_commit_len_hist[4]);
-    $display("[TC-BUILD] committed_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
-             tc_stat_commit_taken_hist[0], tc_stat_commit_taken_hist[1],
-             tc_stat_commit_taken_hist[2], tc_stat_commit_taken_hist[3],
-             tc_stat_commit_taken_hist[4]);
-    $display("[TC-BUILD] committed_branch_hist: B0=%0d B1=%0d B2=%0d B3=%0d B4plus=%0d",
-             tc_stat_commit_branch_hist[0], tc_stat_commit_branch_hist[1],
-             tc_stat_commit_branch_hist[2], tc_stat_commit_branch_hist[3], commit_br_ge4);
-    $display("[TC-BUILD] =================================");
-  end
+  // Summary prints are emitted from frontend at benchmark end.
 // pragma translate_on
 
   `ifdef TRACE_CACHE_DEBUG_EVENTS
