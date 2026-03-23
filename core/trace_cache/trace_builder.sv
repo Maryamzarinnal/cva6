@@ -92,6 +92,40 @@ module trace_builder #(
   logic [CHUNKS_PER_TRACE-1:0] dup_flags [(1 << TRACE_ADDRW)];
   logic [BR_CNT_WIDTH-1:0]     dup_num_branches [(1 << TRACE_ADDRW)];
 
+  logic                        stats_window_has_taken;
+  logic                        stats_finalize_attempt_d;
+  logic                        stats_finalize_duplicate_d;
+  logic                        stats_finalize_indirect_d;
+  logic                        stats_finalize_reason_full_d;
+  logic                        stats_finalize_reason_max_instr_d;
+  logic                        stats_finalize_reason_max_taken_d;
+  logic [START_CNT_W-1:0]      stats_finalize_instrs_d;
+  logic [BR_CNT_W-1:0]         stats_finalize_branches_d;
+  logic [TAKEN_CNT_W-1:0]      stats_finalize_taken_d;
+
+`ifndef SYNTHESIS
+// pragma translate_off
+  int unsigned tc_stat_windows_total;
+  int unsigned tc_stat_windows_aligned;
+  int unsigned tc_stat_windows_unaligned;
+  int unsigned tc_stat_windows_unaligned_with_taken;
+  int unsigned tc_stat_windows_with_taken;
+  int unsigned tc_stat_trace_start_windows;
+  int unsigned tc_stat_trace_finalize_attempts;
+  int unsigned tc_stat_trace_commits;
+  int unsigned tc_stat_trace_dup_drops;
+  int unsigned tc_stat_trace_indirect_drops;
+  int unsigned tc_stat_trace_end_full;
+  int unsigned tc_stat_trace_end_max_instr;
+  int unsigned tc_stat_trace_end_max_taken;
+  int unsigned tc_stat_attempt_len_hist   [0:TRACE_LEN];
+  int unsigned tc_stat_attempt_taken_hist [0:MAX_TAKEN];
+  int unsigned tc_stat_commit_len_hist    [0:TRACE_LEN];
+  int unsigned tc_stat_commit_taken_hist  [0:MAX_TAKEN];
+  int unsigned tc_stat_commit_branch_hist [0:CHUNKS_PER_TRACE];
+// pragma translate_on
+`endif
+
   assign instr_i.ready      = 1'b1;
   assign mem_req_o          = commit_valid_q;
   assign mem_we_o           = commit_valid_q;
@@ -101,6 +135,14 @@ module trace_builder #(
   assign mem_branch_pcs_o   = commit_branch_pcs_q;
   assign trace_valid_o      = commit_valid_q;
   assign trace_data_o       = commit_data_q;
+
+  always_comb begin
+    stats_window_has_taken = 1'b0;
+    for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
+      if (instr_i.valid[i] && instr_i.is_branch[i] && instr_i.taken[i])
+        stats_window_has_taken = 1'b1;
+    end
+  end
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -187,6 +229,15 @@ module trace_builder #(
     branch_slot             = '0;
     hit_taken               = 1'b0;
     trace_full              = 1'b0;
+    stats_finalize_attempt_d          = 1'b0;
+    stats_finalize_duplicate_d        = 1'b0;
+    stats_finalize_indirect_d         = 1'b0;
+    stats_finalize_reason_full_d      = 1'b0;
+    stats_finalize_reason_max_instr_d = 1'b0;
+    stats_finalize_reason_max_taken_d = 1'b0;
+    stats_finalize_instrs_d           = '0;
+    stats_finalize_branches_d         = '0;
+    stats_finalize_taken_d            = '0;
 
     if (flush_i) begin
       state_d                 = IDLE;
@@ -379,6 +430,16 @@ module trace_builder #(
                            && (trace_d.lookup_branch_flags == dup_flags[candidate_addr])
                            && (trace_d.lookup_num_branches == dup_num_branches[candidate_addr]);
 
+              stats_finalize_attempt_d          = 1'b1;
+              stats_finalize_duplicate_d        = is_duplicate;
+              stats_finalize_indirect_d         = temp_has_indirect_cf;
+              stats_finalize_reason_full_d      = trace_full;
+              stats_finalize_reason_max_instr_d = (temp_start_cnt >= START_CNT_W'(MAX_INSTR_PER_TRACE)) && (temp_chunk_ptr > 0);
+              stats_finalize_reason_max_taken_d = (temp_taken_cnt >= TAKEN_CNT_W'(MAX_TAKEN)) && (temp_chunk_ptr > 0);
+              stats_finalize_instrs_d           = temp_start_cnt;
+              stats_finalize_branches_d         = BR_CNT_W'(temp_br_cnt);
+              stats_finalize_taken_d            = temp_taken_cnt;
+
               // Drop any trace containing indirect control flow.
               if (!is_duplicate && !temp_has_indirect_cf) begin
                 sram_wr_addr_d      = candidate_addr;
@@ -418,7 +479,119 @@ module trace_builder #(
     end
   end
 
+
 `ifndef SYNTHESIS
+// pragma translate_off
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      tc_stat_windows_total                <= 0;
+      tc_stat_windows_aligned              <= 0;
+      tc_stat_windows_unaligned            <= 0;
+      tc_stat_windows_unaligned_with_taken <= 0;
+      tc_stat_windows_with_taken           <= 0;
+      tc_stat_trace_start_windows          <= 0;
+      tc_stat_trace_finalize_attempts      <= 0;
+      tc_stat_trace_commits                <= 0;
+      tc_stat_trace_dup_drops              <= 0;
+      tc_stat_trace_indirect_drops         <= 0;
+      tc_stat_trace_end_full               <= 0;
+      tc_stat_trace_end_max_instr          <= 0;
+      tc_stat_trace_end_max_taken          <= 0;
+      for (int i = 0; i <= TRACE_LEN; i++) begin
+        tc_stat_attempt_len_hist[i] <= 0;
+        tc_stat_commit_len_hist[i]  <= 0;
+      end
+      for (int i = 0; i <= MAX_TAKEN; i++) begin
+        tc_stat_attempt_taken_hist[i] <= 0;
+        tc_stat_commit_taken_hist[i]  <= 0;
+      end
+      for (int i = 0; i <= CHUNKS_PER_TRACE; i++)
+        tc_stat_commit_branch_hist[i] <= 0;
+    end else begin
+      if (|instr_i.consumed) begin
+        tc_stat_windows_total <= tc_stat_windows_total + 1;
+        if (instr_i.serving_unaligned) begin
+          tc_stat_windows_unaligned <= tc_stat_windows_unaligned + 1;
+          if (stats_window_has_taken)
+            tc_stat_windows_unaligned_with_taken <= tc_stat_windows_unaligned_with_taken + 1;
+        end else begin
+          tc_stat_windows_aligned <= tc_stat_windows_aligned + 1;
+          if (stats_window_has_taken)
+            tc_stat_windows_with_taken <= tc_stat_windows_with_taken + 1;
+          if ((state_q == IDLE) && stats_window_has_taken)
+            tc_stat_trace_start_windows <= tc_stat_trace_start_windows + 1;
+        end
+      end
+
+      if (stats_finalize_attempt_d) begin
+        tc_stat_trace_finalize_attempts <= tc_stat_trace_finalize_attempts + 1;
+        tc_stat_attempt_len_hist[int'(stats_finalize_instrs_d)] <=
+          tc_stat_attempt_len_hist[int'(stats_finalize_instrs_d)] + 1;
+        tc_stat_attempt_taken_hist[int'(stats_finalize_taken_d)] <=
+          tc_stat_attempt_taken_hist[int'(stats_finalize_taken_d)] + 1;
+
+        if (stats_finalize_reason_full_d)
+          tc_stat_trace_end_full <= tc_stat_trace_end_full + 1;
+        if (stats_finalize_reason_max_instr_d)
+          tc_stat_trace_end_max_instr <= tc_stat_trace_end_max_instr + 1;
+        if (stats_finalize_reason_max_taken_d)
+          tc_stat_trace_end_max_taken <= tc_stat_trace_end_max_taken + 1;
+
+        if (commit_valid_d) begin
+          tc_stat_trace_commits <= tc_stat_trace_commits + 1;
+          tc_stat_commit_len_hist[int'(stats_finalize_instrs_d)] <=
+            tc_stat_commit_len_hist[int'(stats_finalize_instrs_d)] + 1;
+          tc_stat_commit_taken_hist[int'(stats_finalize_taken_d)] <=
+            tc_stat_commit_taken_hist[int'(stats_finalize_taken_d)] + 1;
+          tc_stat_commit_branch_hist[int'(stats_finalize_branches_d)] <=
+            tc_stat_commit_branch_hist[int'(stats_finalize_branches_d)] + 1;
+        end else if (stats_finalize_duplicate_d) begin
+          tc_stat_trace_dup_drops <= tc_stat_trace_dup_drops + 1;
+        end else if (stats_finalize_indirect_d) begin
+          tc_stat_trace_indirect_drops <= tc_stat_trace_indirect_drops + 1;
+        end
+      end
+    end
+  end
+
+  final begin
+    int unsigned commit_br_ge4;
+    commit_br_ge4 = 0;
+    for (int b = 4; b <= CHUNKS_PER_TRACE; b++)
+      commit_br_ge4 += tc_stat_commit_branch_hist[b];
+
+    $display("[TC-BUILD] ===== Trace builder summary =====");
+    $display("[TC-BUILD] windows total=%0d aligned=%0d unaligned=%0d unaligned_with_taken=%0d",
+             tc_stat_windows_total, tc_stat_windows_aligned, tc_stat_windows_unaligned,
+             tc_stat_windows_unaligned_with_taken);
+    $display("[TC-BUILD] windows_with_taken=%0d trace_start_windows=%0d",
+             tc_stat_windows_with_taken, tc_stat_trace_start_windows);
+    $display("[TC-BUILD] finalize_attempts=%0d committed=%0d duplicate_dropped=%0d indirect_dropped=%0d",
+             tc_stat_trace_finalize_attempts, tc_stat_trace_commits,
+             tc_stat_trace_dup_drops, tc_stat_trace_indirect_drops);
+    $display("[TC-BUILD] end_reasons: full=%0d max_instr=%0d max_taken=%0d",
+             tc_stat_trace_end_full, tc_stat_trace_end_max_instr, tc_stat_trace_end_max_taken);
+    $display("[TC-BUILD] attempted_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
+             tc_stat_attempt_len_hist[1], tc_stat_attempt_len_hist[2],
+             tc_stat_attempt_len_hist[3], tc_stat_attempt_len_hist[4]);
+    $display("[TC-BUILD] attempted_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
+             tc_stat_attempt_taken_hist[0], tc_stat_attempt_taken_hist[1],
+             tc_stat_attempt_taken_hist[2], tc_stat_attempt_taken_hist[3],
+             tc_stat_attempt_taken_hist[4]);
+    $display("[TC-BUILD] committed_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
+             tc_stat_commit_len_hist[1], tc_stat_commit_len_hist[2],
+             tc_stat_commit_len_hist[3], tc_stat_commit_len_hist[4]);
+    $display("[TC-BUILD] committed_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
+             tc_stat_commit_taken_hist[0], tc_stat_commit_taken_hist[1],
+             tc_stat_commit_taken_hist[2], tc_stat_commit_taken_hist[3],
+             tc_stat_commit_taken_hist[4]);
+    $display("[TC-BUILD] committed_branch_hist: B0=%0d B1=%0d B2=%0d B3=%0d B4plus=%0d",
+             tc_stat_commit_branch_hist[0], tc_stat_commit_branch_hist[1],
+             tc_stat_commit_branch_hist[2], tc_stat_commit_branch_hist[3], commit_br_ge4);
+    $display("[TC-BUILD] =================================");
+  end
+// pragma translate_on
+
   `ifdef TRACE_CACHE_DEBUG_VERBOSE
   always_ff @(posedge clk_i) begin
     if (commit_valid_q) begin

@@ -436,8 +436,6 @@ module trace_cache_top #(
   end
 
 `ifdef MODEL_TECH
-  initial $display("[TC-DEBUG] trace_cache_top: miss breakdown ACTIVE (MODEL_TECH defined)");
-
   int unsigned tc_miss_empty;
   int unsigned tc_miss_pc;
   int unsigned tc_miss_path;
@@ -465,7 +463,6 @@ module trace_cache_top #(
   assign tc_miss_pc_o    = tc_miss_pc;
   assign tc_miss_path_o  = tc_miss_path;
 `else
-  initial $display("[TC-DEBUG] trace_cache_top: miss breakdown DISABLED (MODEL_TECH not defined - add +define+MODEL_TECH to compile)");
   assign tc_miss_total_o = 32'b0;
   assign tc_miss_empty_o = 32'b0;
   assign tc_miss_pc_o    = 32'b0;
@@ -499,35 +496,6 @@ module trace_cache_top #(
   end
   `endif
 
-  int unsigned tc_valid_lookups;
-  int unsigned tc_useful_hits;
-
-  always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) begin
-      tc_valid_lookups <= 0;
-      tc_useful_hits   <= 0;
-    end else if (lookup_valid_q) begin
-      logic any_valid;
-      any_valid = 1'b0;
-      for (int w = 0; w < NUM_WAYS; w++)
-        if (trace_read[w].valid) any_valid = 1'b1;
-      if (any_valid) begin
-        tc_valid_lookups <= tc_valid_lookups + 1;
-        if (trace_hit)
-          tc_useful_hits <= tc_useful_hits + 1;
-      end
-    end
-  end
-
-  final begin
-    $display("[TC-USEFUL] valid_lookups=%0d hits=%0d rate=%0d%%",
-             tc_valid_lookups, tc_useful_hits,
-             tc_valid_lookups > 0 ? (tc_useful_hits * 100) / tc_valid_lookups : 0);
-    `ifdef MODEL_TECH
-    $display("[TC-MISS-BREAKDOWN] total_misses=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why lookups missed)",
-             tc_miss_total, tc_miss_empty, tc_miss_pc, tc_miss_path);
-    `endif
-  end
 `endif
 
 endmodule
