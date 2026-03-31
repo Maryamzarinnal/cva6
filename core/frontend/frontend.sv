@@ -45,6 +45,11 @@ module frontend
     input logic [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_ready_i
 );
 
+
+`ifndef SYNTHESIS
+  initial $display("[TC-RUN-MARKER] TC_FIX_V56_STABILIZE_PENDING_AND_RAS");
+`endif
+
   localparam type bht_update_t = struct packed {
     logic                    valid;
     logic [CVA6Cfg.VLEN-1:0] pc;
@@ -72,6 +77,7 @@ module frontend
   logic [31:0]                             icache_tinst_q;
   logic                                    icache_gva_q;
   logic                                    instr_queue_ready;
+  logic                                    instr_queue_empty;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]      instr_queue_consumed;
   btb_prediction_t                         btb_q;
   bht_prediction_t                         bht_q;
@@ -102,6 +108,27 @@ module frontend
   logic                                    tc_active_hit;
   logic                                    tc_trace_starts_ok;
   logic                                    tc_trace_last_is_taken_cf;
+  logic [BR_CNT_WIDTH-1:0]                 tc_trace_mapped_num_branches;
+  logic [TAKEN_CNT_WIDTH-1:0]              tc_trace_mapped_num_taken;
+  logic                                    tc_trace_branch_map_ok;
+  logic                                    tc_trace_has_call;
+
+  // TC pending-hit latch: preserve one conservative hit until the instr_queue becomes ready.
+  logic                                    tc_pending_q, tc_pending_d;
+  logic [TRACE_LEN_WIDTH-1:0]              tc_pending_len_q, tc_pending_len_d;
+  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   tc_pending_instr_q, tc_pending_instr_d;
+  logic [TRACE_LEN-1:0][CVA6Cfg.VLEN-1:0]  tc_pending_pcs_q, tc_pending_pcs_d;
+  logic [CVA6Cfg.VLEN-1:0]                 tc_pending_next_pc_q, tc_pending_next_pc_d;
+  logic [TRACE_LEN-1:0]                    tc_pending_taken_cf_q, tc_pending_taken_cf_d;
+  logic [TAKEN_CNT_WIDTH-1:0]              tc_pending_num_taken_q, tc_pending_num_taken_d;
+  logic                                    tc_pending_capture;
+  logic                                    tc_pending_start;
+  logic                                    tc_rehit_block_q, tc_rehit_block_d;
+  logic [CVA6Cfg.VLEN-1:0]                 tc_rehit_pc_q, tc_rehit_pc_d;
+  logic                                    tc_same_pc_rehit_block;
+  logic                                    tc_lookup_oneshot_q, tc_lookup_oneshot_d;
+  logic [CVA6Cfg.VLEN-1:0]                 tc_lookup_oneshot_pc_q, tc_lookup_oneshot_pc_d;
+  logic                                    tc_same_lookup_oneshot_block;
 
   // TC feeding registers
   logic                                    tc_feeding_q, tc_feeding_d;
@@ -109,8 +136,8 @@ module frontend
   logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   tc_feeding_instr_q, tc_feeding_instr_d;
   logic [TRACE_LEN-1:0][CVA6Cfg.VLEN-1:0]  tc_feeding_pcs_q, tc_feeding_pcs_d;
   logic [CVA6Cfg.VLEN-1:0]                 tc_feeding_next_pc_q, tc_feeding_next_pc_d;
-  logic [CVA6Cfg.VLEN-1:0]                 tc_feeding_taken_target_q, tc_feeding_taken_target_d;
   logic [TRACE_LEN-1:0]                    tc_feeding_consumed_q, tc_feeding_consumed_d;
+  logic [TRACE_LEN-1:0]                    tc_feeding_taken_cf_q, tc_feeding_taken_cf_d;
   logic                                    tc_feeding_done;
   logic                                    tc_feeding_start;
 
@@ -119,10 +146,8 @@ module frontend
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] replay_addr_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]                   replay_valid_iq;
   cf_t  [CVA6Cfg.INSTR_PER_FETCH-1:0]                   replay_cf_type_iq;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] replay_predict_addr;
-
-  // TC feeding: which slot has the taken branch
-  logic [TRACE_LEN_WIDTH-1:0]                           tc_taken_slot_q, tc_taken_slot_d;
+  logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] replay_predict_addr_iq;
+  logic [CVA6Cfg.INSTR_PER_FETCH-1:0][TRACE_LEN_WIDTH-1:0] replay_slot_map_iq;
 
   // MUX outputs to instr_queue
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0]             instr_to_iq;
@@ -130,11 +155,13 @@ module frontend
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]                   valid_to_iq;
   cf_t  [CVA6Cfg.INSTR_PER_FETCH-1:0]                   cf_type_to_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] predict_addr_to_iq;
+  logic [CVA6Cfg.VLEN-1:0]                              replay_predict_addr_single_iq;
   ariane_pkg::frontend_exception_t                      exception_to_iq;
   logic [CVA6Cfg.VLEN-1:0]                              exception_addr_to_iq;
   logic [CVA6Cfg.GPLEN-1:0]                             exception_gpaddr_to_iq;
   logic [31:0]                                          exception_tinst_to_iq;
   logic                                                 exception_gva_to_iq;
+  logic                                                 tc_disable_replay_q;
 
   function automatic cf_t tc_replay_cf_type(input logic [31:0] instr_i);
     logic is_rvc;
@@ -156,11 +183,13 @@ module frontend
           default: ;
         endcase
       end else begin
-        if ((instr_i[15:13] == riscv::OpcodeC1Beqz) ||
-            (instr_i[15:13] == riscv::OpcodeC1Bnez)) begin
+        if ((instr_i[1:0] == riscv::OpcodeC1) &&
+            ((instr_i[15:13] == riscv::OpcodeC1Beqz) ||
+             (instr_i[15:13] == riscv::OpcodeC1Bnez))) begin
           tc_replay_cf_type = ariane_pkg::Branch;
-        end else if ((instr_i[15:13] == riscv::OpcodeC1J) ||
-                     ((CVA6Cfg.XLEN == 32) && (instr_i[15:13] == riscv::OpcodeC1Jal))) begin
+        end else if ((instr_i[1:0] == riscv::OpcodeC1) &&
+                     ((instr_i[15:13] == riscv::OpcodeC1J) ||
+                      ((CVA6Cfg.XLEN == 32) && (instr_i[15:13] == riscv::OpcodeC1Jal)))) begin
           tc_replay_cf_type = ariane_pkg::Jump;
         end else if ((instr_i[1:0] == riscv::OpcodeC2) &&
                      (instr_i[15:13] == riscv::OpcodeC2JalrMvAdd) &&
@@ -171,6 +200,25 @@ module frontend
           else
             tc_replay_cf_type = ariane_pkg::JumpR;
         end
+      end
+    end
+  endfunction
+
+  function automatic logic tc_replay_is_call(input logic [31:0] instr_i);
+    logic is_rvc;
+    begin
+      tc_replay_is_call = 1'b0;
+      is_rvc = (instr_i[1:0] != 2'b11);
+
+      if (!is_rvc) begin
+        if ((instr_i[6:0] == riscv::OpcodeJal) &&
+            ((instr_i[11:7] == 5'd1) || (instr_i[11:7] == 5'd5)))
+          tc_replay_is_call = 1'b1;
+      end else begin
+        if ((CVA6Cfg.XLEN == 32) &&
+            (instr_i[1:0] == riscv::OpcodeC1) &&
+            (instr_i[15:13] == riscv::OpcodeC1Jal))
+          tc_replay_is_call = 1'b1;
       end
     end
   endfunction
@@ -228,14 +276,20 @@ module frontend
   end
 
   logic bp_valid;
+  logic tc_icache_sidefx_en;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] is_branch, is_call, is_jump, is_return, is_jalr;
+  logic [CHUNKS_PER_TRACE-1:0] iq_branch_flags_out;
+  logic [CHUNKS_PER_TRACE-1:0] tc_active_branch_flags;
+  logic [CHUNKS_PER_TRACE-1:0] restored_branch_flags;
+
+  assign tc_icache_sidefx_en = !tc_feeding_q && !tc_pending_q && !tc_feeding_start;
 
   for (genvar i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
-    assign is_branch[i] = instruction_valid[i] & (rvi_branch[i] | rvc_branch[i]);
-    assign is_call[i]   = instruction_valid[i] & (rvi_call[i]   | rvc_call[i]);
-    assign is_return[i] = instruction_valid[i] & (rvi_return[i] | rvc_return[i]);
-    assign is_jump[i]   = instruction_valid[i] & (rvi_jump[i]   | rvc_jump[i]);
-    assign is_jalr[i]   = instruction_valid[i] & ~is_return[i] & (rvi_jalr[i] | rvc_jalr[i] | rvc_jr[i]);
+    assign is_branch[i] = tc_icache_sidefx_en & instruction_valid[i] & (rvi_branch[i] | rvc_branch[i]);
+    assign is_call[i]   = tc_icache_sidefx_en & instruction_valid[i] & (rvi_call[i]   | rvc_call[i]);
+    assign is_return[i] = tc_icache_sidefx_en & instruction_valid[i] & (rvi_return[i] | rvc_return[i]);
+    assign is_jump[i]   = tc_icache_sidefx_en & instruction_valid[i] & (rvi_jump[i]   | rvc_jump[i]);
+    assign is_jalr[i]   = tc_icache_sidefx_en & instruction_valid[i] & ~is_return[i] & (rvi_jalr[i] | rvc_jalr[i] | rvc_jr[i]);
   end
 
   always_comb begin
@@ -268,8 +322,10 @@ module frontend
         4'b0100: begin
           ras_pop = ras_predict.valid & instr_queue_consumed[i];
           ras_push = 1'b0;
-          predict_address = ras_predict.ra;
-          cf_type[i] = ariane_pkg::Return;
+          if (ras_predict.valid) begin
+            predict_address = ras_predict.ra;
+            cf_type[i] = ariane_pkg::Return;
+          end
         end
         4'b1000: begin
           ras_pop = 1'b0;
@@ -305,8 +361,10 @@ module frontend
 
   assign is_mispredict = resolved_branch_i.valid & resolved_branch_i.is_mispredict;
 
+  // Keep the I$ request side alive while a hit is held in pending, but keep
+  // NPC/IQ side effects frozen until replay actually starts.
   assign icache_dreq_o.req     = instr_queue_ready & ~halt_frontend_i & ~tc_feeding_q;
-  assign if_ready              = icache_dreq_i.ready & instr_queue_ready & ~halt_frontend_i & ~tc_feeding_q;
+  assign if_ready              = icache_dreq_i.ready & instr_queue_ready & ~halt_frontend_i & ~tc_feeding_q & ~tc_pending_q;
   assign icache_dreq_o.kill_s1 = is_mispredict | flush_i | replay;
   assign icache_dreq_o.kill_s2 = icache_dreq_o.kill_s1 | bp_valid;
 
@@ -331,155 +389,349 @@ module frontend
 
   always_comb begin
     int last_idx;
-    int cf_before_last;
+    int branch_slot_idx;
+    int mapped_taken_cnt;
 
-    tc_trace_last_is_taken_cf = 1'b0;
-    last_idx = 0;
-    cf_before_last = 0;
+    tc_trace_last_is_taken_cf     = 1'b0;
+    tc_trace_mapped_num_branches  = '0;
+    tc_trace_mapped_num_taken     = '0;
+    last_idx                      = 0;
+    branch_slot_idx               = 0;
+    mapped_taken_cnt              = 0;
 
     if (tc_trace_length != 0) begin
       last_idx = int'(tc_trace_length) - 1;
 
       for (int i = 0; i < TRACE_LEN; i++) begin
-        if ((i < last_idx) && (tc_replay_cf_type(tc_trace_instructions[i]) != ariane_pkg::NoCF))
-          cf_before_last++;
-      end
+        if ((i < int'(tc_trace_length)) &&
+            (tc_replay_cf_type(tc_trace_instructions[i]) != ariane_pkg::NoCF)) begin
 
-      if ((tc_replay_cf_type(tc_trace_instructions[last_idx]) != ariane_pkg::NoCF) &&
-          (cf_before_last < CHUNKS_PER_TRACE) &&
-          tc_trace_branch_flags[cf_before_last]) begin
-        tc_trace_last_is_taken_cf = 1'b1;
-      end
-    end
-  end
-
-  // -----------------------------------------------------------------------
-  // TC: Compute which slot has the taken branch
-  // Scans the trace instructions + branch_flags to find the taken-CF slot.
-  // -----------------------------------------------------------------------
-  logic [TRACE_LEN_WIDTH-1:0] tc_taken_slot;
-
-  always_comb begin
-    int br_idx;
-    tc_taken_slot = TRACE_LEN_WIDTH'(tc_trace_length - 1); // default: last slot
-    br_idx = 0;
-
-    for (int i = 0; i < TRACE_LEN; i++) begin
-      if (i < int'(tc_trace_length)) begin
-        if (tc_replay_cf_type(tc_trace_instructions[i]) != ariane_pkg::NoCF) begin
-          if (br_idx < CHUNKS_PER_TRACE && tc_trace_branch_flags[br_idx]) begin
-            tc_taken_slot = TRACE_LEN_WIDTH'(i);
+          if ((i == last_idx) &&
+              (branch_slot_idx < int'(tc_trace_num_branches)) &&
+              tc_trace_branch_flags[branch_slot_idx]) begin
+            tc_trace_last_is_taken_cf = 1'b1;
           end
-          br_idx++;
+
+          if ((branch_slot_idx < int'(tc_trace_num_branches)) &&
+              tc_trace_branch_flags[branch_slot_idx]) begin
+            mapped_taken_cnt++;
+          end
+
+          branch_slot_idx++;
         end
       end
+
+      tc_trace_mapped_num_branches = BR_CNT_WIDTH'(branch_slot_idx);
+      tc_trace_mapped_num_taken    = TAKEN_CNT_WIDTH'(mapped_taken_cnt);
+    end
+  end
+
+  assign tc_trace_branch_map_ok = (tc_trace_mapped_num_branches == tc_trace_num_branches) &&
+                                  (tc_trace_mapped_num_taken == tc_trace_num_taken);
+
+  always_comb begin
+    tc_trace_has_call = 1'b0;
+    for (int i = 0; i < TRACE_LEN; i++) begin
+      if ((i < int'(tc_trace_length)) && tc_replay_is_call(tc_trace_instructions[i]))
+        tc_trace_has_call = 1'b1;
     end
   end
 
   // -----------------------------------------------------------------------
-  // TC: Present trace to instr_queue (per-slot predict addresses)
-  // The taken CF can be in any slot; each slot gets its own predict_addr.
+  // TC: Present trace to instr_queue
+  // Compact remaining unconsumed trace slots before re-feeding them.
+  // instr_queue replay accounting assumes a dense packet that starts at slot 0;
+  // leaving holes after partial consumption corrupts replay_addr / FIFO alignment.
   // -----------------------------------------------------------------------
   always_comb begin
-    replay_instr_iq     = '0;
-    replay_addr_iq      = '0;
-    replay_valid_iq     = '0;
-    replay_cf_type_iq   = '{default: ariane_pkg::NoCF};
-    replay_predict_addr = '0;
+    automatic cf_t cf_local;
+    automatic int compact_idx;
+    automatic int next_unconsumed;
 
-    for (int s = 0; s < CVA6Cfg.INSTR_PER_FETCH; s++) begin
-      if ((s < int'(tc_feeding_len_q)) && !tc_feeding_consumed_q[s]) begin
-        replay_valid_iq[s] = 1'b1;
-        replay_instr_iq[s] = tc_feeding_instr_q[s];
-        replay_addr_iq[s]  = tc_feeding_pcs_q[s];
+    replay_instr_iq        = '0;
+    replay_addr_iq         = '0;
+    replay_valid_iq        = '0;
+    replay_cf_type_iq      = '{default: ariane_pkg::NoCF};
+    replay_predict_addr_iq = '0;
+    replay_slot_map_iq     = '0;
+    compact_idx            = 0;
 
-        // Mark CF type on the taken branch slot
-        if (TRACE_LEN_WIDTH'(s) == tc_taken_slot_q)
-          replay_cf_type_iq[s] = tc_replay_cf_type(tc_feeding_instr_q[s]);
+    for (int s = 0; s < TRACE_LEN; s++) begin
+      if ((s < int'(tc_feeding_len_q)) && !tc_feeding_consumed_q[s] &&
+          (compact_idx < CVA6Cfg.INSTR_PER_FETCH)) begin
+        cf_local = tc_feeding_taken_cf_q[s] ?
+                   tc_replay_cf_type(tc_feeding_instr_q[s]) : ariane_pkg::NoCF;
+
+        replay_valid_iq[compact_idx]    = 1'b1;
+        replay_instr_iq[compact_idx]    = tc_feeding_instr_q[s];
+        replay_addr_iq[compact_idx]     = tc_feeding_pcs_q[s];
+        replay_cf_type_iq[compact_idx]  = cf_local;
+        replay_slot_map_iq[compact_idx] = s;
+
+        if (cf_local != ariane_pkg::NoCF) begin
+          next_unconsumed = -1;
+          for (int t = s + 1; t < TRACE_LEN; t++) begin
+            if ((t < int'(tc_feeding_len_q)) && !tc_feeding_consumed_q[t] && (next_unconsumed < 0))
+              next_unconsumed = t;
+          end
+
+          if (next_unconsumed >= 0)
+            replay_predict_addr_iq[compact_idx] = tc_feeding_pcs_q[next_unconsumed];
+          else
+            replay_predict_addr_iq[compact_idx] = tc_feeding_next_pc_q;
+        end
+
+        compact_idx++;
       end
     end
-
-    // Set per-slot predict address for the taken branch slot (branch target)
-    replay_predict_addr[tc_taken_slot_q[CVA6Cfg.LOG2_INSTR_PER_FETCH-1:0]] = tc_feeding_taken_target_q;
   end
 
   // -----------------------------------------------------------------------
   // TC: Consumed mask + feeding done
   // -----------------------------------------------------------------------
   always_comb begin
+    logic all_replay_accepted;
+
     tc_feeding_consumed_d = tc_feeding_consumed_q;
     tc_feeding_done       = 1'b0;
+    all_replay_accepted   = 1'b1;
 
-    if (flush_i || is_mispredict || set_pc_commit_i || ex_valid_i || eret_i) begin
+    // ex_valid_i can pulse during ordinary backend activity; rely on the
+    // architectural redirect controls (flush/set_pc/eret) to clear replay state.
+    if (flush_i || is_mispredict || set_pc_commit_i || eret_i) begin
       tc_feeding_consumed_d = '0;
     end else begin
       if (tc_feeding_start)
         tc_feeding_consumed_d = '0;
 
       if (tc_feeding_q) begin
-        for (int j = 0; j < TRACE_LEN; j++) begin
-          if ((j < int'(tc_feeding_len_q)) && instr_queue_consumed[j])
-            tc_feeding_consumed_d[j] = 1'b1;
+        for (int j = 0; j < CVA6Cfg.INSTR_PER_FETCH; j++) begin
+          if (replay_valid_iq[j] && instr_queue_consumed[j])
+            tc_feeding_consumed_d[replay_slot_map_iq[j]] = 1'b1;
         end
 
-        tc_feeding_done = 1'b1;
         for (int j = 0; j < TRACE_LEN; j++) begin
           if ((j < int'(tc_feeding_len_q)) && !tc_feeding_consumed_d[j])
-            tc_feeding_done = 1'b0;
+            all_replay_accepted = 1'b0;
         end
 
-        if (tc_feeding_done)
+        // Keep tc_feeding_q asserted until replayed instructions are both:
+        // 1) accepted into instr_queue and 2) fully drained from instr_queue.
+        // This avoids mode-switch races where replay-origin CFs are later
+        // consumed while tc_feeding_q is already low.
+        // Do not finish in the same cycle replay_valid_iq is still being
+        // presented/accepted. Otherwise tc_feeding_q can drop too early and
+        // replay-origin CFs get handled by the normal path.
+        tc_feeding_done = all_replay_accepted &&
+                          !(|replay_valid_iq) ;
+
+        if (tc_feeding_done) begin
           tc_feeding_consumed_d = '0;
+        end
       end
     end
   end
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
+      tc_pending_q          <= 1'b0;
+      tc_pending_len_q      <= '0;
+      tc_pending_instr_q    <= '0;
+      tc_pending_pcs_q      <= '0;
+      tc_pending_next_pc_q  <= '0;
+      tc_pending_taken_cf_q <= '0;
+      tc_pending_num_taken_q <= '0;
+      tc_rehit_block_q      <= 1'b0;
+      tc_rehit_pc_q         <= '0;
+      tc_lookup_oneshot_q   <= 1'b0;
+      tc_lookup_oneshot_pc_q <= '0;
       tc_feeding_q          <= 1'b0;
       tc_feeding_len_q      <= '0;
       tc_feeding_instr_q    <= '0;
       tc_feeding_pcs_q      <= '0;
       tc_feeding_next_pc_q  <= '0;
-      tc_feeding_taken_target_q <= '0;
       tc_feeding_consumed_q <= '0;
-      tc_taken_slot_q       <= '0;
+      tc_feeding_taken_cf_q <= '0;
     end else begin
+      tc_pending_q          <= tc_pending_d;
+      tc_pending_len_q      <= tc_pending_len_d;
+      tc_pending_instr_q    <= tc_pending_instr_d;
+      tc_pending_pcs_q      <= tc_pending_pcs_d;
+      tc_pending_next_pc_q  <= tc_pending_next_pc_d;
+      tc_pending_taken_cf_q <= tc_pending_taken_cf_d;
+      tc_pending_num_taken_q <= tc_pending_num_taken_d;
+      tc_rehit_block_q      <= tc_rehit_block_d;
+      tc_rehit_pc_q         <= tc_rehit_pc_d;
+      tc_lookup_oneshot_q   <= tc_lookup_oneshot_d;
+      tc_lookup_oneshot_pc_q <= tc_lookup_oneshot_pc_d;
       tc_feeding_q          <= tc_feeding_d;
       tc_feeding_len_q      <= tc_feeding_len_d;
       tc_feeding_instr_q    <= tc_feeding_instr_d;
       tc_feeding_pcs_q      <= tc_feeding_pcs_d;
       tc_feeding_next_pc_q  <= tc_feeding_next_pc_d;
-      tc_feeding_taken_target_q <= tc_feeding_taken_target_d;
       tc_feeding_consumed_q <= tc_feeding_consumed_d;
-      tc_taken_slot_q       <= tc_taken_slot_d;
+      tc_feeding_taken_cf_q <= tc_feeding_taken_cf_d;
     end
   end
 
-  assign tc_feeding_start = tc_active_use && !tc_feeding_q;
+  always_comb begin
+    automatic int br_idx;
+
+    tc_pending_d          = tc_pending_q;
+    tc_pending_len_d      = tc_pending_len_q;
+    tc_pending_instr_d    = tc_pending_instr_q;
+    tc_pending_pcs_d      = tc_pending_pcs_q;
+    tc_pending_next_pc_d  = tc_pending_next_pc_q;
+    tc_pending_taken_cf_d = tc_pending_taken_cf_q;
+    tc_pending_num_taken_d = tc_pending_num_taken_q;
+
+    // Keep pending trace data across transient ex_valid_i pulses.
+    if (flush_i || is_mispredict || set_pc_commit_i || eret_i) begin
+      tc_pending_d          = 1'b0;
+      tc_pending_taken_cf_d = '0;
+      tc_pending_num_taken_d = '0;
+    end else if (tc_feeding_start) begin
+      tc_pending_d          = 1'b0;
+      tc_pending_taken_cf_d = '0;
+      tc_pending_num_taken_d = '0;
+    end else if (tc_pending_start) begin
+      tc_pending_d          = 1'b0;
+      tc_pending_taken_cf_d = '0;
+      tc_pending_num_taken_d = '0;
+    end else if (tc_pending_capture) begin
+      tc_pending_d          = 1'b1;
+      tc_pending_len_d      = tc_trace_length;
+      tc_pending_instr_d    = tc_trace_instructions;
+      tc_pending_next_pc_d  = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
+      tc_pending_taken_cf_d = '0;
+      tc_pending_num_taken_d = tc_trace_num_taken;
+      br_idx = 0;
+      for (int k = 0; k < TRACE_LEN; k++) begin
+        tc_pending_pcs_d[k] = tc_trace_pcs[k][CVA6Cfg.VLEN-1:0];
+
+        if ((k < int'(tc_trace_length)) &&
+            (tc_replay_cf_type(tc_trace_instructions[k]) != ariane_pkg::NoCF) &&
+            (br_idx < int'(tc_trace_num_branches))) begin
+          tc_pending_taken_cf_d[k] = tc_trace_branch_flags[br_idx];
+          br_idx++;
+        end
+      end
+
+    end
+  end
 
   always_comb begin
+    tc_rehit_block_d = tc_rehit_block_q;
+    tc_rehit_pc_d    = tc_rehit_pc_q;
+
+    // Keep the replay re-hit lock alive across ordinary ex_valid_i traffic.
+    // ex_valid_i can pulse during normal backend progress and was clearing the
+    // guard before the stale lookup result for the just-launched trace vanished.
+    // Keep the lock across mispredict redirects; otherwise the same stale hit
+    // can relaunch immediately and livelock replay progress.
+    if (flush_i || set_pc_commit_i || eret_i) begin
+      tc_rehit_block_d = 1'b0;
+      tc_rehit_pc_d    = '0;
+    end else begin
+      if (tc_feeding_start) begin
+        tc_rehit_block_d = 1'b1;
+        tc_rehit_pc_d    = tc_pending_start ? tc_pending_pcs_q[0] : tc_trace_pcs[0][CVA6Cfg.VLEN-1:0];
+      end else if (tc_rehit_block_q &&
+                   (trace_cache_pkg::pc_align_16(tc_pc[0]) != trace_cache_pkg::pc_align_16(tc_rehit_pc_q))) begin
+        tc_rehit_block_d = 1'b0;
+      end
+    end
+  end
+
+  // Block both:
+  // 1) a new live frontend revisit of the same trace-start PC, and
+  // 2) a delayed lookup result that comes back for the same trace-start PC after
+  //    replay already started. Case (2) is the one that creates FEED-START #2.
+  assign tc_same_pc_rehit_block = tc_rehit_block_q &&
+                                  (((tc_lookup_result_valid && tc_trace_hit) &&
+                                    (trace_cache_pkg::pc_align_16(tc_trace_pcs[0][CVA6Cfg.VLEN-1:0]) ==
+                                     trace_cache_pkg::pc_align_16(tc_rehit_pc_q))) ||
+                                   ((!tc_lookup_result_valid) &&
+                                    (trace_cache_pkg::pc_align_16(tc_pc[0]) ==
+                                     trace_cache_pkg::pc_align_16(tc_rehit_pc_q))));
+
+  always_comb begin
+    tc_lookup_oneshot_d    = tc_lookup_oneshot_q;
+    tc_lookup_oneshot_pc_d = tc_lookup_oneshot_pc_q;
+
+    // Clear the one-shot lookup guard only on architectural redirects.
+    // Keep one-shot guard across mispredict for the same reason as rehit lock.
+    if (flush_i || set_pc_commit_i || eret_i) begin
+      tc_lookup_oneshot_d    = 1'b0;
+      tc_lookup_oneshot_pc_d = '0;
+    end else begin
+      // Lock the launched trace-start PC exactly when replay begins, then keep
+      // blocking identical lookup results until that result disappears or changes
+      // to a different start PC. This closes the window where tc_feeding_q drops
+      // after the first replay packet but the old lookup result is still visible.
+      if (tc_feeding_start) begin
+        tc_lookup_oneshot_d    = 1'b1;
+        tc_lookup_oneshot_pc_d = tc_pending_start ? tc_pending_pcs_q[0]
+                                                  : tc_trace_pcs[0][CVA6Cfg.VLEN-1:0];
+      end else if (tc_lookup_oneshot_q &&
+                   (!tc_lookup_result_valid || !tc_trace_hit ||
+                    (trace_cache_pkg::pc_align_16(tc_trace_pcs[0][CVA6Cfg.VLEN-1:0]) !=
+                     trace_cache_pkg::pc_align_16(tc_lookup_oneshot_pc_q)))) begin
+        tc_lookup_oneshot_d    = 1'b0;
+        tc_lookup_oneshot_pc_d = '0;
+      end
+    end
+  end
+
+  assign tc_same_lookup_oneshot_block = tc_lookup_oneshot_q &&
+                                        tc_lookup_result_valid && tc_trace_hit &&
+                                        (trace_cache_pkg::pc_align_16(tc_trace_pcs[0][CVA6Cfg.VLEN-1:0]) ==
+                                         trace_cache_pkg::pc_align_16(tc_lookup_oneshot_pc_q));
+
+  assign tc_feeding_start = (tc_active_use || tc_pending_start) && !tc_feeding_q;
+
+  always_comb begin
+    automatic int br_idx;
+
     tc_feeding_d         = tc_feeding_q;
     tc_feeding_len_d     = tc_feeding_len_q;
     tc_feeding_instr_d   = tc_feeding_instr_q;
     tc_feeding_pcs_d     = tc_feeding_pcs_q;
     tc_feeding_next_pc_d = tc_feeding_next_pc_q;
-    tc_feeding_taken_target_d = tc_feeding_taken_target_q;
-    tc_taken_slot_d      = tc_taken_slot_q;
+    tc_feeding_taken_cf_d = tc_feeding_taken_cf_q;
 
-    if (flush_i || is_mispredict || set_pc_commit_i || ex_valid_i || eret_i)
-      tc_feeding_d = 1'b0;
-    else if (tc_feeding_done)
-      tc_feeding_d = 1'b0;
-    else if (tc_feeding_start) begin
-      tc_feeding_d         = 1'b1;
-      tc_feeding_len_d     = tc_trace_length;
-      tc_feeding_instr_d   = tc_trace_instructions;
-      tc_feeding_next_pc_d = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
-      tc_feeding_taken_target_d = tc_trace_taken_targets[0][CVA6Cfg.VLEN-1:0];
-      tc_taken_slot_d      = tc_taken_slot;
-      for (int k = 0; k < TRACE_LEN; k++)
-        tc_feeding_pcs_d[k] = tc_trace_pcs[k][CVA6Cfg.VLEN-1:0];
+    // Keep replay feeding alive across transient ex_valid_i pulses.
+    if (flush_i || is_mispredict || set_pc_commit_i || eret_i) begin
+      tc_feeding_d          = 1'b0;
+      tc_feeding_taken_cf_d = '0;
+    end else if (tc_feeding_done) begin
+      tc_feeding_d          = 1'b0;
+      tc_feeding_taken_cf_d = '0;
+    end else if (tc_feeding_start) begin
+      tc_feeding_d          = 1'b1;
+      tc_feeding_taken_cf_d = '0;
+      if (tc_pending_start) begin
+        tc_feeding_len_d      = tc_pending_len_q;
+        tc_feeding_instr_d    = tc_pending_instr_q;
+        tc_feeding_pcs_d      = tc_pending_pcs_q;
+        tc_feeding_next_pc_d  = tc_pending_next_pc_q;
+        tc_feeding_taken_cf_d = tc_pending_taken_cf_q;
+      end else begin
+        tc_feeding_len_d      = tc_trace_length;
+        tc_feeding_instr_d    = tc_trace_instructions;
+        tc_feeding_next_pc_d  = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
+        br_idx = 0;
+        for (int k = 0; k < TRACE_LEN; k++) begin
+          tc_feeding_pcs_d[k] = tc_trace_pcs[k][CVA6Cfg.VLEN-1:0];
+
+          if ((k < int'(tc_trace_length)) &&
+              (tc_replay_cf_type(tc_trace_instructions[k]) != ariane_pkg::NoCF) &&
+              (br_idx < int'(tc_trace_num_branches))) begin
+            tc_feeding_taken_cf_d[k] = tc_trace_branch_flags[br_idx];
+            br_idx++;
+          end
+        end
+      end
     end
   end
 
@@ -488,17 +740,36 @@ module frontend
   // -----------------------------------------------------------------------
   assign instr_to_iq            = tc_feeding_q ? replay_instr_iq   : instr;
   assign addr_to_iq             = tc_feeding_q ? replay_addr_iq    : addr;
-  assign valid_to_iq            = tc_feeding_q ? replay_valid_iq   : instruction_valid;
+  assign valid_to_iq            = tc_feeding_q ? replay_valid_iq
+                                               : ((tc_pending_q || tc_feeding_start) ? '0
+                                                                                     : instruction_valid);
   assign cf_type_to_iq          = tc_feeding_q ? replay_cf_type_iq : cf_type;
   assign exception_to_iq        = tc_feeding_q ? ariane_pkg::FE_NONE : icache_ex_valid_q;
   assign exception_addr_to_iq   = tc_feeding_q ? '0 : icache_vaddr_q;
   assign exception_gpaddr_to_iq = tc_feeding_q ? '0 : icache_gpaddr_q;
   assign exception_tinst_to_iq  = tc_feeding_q ? '0 : icache_tinst_q;
   assign exception_gva_to_iq    = tc_feeding_q ? 1'b0 : icache_gva_q;
-  // Per-slot predict addresses: I-cache path replicates the single predict_address
-  for (genvar gi = 0; gi < CVA6Cfg.INSTR_PER_FETCH; gi++) begin : gen_predict_addr_mux
-    assign predict_addr_to_iq[gi] = tc_feeding_q ? replay_predict_addr[gi] : predict_address;
+  always_comb begin
+    replay_predict_addr_single_iq = '0;
+    for (int r = 0; r < CVA6Cfg.INSTR_PER_FETCH; r++) begin
+      if (replay_valid_iq[r] && (replay_cf_type_iq[r] != ariane_pkg::NoCF))
+        replay_predict_addr_single_iq = replay_predict_addr_iq[r];
+    end
   end
+
+  for (genvar gi = 0; gi < CVA6Cfg.INSTR_PER_FETCH; gi++) begin : gen_predict_addr_mux
+    assign predict_addr_to_iq[gi] = tc_feeding_q ? replay_predict_addr_single_iq : predict_address;
+  end
+
+  always_comb begin
+    tc_active_branch_flags = '0;
+    if (tc_feeding_q) begin
+      for (int bf = 0; bf < TRACE_LEN; bf++)
+        tc_active_branch_flags[bf] = tc_feeding_taken_cf_q[bf];
+    end
+  end
+
+  assign restored_branch_flags = is_mispredict ? iq_branch_flags_out : tc_active_branch_flags;
 
   // -----------------------------------------------------------------------
   // NPC select
@@ -523,8 +794,12 @@ module frontend
       npc_d = {fetch_address[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] + 1,
                {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}};
 
-    if (tc_feeding_done && tc_feeding_q)
-      npc_d = tc_feeding_next_pc_q;
+    if (tc_feeding_done && tc_feeding_q) begin
+      automatic logic [CVA6Cfg.VLEN-1:0] last_pc = tc_feeding_pcs_q[tc_feeding_len_q - 1];
+      automatic logic [1:0] last_instr_low = tc_feeding_instr_q[tc_feeding_len_q - 1][1:0];
+      automatic logic [CVA6Cfg.VLEN-1:0] instr_len = (last_instr_low != 2'b11) ? 2 : 4;
+      npc_d = last_pc + instr_len;
+    end
 
     if (replay)          npc_d = replay_addr;
     if (is_mispredict)   npc_d = resolved_branch_i.target_address;
@@ -559,9 +834,9 @@ module frontend
       npc_rst_load_q <= 1'b0;
       npc_q          <= npc_d;
       speculative_q  <= speculative_d;
-      icache_valid_q <= icache_dreq_i.valid;
+      icache_valid_q <= icache_dreq_i.valid & tc_icache_sidefx_en;
 
-      if (icache_dreq_i.valid) begin
+      if (icache_dreq_i.valid && tc_icache_sidefx_en) begin
         icache_data_q  <= icache_data;
         icache_vaddr_q <= icache_dreq_i.vaddr;
 
@@ -681,11 +956,17 @@ module frontend
 
   instr_queue #(
       .CVA6Cfg      (CVA6Cfg),
+      .BRANCH_FLAGS_W(CHUNKS_PER_TRACE),
       .fetch_entry_t(fetch_entry_t)
   ) i_instr_queue (
       .clk_i,
       .rst_ni,
-      .flush_i            (flush_i),
+      // Keep frontend queue state aligned with architectural redirects.
+      // In practice we observed low-PC leakage right after resume/redirect
+      // windows; flushing/reseeding the queue on these events prevents stale
+      // pc/address FIFO state from escaping into fetch_entry_o.
+      .flush_i            (flush_i || is_mispredict || set_pc_commit_i || eret_i ||
+                           ex_valid_i || tc_feeding_start),
       .instr_i            (instr_to_iq),
       .addr_i             (addr_to_iq),
       .exception_i        (exception_to_iq),
@@ -694,16 +975,19 @@ module frontend
       .exception_tinst_i  (exception_tinst_to_iq),
       .exception_gva_i    (exception_gva_to_iq),
       .predict_address_i  (predict_addr_to_iq),
+      .branch_flags_i     (tc_active_branch_flags),
       .cf_type_i          (cf_type_to_iq),
       .valid_i            (valid_to_iq),
       .consumed_o         (instr_queue_consumed),
       .ready_o            (instr_queue_ready),
+      .empty_o            (instr_queue_empty),
       .replay_o           (replay),
       .replay_addr_o      (replay_addr),
+      .branch_flags_o     (iq_branch_flags_out),
       .fetch_entry_o      (fetch_entry_o),
       .fetch_entry_valid_o(fetch_entry_valid_o),
       .fetch_entry_ready_i(fetch_entry_ready_i),
-      .no_branch_mask_i   (tc_feeding_q)
+      .tc_feeding_i       (tc_feeding_q)
   );
 
   // -----------------------------------------------------------------------
@@ -713,19 +997,31 @@ module frontend
   logic [SLOTS_PER_CYCLE-1:0][31:0]         tc_instr;
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_pc;
   logic [SLOTS_PER_CYCLE-1:0]               tc_is_branch;
+  logic [SLOTS_PER_CYCLE-1:0]               tc_raw_taken;
   logic [SLOTS_PER_CYCLE-1:0]               tc_taken;
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
   logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
+  logic [CHUNKS_PER_TRACE-1:0]              tc_lookup_branch_predictions;
   logic [BR_CNT_WIDTH-1:0]                  tc_lookup_num_branches;
   logic                                     tc_window_eligible;
+  logic                                     tc_record_enable;
 
   assign tc_window_eligible = !serving_unaligned && !halt_i && !halt_frontend_i && !debug_mode_i;
+  // Also block the exact cycle replay starts. tc_feeding_q only goes high
+  // after the clock edge, but tc_feeding_start is already combinationally
+  // asserted in the launch cycle. Without this, the consumed taken branch
+  // that triggered replay can still launch one more lookup in that same cycle.
+  assign tc_record_enable = tc_window_eligible && !tc_feeding_q && !tc_feeding_start
+                          && addr[0][31];
 
   for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
-    assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i & tc_window_eligible;
+    assign tc_instr_valid[i] = instruction_valid[i] & ~flush_i & tc_record_enable;
     assign tc_pc[i]          = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, addr[i]};
     assign tc_instr[i]       = instr[i];
     assign tc_is_branch[i]   = is_branch[i] | is_jump[i] | is_jalr[i] | is_return[i] | is_call[i];
+    assign tc_raw_taken[i]   = ((taken_rvi_cf[i] | taken_rvc_cf[i]) | is_jump[i] | is_call[i] |
+                                (is_jalr[i] & btb_prediction_shifted[i].valid) |
+                                (is_return[i] & ras_predict.valid)) & tc_instr_valid[i];
 
     always_comb begin
       if (taken_rvi_cf[i])
@@ -746,16 +1042,11 @@ module frontend
     found_taken = 1'b0;
 
     for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
-      automatic logic raw_taken;
-      raw_taken = (taken_rvi_cf[i] | taken_rvc_cf[i]) | is_jump[i] | is_call[i] |
-                  (is_jalr[i] & btb_prediction_shifted[i].valid) |
-                  (is_return[i] & ras_predict.valid);
-
       if (found_taken) begin
         tc_taken[i] = 1'b0;
       end else begin
-        tc_taken[i] = raw_taken & tc_instr_valid[i];
-        if (raw_taken & tc_instr_valid[i]) found_taken = 1'b1;
+        tc_taken[i] = tc_raw_taken[i];
+        if (tc_raw_taken[i]) found_taken = 1'b1;
       end
     end
   end
@@ -770,8 +1061,12 @@ module frontend
   end
 
   logic tc_lookup_cond;
+  // Do not launch a new TC lookup from instructions that are currently being
+  // replayed by the TC itself, or in the exact cycle replay is launched.
+  // Otherwise the consumed taken branch that triggered replay can still create
+  // one more lookup before tc_feeding_q rises, and that re-hits one cycle later.
   assign tc_lookup_cond = (|instr_queue_consumed) && consumed_has_taken_branch &&
-                          !tc_feeding_q && tc_window_eligible;
+                          tc_record_enable && !tc_feeding_q && !tc_feeding_start;
 
   always_comb begin
     integer br_idx;
@@ -799,16 +1094,19 @@ module frontend
     end
   end
 
+  assign tc_lookup_branch_predictions = is_mispredict ? restored_branch_flags
+                                                       : tc_branch_predictions;
+
   logic [PC_WIDTH-1:0] tc_lookup_pc_q;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni)
       tc_lookup_pc_q <= '0;
     else if (tc_lookup_cond && !flush_i)
-      tc_lookup_pc_q <= trace_cache_pkg::pc_align_16(tc_pc[0]);
+      tc_lookup_pc_q <= tc_pc[0];
   end
 
   trace_cache_top #(
-      .MaxTraceInstr(CVA6Cfg.INSTR_PER_FETCH)
+      .MaxTraceInstr(MAX_TRACE_INSTR)
   ) i_trace_cache_top (
       .clk_i,
       .rst_ni,
@@ -819,17 +1117,17 @@ module frontend
       .branch_taken_i                 (tc_taken),
       .branch_target_i                (tc_target),
       .serving_unaligned_i            (serving_unaligned),
-      .flush_i                        (flush_i || is_mispredict || serving_unaligned),
-      .instr_queue_ready_i            (instr_queue_ready && tc_window_eligible),
-      .instr_queue_consumed_i         (tc_window_eligible ? instr_queue_consumed : '0),
-      .branch_predictions_i           (tc_window_eligible ? tc_branch_predictions : '0),
-      .lookup_num_branches_i          (tc_window_eligible ? tc_lookup_num_branches : '0),
+      .flush_i                        (flush_i || is_mispredict || tc_feeding_q),
+      .instr_queue_ready_i            (instr_queue_ready && tc_record_enable),
+      .instr_queue_consumed_i         (tc_record_enable ? instr_queue_consumed : '0),
+      .branch_predictions_i           (tc_record_enable ? tc_lookup_branch_predictions : '0),
+      .lookup_num_branches_i          (tc_record_enable ? tc_lookup_num_branches : '0),
       .resolved_branch_valid_i        (resolved_branch_i.valid),
       .resolved_branch_pc_i           (resolved_branch_i.pc),
       .resolved_branch_is_taken_i     (resolved_branch_i.is_taken),
       .resolved_branch_is_mispredict_i(resolved_branch_i.is_mispredict),
       .lookup_valid_i                 (tc_lookup_cond),
-      .lookup_pc_i                    (trace_cache_pkg::pc_align_16(tc_pc[0])),
+      .lookup_pc_i                    (tc_pc[0]),
       .trace_hit_o                    (tc_trace_hit),
       .trace_instructions_o           (tc_trace_instructions),
       .trace_length_o                 (tc_trace_length),
@@ -851,380 +1149,405 @@ module frontend
       .tc_miss_path_o                 (tc_miss_path)
   );
 
+  logic tc_trace_policy_ok;
+
+`ifndef SYNTHESIS
+  initial begin
+    tc_disable_replay_q = $test$plusargs("TC_DISABLE_REPLAY");
+  end
+
+  initial begin
+    $display("[TC-RUN-MARKER] TC_FIX_V56_STABILIZE_PENDING_AND_RAS");
+    if (tc_disable_replay_q)
+      $display("[TC-RUN-MARKER] TC_SWITCH_DISABLE_REPLAY_ACTIVE");
+  end
+`else
+  assign tc_disable_replay_q = 1'b0;
+`endif
+
   assign tc_active_hit = tc_lookup_result_valid && tc_trace_hit &&
                          (tc_trace_length != '0) && !flush_i && !is_mispredict;
 
   // Replay policy:
-  // exactly one taken control-flow in the trace.
-  // Per-slot address FIFOs in instr_queue allow the taken CF in any slot.
+  // - exactly one taken control-flow
+  // - branch map must be consistent
+  // - no calls, because the current replay path does not preserve RAS side effects
+  assign tc_trace_policy_ok = tc_trace_starts_ok &&
+                              tc_trace_branch_map_ok &&
+                              (tc_trace_num_taken == TAKEN_CNT_WIDTH'(1)) &&
+                              !tc_trace_has_call &&
+                              !tc_disable_replay_q;
+
+  // Capture a hit into pending only while the normal IQ path is still draining.
+  // If the queue is already empty, use the trace immediately through tc_active_use.
+  assign tc_pending_capture = tc_active_hit &&
+                              tc_trace_policy_ok &&
+                              instr_queue_ready &&
+                              !instr_queue_empty &&
+                              !tc_feeding_q &&
+                              !tc_pending_q &&
+                              !tc_same_pc_rehit_block &&
+                              !tc_same_lookup_oneshot_block;
+
+  assign tc_pending_start = tc_pending_q &&
+                            instr_queue_ready &&
+                            instr_queue_empty &&
+                            !tc_feeding_q &&
+                            !flush_i &&
+                            !is_mispredict &&
+                            !tc_same_pc_rehit_block;
+
   assign tc_active_use = tc_active_hit &&
-                         tc_trace_starts_ok &&
-                         (tc_trace_num_taken == TAKEN_CNT_WIDTH'(1)) &&
+                         tc_trace_policy_ok &&
+                         instr_queue_ready &&
+                         instr_queue_empty &&
                          !tc_feeding_q &&
-                         (tc_trace_pcs[0] >= PC_WIDTH'(64'h80001000));
+                         !tc_pending_q &&
+                         !tc_same_pc_rehit_block &&
+                         !tc_same_lookup_oneshot_block;
 
-`ifndef SYNTHESIS
 // pragma translate_off
-  initial $display("[TC-FRONT-VERSION] 2026-03-23-stats-v3-runtime-summary");
-  localparam logic [63:0] TC_BENCH_START_PC = 64'h80001568;
-  localparam logic [63:0] TC_BENCH_END_PC   = 64'h80001576;
-
-  int unsigned      tc_lookup_total, tc_lookup_hits, tc_lookup_misses;
-  int unsigned      tc_active_hit_total, tc_active_use_total;
-  int unsigned      tc_feed_starts_total, tc_feeds_completed, tc_feed_cycles_total, tc_feed_instr_total;
-  int unsigned      tc_miss_empty_total, tc_miss_pc_total, tc_miss_path_total;
-  int unsigned      tc_reject_bad_start, tc_reject_num_taken, tc_reject_last_taken_cf;
-  int unsigned      tc_reject_busy, tc_reject_low_pc, tc_reject_other;
-  int unsigned      tc_progress_commit_count_q;
-  longint unsigned  tc_total_cycles_q;
-
-  logic             tc_bench_active_q, tc_bench_done_q;
-  longint unsigned  tc_bench_cycles_q, tc_bench_feed_cycles_q;
-  int unsigned      tc_bench_lookup_total, tc_bench_lookup_hits, tc_bench_lookup_misses;
-  int unsigned      tc_bench_active_hits, tc_bench_active_uses, tc_bench_feed_instr_total;
-
-  int unsigned      tc_hit_len_hist [1:TRACE_LEN];
-  int unsigned      tc_use_len_hist [1:TRACE_LEN];
-  int unsigned      tc_hit_taken_hist [0:MAX_TAKEN];
-  int unsigned      tc_use_taken_hist [0:MAX_TAKEN];
-  int unsigned      tc_hit_branch_hist [0:CHUNKS_PER_TRACE];
-  int unsigned      tc_use_branch_hist [0:CHUNKS_PER_TRACE];
-  longint unsigned  tc_replay_seq_q, tc_replay_active_id_q;
-  int unsigned      tc_replay_cycle_count_q;
+  longint unsigned tc_total_cycles_q;
+  int unsigned tc_dbg_lookup_count_q;
+  int unsigned tc_dbg_hit_count_q;
+  int unsigned tc_dbg_accept_count_q;
+  int unsigned tc_dbg_reject_not_ready_q;
+  int unsigned tc_dbg_reject_policy_q;
+  int unsigned tc_dbg_feed_done_q;
+  int unsigned tc_dbg_feed_cycles_q;
+  int unsigned tc_dbg_hold_count_q;
+  int unsigned tc_dbg_pending_use_count_q;
+  int unsigned tc_dbg_miss_empty_q;
+  int unsigned tc_dbg_miss_pc_q;
+  int unsigned tc_dbg_miss_path_q;
+  int unsigned tc_dbg_feed_start_count_q;
+  int unsigned tc_dbg_replay_pkt_count_q;
+  int unsigned tc_dbg_feed_start_total_q;
+  int unsigned tc_dbg_tc_pkt_cycles_q;
+  int unsigned tc_dbg_tc_instr_total_q;
+  int unsigned tc_dbg_icache_pkt_cycles_q;
+  int unsigned tc_dbg_icache_instr_total_q;
+  int unsigned tc_dbg_icache_block_cycles_q;
+  logic        tc_dbg_seen_coremark_pc_q;
+  int unsigned tc_dbg_pc_floor_breach_q;
+  int unsigned tc_dbg_window_total_q;
+  int unsigned tc_dbg_window_unaligned_q;
+  int unsigned tc_dbg_window_not_ready_q;
+  int unsigned tc_dbg_window_cf0_q;
+  int unsigned tc_dbg_window_cf1_q;
+  int unsigned tc_dbg_window_cf2_q;
+  int unsigned tc_dbg_window_cf3_q;
+  int unsigned tc_dbg_window_cf4p_q;
+  int unsigned tc_dbg_window_taken0_q;
+  int unsigned tc_dbg_window_taken1_q;
+  int unsigned tc_dbg_window_taken2_q;
+  int unsigned tc_dbg_window_taken3_q;
+  int unsigned tc_dbg_window_taken4p_q;
+  int unsigned tc_dbg_window_single_taken_q;
+  int unsigned tc_dbg_window_multi_taken_q;
+  int unsigned tc_dbg_mispredict_count_q;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      tc_total_cycles_q        <= 0;
-      tc_lookup_total          <= 0;
-      tc_lookup_hits           <= 0;
-      tc_lookup_misses         <= 0;
-      tc_active_hit_total      <= 0;
-      tc_active_use_total      <= 0;
-      tc_feed_starts_total     <= 0;
-      tc_feeds_completed       <= 0;
-      tc_feed_cycles_total     <= 0;
-      tc_feed_instr_total      <= 0;
-      tc_miss_empty_total      <= 0;
-      tc_miss_pc_total         <= 0;
-      tc_miss_path_total       <= 0;
-      tc_reject_bad_start      <= 0;
-      tc_reject_num_taken      <= 0;
-      tc_reject_last_taken_cf  <= 0;
-      tc_reject_busy           <= 0;
-      tc_reject_low_pc         <= 0;
-      tc_reject_other          <= 0;
-      tc_progress_commit_count_q <= 0;
-      tc_bench_active_q        <= 1'b0;
-      tc_bench_done_q          <= 1'b0;
-      tc_bench_cycles_q        <= 0;
-      tc_bench_feed_cycles_q   <= 0;
-      tc_bench_lookup_total    <= 0;
-      tc_bench_lookup_hits     <= 0;
-      tc_bench_lookup_misses   <= 0;
-      tc_bench_active_hits     <= 0;
-      tc_bench_active_uses     <= 0;
-      tc_bench_feed_instr_total <= 0;
-      for (int i = 1; i <= TRACE_LEN; i++) begin
-        tc_hit_len_hist[i] <= 0;
-        tc_use_len_hist[i] <= 0;
-      end
-      for (int i = 0; i <= MAX_TAKEN; i++) begin
-        tc_hit_taken_hist[i] <= 0;
-        tc_use_taken_hist[i] <= 0;
-      end
-      for (int i = 0; i <= CHUNKS_PER_TRACE; i++) begin
-        tc_hit_branch_hist[i] <= 0;
-        tc_use_branch_hist[i] <= 0;
-      end
-      tc_replay_seq_q         <= 0;
-      tc_replay_active_id_q   <= 0;
-      tc_replay_cycle_count_q <= 0;
+      tc_total_cycles_q         <= 0;
+      tc_dbg_lookup_count_q     <= 0;
+      tc_dbg_hit_count_q        <= 0;
+      tc_dbg_accept_count_q     <= 0;
+      tc_dbg_reject_not_ready_q <= 0;
+      tc_dbg_reject_policy_q    <= 0;
+      tc_dbg_feed_done_q        <= 0;
+      tc_dbg_feed_cycles_q      <= 0;
+      tc_dbg_hold_count_q       <= 0;
+      tc_dbg_pending_use_count_q <= 0;
+      tc_dbg_miss_empty_q       <= 0;
+      tc_dbg_miss_pc_q          <= 0;
+      tc_dbg_miss_path_q        <= 0;
+      tc_dbg_feed_start_count_q <= 0;
+      tc_dbg_replay_pkt_count_q <= 0;
+      tc_dbg_feed_start_total_q <= 0;
+      tc_dbg_tc_pkt_cycles_q    <= 0;
+      tc_dbg_tc_instr_total_q   <= 0;
+      tc_dbg_icache_pkt_cycles_q <= 0;
+      tc_dbg_icache_instr_total_q <= 0;
+      tc_dbg_icache_block_cycles_q <= 0;
+      tc_dbg_seen_coremark_pc_q <= 1'b0;
+      tc_dbg_pc_floor_breach_q <= 0;
+      tc_dbg_window_total_q <= 0;
+      tc_dbg_window_unaligned_q <= 0;
+      tc_dbg_window_not_ready_q <= 0;
+      tc_dbg_window_cf0_q <= 0;
+      tc_dbg_window_cf1_q <= 0;
+      tc_dbg_window_cf2_q <= 0;
+      tc_dbg_window_cf3_q <= 0;
+      tc_dbg_window_cf4p_q <= 0;
+      tc_dbg_window_taken0_q <= 0;
+      tc_dbg_window_taken1_q <= 0;
+      tc_dbg_window_taken2_q <= 0;
+      tc_dbg_window_taken3_q <= 0;
+      tc_dbg_window_taken4p_q <= 0;
+      tc_dbg_window_single_taken_q <= 0;
+      tc_dbg_window_multi_taken_q <= 0;
+      tc_dbg_mispredict_count_q <= 0;
     end else begin
+      int unsigned src_cnt;
+      int unsigned cf_cnt;
+      int unsigned taken_cnt;
       tc_total_cycles_q <= tc_total_cycles_q + 1;
 
-      if (tc_feeding_start) begin
-        tc_replay_seq_q         <= tc_replay_seq_q + 1;
-        tc_replay_active_id_q   <= tc_replay_seq_q + 1;
-        tc_replay_cycle_count_q <= 0;
-      end else if (tc_feeding_q) begin
-        tc_replay_cycle_count_q <= tc_replay_cycle_count_q + 1;
-      end else begin
-        tc_replay_cycle_count_q <= 0;
-      end
-
-      if (pc_commit_i == TC_BENCH_START_PC) begin
-        tc_bench_active_q <= 1'b1;
-        tc_bench_done_q   <= 1'b0;
-      end
-      if ((pc_commit_i == TC_BENCH_END_PC) && !tc_bench_done_q) begin
-        int unsigned tc_commit_br_ge4;
-        int unsigned tc_use_br_ge4;
-        tc_bench_active_q <= 1'b0;
-        tc_bench_done_q   <= 1'b1;
-
-        tc_commit_br_ge4 = i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[4]
-                         + i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[5]
-                         + i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[6]
-                         + i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[7]
-                         + i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[8];
-        tc_use_br_ge4    = tc_use_branch_hist[4]
-                         + tc_use_branch_hist[5]
-                         + tc_use_branch_hist[6]
-                         + tc_use_branch_hist[7]
-                         + tc_use_branch_hist[8];
-
-        $display("\n[BENCH-TC] === Trace Cache (CoreMark only) ===");
-        $display("[BENCH-TC] lookups=%0d hits=%0d misses=%0d hit_rate=%0d%%",
-                 tc_bench_lookup_total, tc_bench_lookup_hits, tc_bench_lookup_misses,
-                 (tc_bench_lookup_total > 0) ? ((tc_bench_lookup_hits * 100) / tc_bench_lookup_total) : 0);
-        $display("[BENCH-TC] active_hits=%0d active_uses=%0d use_rate=%0d%% replayed_instr=%0d feed_cycles=%0d (%0d%% of bench window)",
-                 tc_bench_active_hits, tc_bench_active_uses,
-                 (tc_bench_active_hits > 0) ? ((tc_bench_active_uses * 100) / tc_bench_active_hits) : 0,
-                 tc_bench_feed_instr_total, tc_bench_feed_cycles_q,
-                 (tc_bench_cycles_q > 0) ? ((int'(tc_bench_feed_cycles_q) * 100) / int'(tc_bench_cycles_q)) : 0);
-        $display("[BENCH-TC] bench_cycles=%0d replay_efficiency: instr_per_use=%0d.%02d cycles_per_use=%0d.%02d instr_per_feed_cycle=%0d.%02d",
-                 tc_bench_cycles_q,
-                 ((tc_bench_active_uses > 0) ? ((tc_bench_feed_instr_total * 100) / tc_bench_active_uses) : 0)/100,
-                 ((tc_bench_active_uses > 0) ? ((tc_bench_feed_instr_total * 100) / tc_bench_active_uses) : 0)%100,
-                 ((tc_bench_active_uses > 0) ? ((int'(tc_bench_feed_cycles_q) * 100) / tc_bench_active_uses) : 0)/100,
-                 ((tc_bench_active_uses > 0) ? ((int'(tc_bench_feed_cycles_q) * 100) / tc_bench_active_uses) : 0)%100,
-                 ((tc_bench_feed_cycles_q > 0) ? ((tc_bench_feed_instr_total * 100) / int'(tc_bench_feed_cycles_q)) : 0)/100,
-                 ((tc_bench_feed_cycles_q > 0) ? ((tc_bench_feed_instr_total * 100) / int'(tc_bench_feed_cycles_q)) : 0)%100);
-
-        $display("[TC-FRONT] ===== Frontend / replay summary =====");
-        $display("[TC-FRONT] lookups=%0d hits=%0d misses=%0d hit_rate=%0d%%",
-                 tc_lookup_total, tc_lookup_hits, tc_lookup_misses,
-                 (tc_lookup_total > 0) ? ((tc_lookup_hits * 100) / tc_lookup_total) : 0);
-        $display("[TC-FRONT] active_hits=%0d active_uses=%0d use_rate_from_active_hits=%0d%%",
-                 tc_active_hit_total, tc_active_use_total,
-                 (tc_active_hit_total > 0) ? ((tc_active_use_total * 100) / tc_active_hit_total) : 0);
-        $display("[TC-FRONT] feed_starts=%0d completed_feeds=%0d replayed_instr=%0d feed_cycles=%0d (%0d%% of full run)",
-                 tc_feed_starts_total, tc_feeds_completed, tc_feed_instr_total,
-                 tc_feed_cycles_total,
-                 (tc_total_cycles_q > 0) ? ((int'(tc_feed_cycles_total) * 100) / int'(tc_total_cycles_q)) : 0);
-        $display("[TC-FRONT] replay_efficiency: instr_per_use=%0d.%02d cycles_per_use=%0d.%02d instr_per_feed_cycle=%0d.%02d",
-                 ((tc_feed_starts_total > 0) ? ((tc_feed_instr_total * 100) / tc_feed_starts_total) : 0)/100,
-                 ((tc_feed_starts_total > 0) ? ((tc_feed_instr_total * 100) / tc_feed_starts_total) : 0)%100,
-                 ((tc_feed_starts_total > 0) ? ((tc_feed_cycles_total * 100) / tc_feed_starts_total) : 0)/100,
-                 ((tc_feed_starts_total > 0) ? ((tc_feed_cycles_total * 100) / tc_feed_starts_total) : 0)%100,
-                 ((tc_feed_cycles_total > 0) ? ((tc_feed_instr_total * 100) / tc_feed_cycles_total) : 0)/100,
-                 ((tc_feed_cycles_total > 0) ? ((tc_feed_instr_total * 100) / tc_feed_cycles_total) : 0)%100);
-        $display("[TC-FRONT] miss_breakdown: empty=%0d pc=%0d path=%0d",
-                 tc_miss_empty_total, tc_miss_pc_total, tc_miss_path_total);
-        $display("[TC-FRONT] active_hit_rejects: bad_start=%0d num_taken!=1=%0d last_not_taken_cf=%0d busy=%0d low_pc=%0d other=%0d",
-                 tc_reject_bad_start, tc_reject_num_taken, tc_reject_last_taken_cf,
-                 tc_reject_busy, tc_reject_low_pc, tc_reject_other);
-        $display("[TC-FRONT] hit_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
-                 tc_hit_len_hist[1], tc_hit_len_hist[2], tc_hit_len_hist[3], tc_hit_len_hist[4]);
-        $display("[TC-FRONT] used_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
-                 tc_use_len_hist[1], tc_use_len_hist[2], tc_use_len_hist[3], tc_use_len_hist[4]);
-        $display("[TC-FRONT] hit_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
-                 tc_hit_taken_hist[0], tc_hit_taken_hist[1], tc_hit_taken_hist[2],
-                 tc_hit_taken_hist[3], tc_hit_taken_hist[4]);
-        $display("[TC-FRONT] used_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
-                 tc_use_taken_hist[0], tc_use_taken_hist[1], tc_use_taken_hist[2],
-                 tc_use_taken_hist[3], tc_use_taken_hist[4]);
-        $display("[TC-FRONT] hit_branch_hist: B0=%0d B1=%0d B2=%0d B3=%0d B4plus=%0d",
-                 tc_hit_branch_hist[0], tc_hit_branch_hist[1], tc_hit_branch_hist[2],
-                 tc_hit_branch_hist[3], tc_hit_branch_hist[4] + tc_hit_branch_hist[5] + tc_hit_branch_hist[6] + tc_hit_branch_hist[7] + tc_hit_branch_hist[8]);
-        $display("[TC-FRONT] used_branch_hist: B0=%0d B1=%0d B2=%0d B3=%0d B4plus=%0d",
-                 tc_use_branch_hist[0], tc_use_branch_hist[1], tc_use_branch_hist[2],
-                 tc_use_branch_hist[3], tc_use_br_ge4);
-        $display("[TC-FRONT] =====================================");
-
-        $display("[TC-BUILD] ===== Trace builder summary =====");
-        $display("[TC-BUILD] windows total=%0d aligned=%0d unaligned=%0d unaligned_with_taken=%0d",
-                 i_trace_cache_top.i_trace_builder.tc_stat_windows_total,
-                 i_trace_cache_top.i_trace_builder.tc_stat_windows_aligned,
-                 i_trace_cache_top.i_trace_builder.tc_stat_windows_unaligned,
-                 i_trace_cache_top.i_trace_builder.tc_stat_windows_unaligned_with_taken);
-        $display("[TC-BUILD] windows_with_taken=%0d trace_start_windows=%0d",
-                 i_trace_cache_top.i_trace_builder.tc_stat_windows_with_taken,
-                 i_trace_cache_top.i_trace_builder.tc_stat_trace_start_windows);
-        $display("[TC-BUILD] finalize_attempts=%0d committed=%0d duplicate_dropped=%0d indirect_dropped=%0d",
-                 i_trace_cache_top.i_trace_builder.tc_stat_trace_finalize_attempts,
-                 i_trace_cache_top.i_trace_builder.tc_stat_trace_commits,
-                 i_trace_cache_top.i_trace_builder.tc_stat_trace_dup_drops,
-                 i_trace_cache_top.i_trace_builder.tc_stat_trace_indirect_drops);
-        $display("[TC-BUILD] end_reasons: full=%0d max_instr=%0d max_taken=%0d",
-                 i_trace_cache_top.i_trace_builder.tc_stat_trace_end_full,
-                 i_trace_cache_top.i_trace_builder.tc_stat_trace_end_max_instr,
-                 i_trace_cache_top.i_trace_builder.tc_stat_trace_end_max_taken);
-        $display("[TC-BUILD] attempted_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
-                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_len_hist[1],
-                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_len_hist[2],
-                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_len_hist[3],
-                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_len_hist[4]);
-        $display("[TC-BUILD] attempted_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
-                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_taken_hist[0],
-                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_taken_hist[1],
-                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_taken_hist[2],
-                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_taken_hist[3],
-                 i_trace_cache_top.i_trace_builder.tc_stat_attempt_taken_hist[4]);
-        $display("[TC-BUILD] committed_len_hist: L1=%0d L2=%0d L3=%0d L4=%0d",
-                 i_trace_cache_top.i_trace_builder.tc_stat_commit_len_hist[1],
-                 i_trace_cache_top.i_trace_builder.tc_stat_commit_len_hist[2],
-                 i_trace_cache_top.i_trace_builder.tc_stat_commit_len_hist[3],
-                 i_trace_cache_top.i_trace_builder.tc_stat_commit_len_hist[4]);
-        $display("[TC-BUILD] committed_taken_hist: T0=%0d T1=%0d T2=%0d T3=%0d T4=%0d",
-                 i_trace_cache_top.i_trace_builder.tc_stat_commit_taken_hist[0],
-                 i_trace_cache_top.i_trace_builder.tc_stat_commit_taken_hist[1],
-                 i_trace_cache_top.i_trace_builder.tc_stat_commit_taken_hist[2],
-                 i_trace_cache_top.i_trace_builder.tc_stat_commit_taken_hist[3],
-                 i_trace_cache_top.i_trace_builder.tc_stat_commit_taken_hist[4]);
-        $display("[TC-BUILD] committed_branch_hist: B0=%0d B1=%0d B2=%0d B3=%0d B4plus=%0d",
-                 i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[0],
-                 i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[1],
-                 i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[2],
-                 i_trace_cache_top.i_trace_builder.tc_stat_commit_branch_hist[3],
-                 tc_commit_br_ge4);
-        $display("[TC-BUILD] =================================");
-      end
-
-      if (tc_bench_active_q)
-        tc_bench_cycles_q <= tc_bench_cycles_q + 1;
-
-      if (i_trace_cache_top.i_trace_builder.commit_valid_q) begin
-        tc_progress_commit_count_q <= tc_progress_commit_count_q + 1;
-        if (((tc_progress_commit_count_q + 1) % 500) == 0)
-          $display("[TC-PROGRESS] commits=%0d lookups=%0d hits=%0d active_uses=%0d @ %0t",
-                   tc_progress_commit_count_q + 1, tc_lookup_total, tc_lookup_hits,
-                   tc_active_use_total, $time);
-      end
+      if (resolved_branch_i.valid && resolved_branch_i.is_mispredict)
+        tc_dbg_mispredict_count_q <= tc_dbg_mispredict_count_q + 1;
 
       if (tc_lookup_result_valid) begin
-        tc_lookup_total <= tc_lookup_total + 1;
+        tc_dbg_lookup_count_q <= tc_dbg_lookup_count_q + 1;
+
         if (tc_trace_hit) begin
-          tc_lookup_hits <= tc_lookup_hits + 1;
-          if ((int'(tc_trace_length) >= 1) && (int'(tc_trace_length) <= TRACE_LEN))
-            tc_hit_len_hist[int'(tc_trace_length)] <= tc_hit_len_hist[int'(tc_trace_length)] + 1;
-          if (int'(tc_trace_num_taken) <= MAX_TAKEN)
-            tc_hit_taken_hist[int'(tc_trace_num_taken)] <= tc_hit_taken_hist[int'(tc_trace_num_taken)] + 1;
-          if (int'(tc_trace_num_branches) <= CHUNKS_PER_TRACE)
-            tc_hit_branch_hist[int'(tc_trace_num_branches)] <= tc_hit_branch_hist[int'(tc_trace_num_branches)] + 1;
+          tc_dbg_hit_count_q <= tc_dbg_hit_count_q + 1;
+
+          if (!tc_feeding_q) begin
+            if (tc_trace_policy_ok) begin
+              if (tc_active_use)
+                tc_dbg_accept_count_q <= tc_dbg_accept_count_q + 1;
+              else if (!tc_pending_capture)
+                tc_dbg_reject_not_ready_q <= tc_dbg_reject_not_ready_q + 1;
+            end else begin
+              tc_dbg_reject_policy_q <= tc_dbg_reject_policy_q + 1;
+            end
+          end
         end else begin
-          tc_lookup_misses <= tc_lookup_misses + 1;
-          if (tc_miss_reason_empty) tc_miss_empty_total <= tc_miss_empty_total + 1;
-          if (tc_miss_reason_pc)    tc_miss_pc_total    <= tc_miss_pc_total + 1;
-          if (tc_miss_reason_path)  tc_miss_path_total  <= tc_miss_path_total + 1;
-        end
-
-        if (tc_bench_active_q) begin
-          tc_bench_lookup_total <= tc_bench_lookup_total + 1;
-          if (tc_trace_hit) tc_bench_lookup_hits <= tc_bench_lookup_hits + 1;
-          else              tc_bench_lookup_misses <= tc_bench_lookup_misses + 1;
+          if (tc_miss_reason_empty) tc_dbg_miss_empty_q <= tc_dbg_miss_empty_q + 1;
+          if (tc_miss_reason_pc)    tc_dbg_miss_pc_q    <= tc_dbg_miss_pc_q + 1;
+          if (tc_miss_reason_path)  tc_dbg_miss_path_q  <= tc_dbg_miss_path_q + 1;
         end
       end
 
-      if (tc_active_hit) begin
-        tc_active_hit_total <= tc_active_hit_total + 1;
-        if (tc_bench_active_q)
-          tc_bench_active_hits <= tc_bench_active_hits + 1;
+      if (tc_feeding_q)
+        tc_dbg_feed_cycles_q <= tc_dbg_feed_cycles_q + 1;
 
-        if (!tc_active_use) begin
-          if (!tc_trace_starts_ok)
-            tc_reject_bad_start <= tc_reject_bad_start + 1;
-          else if (tc_trace_num_taken != TAKEN_CNT_WIDTH'(1))
-            tc_reject_num_taken <= tc_reject_num_taken + 1;
-          else if (!tc_trace_last_is_taken_cf)
-            tc_reject_last_taken_cf <= tc_reject_last_taken_cf + 1;
-          else if (tc_feeding_q)
-            tc_reject_busy <= tc_reject_busy + 1;
-          else if (tc_trace_pcs[0] < PC_WIDTH'(64'h80001000))
-            tc_reject_low_pc <= tc_reject_low_pc + 1;
-          else
-            tc_reject_other <= tc_reject_other + 1;
+      if (tc_feeding_start)
+        tc_dbg_feed_start_total_q <= tc_dbg_feed_start_total_q + 1;
+
+      if (!tc_icache_sidefx_en)
+        tc_dbg_icache_block_cycles_q <= tc_dbg_icache_block_cycles_q + 1;
+
+      if (tc_icache_sidefx_en && (|instruction_valid)) begin
+        tc_dbg_icache_pkt_cycles_q <= tc_dbg_icache_pkt_cycles_q + 1;
+        src_cnt = 0;
+        for (int k = 0; k < CVA6Cfg.INSTR_PER_FETCH; k++)
+          if (instruction_valid[k]) src_cnt++;
+        tc_dbg_icache_instr_total_q <= tc_dbg_icache_instr_total_q + src_cnt;
+      end
+
+      if ((|instruction_valid) && addr[0][31] && serving_unaligned &&
+          !tc_feeding_q && !tc_feeding_start)
+        tc_dbg_window_unaligned_q <= tc_dbg_window_unaligned_q + 1;
+
+      if ((|instruction_valid) && addr[0][31] && tc_window_eligible &&
+          !instr_queue_ready && !tc_feeding_q && !tc_feeding_start)
+        tc_dbg_window_not_ready_q <= tc_dbg_window_not_ready_q + 1;
+
+      if (tc_icache_sidefx_en && (|instruction_valid) && addr[0][31]) begin
+        cf_cnt = 0;
+        taken_cnt = 0;
+        for (int k = 0; k < SLOTS_PER_CYCLE; k++) begin
+          if (instruction_valid[k] && tc_is_branch[k])
+            cf_cnt++;
+          if (tc_raw_taken[k])
+            taken_cnt++;
+        end
+
+        tc_dbg_window_total_q <= tc_dbg_window_total_q + 1;
+
+        unique case (cf_cnt)
+          0:      tc_dbg_window_cf0_q <= tc_dbg_window_cf0_q + 1;
+          1:      tc_dbg_window_cf1_q <= tc_dbg_window_cf1_q + 1;
+          2:      tc_dbg_window_cf2_q <= tc_dbg_window_cf2_q + 1;
+          3:      tc_dbg_window_cf3_q <= tc_dbg_window_cf3_q + 1;
+          default: tc_dbg_window_cf4p_q <= tc_dbg_window_cf4p_q + 1;
+        endcase
+
+        unique case (taken_cnt)
+          0:      tc_dbg_window_taken0_q <= tc_dbg_window_taken0_q + 1;
+          1:      tc_dbg_window_taken1_q <= tc_dbg_window_taken1_q + 1;
+          2:      tc_dbg_window_taken2_q <= tc_dbg_window_taken2_q + 1;
+          3:      tc_dbg_window_taken3_q <= tc_dbg_window_taken3_q + 1;
+          default: tc_dbg_window_taken4p_q <= tc_dbg_window_taken4p_q + 1;
+        endcase
+
+        if (taken_cnt == 1)
+          tc_dbg_window_single_taken_q <= tc_dbg_window_single_taken_q + 1;
+        else if (taken_cnt > 1)
+          tc_dbg_window_multi_taken_q <= tc_dbg_window_multi_taken_q + 1;
+      end
+
+      if (fetch_entry_valid_o[0] && fetch_entry_ready_i[0] &&
+          (fetch_entry_o[0].address >= CVA6Cfg.VLEN'(64'h80000000)))
+        tc_dbg_seen_coremark_pc_q <= 1'b1;
+
+      if (tc_dbg_seen_coremark_pc_q && fetch_entry_valid_o[0] && fetch_entry_ready_i[0] &&
+          (fetch_entry_o[0].address < CVA6Cfg.VLEN'(64'h80000000))) begin
+        tc_dbg_pc_floor_breach_q <= tc_dbg_pc_floor_breach_q + 1;
+        if (tc_dbg_pc_floor_breach_q < 16) begin
+          $display("[TC-PC-FLOOR-BREACH] t=%0t pc=0x%h replay=%0b replay_addr=0x%h iq_ready=%0b tc_feeding=%0b pending=%0b",
+                   $time, fetch_entry_o[0].address, replay, replay_addr, instr_queue_ready, tc_feeding_q, tc_pending_q);
         end
       end
 
-      if (tc_feeding_start) begin
-        tc_active_use_total  <= tc_active_use_total + 1;
-        tc_feed_starts_total <= tc_feed_starts_total + 1;
-        tc_feed_instr_total  <= tc_feed_instr_total + int'(tc_trace_length);
+      if (tc_feeding_q && (|replay_valid_iq)) begin
+        tc_dbg_tc_pkt_cycles_q <= tc_dbg_tc_pkt_cycles_q + 1;
+        src_cnt = 0;
+        for (int k = 0; k < CVA6Cfg.INSTR_PER_FETCH; k++)
+          if (replay_valid_iq[k]) src_cnt++;
+        tc_dbg_tc_instr_total_q <= tc_dbg_tc_instr_total_q + src_cnt;
+      end
 
-        if ((int'(tc_trace_length) >= 1) && (int'(tc_trace_length) <= TRACE_LEN))
-          tc_use_len_hist[int'(tc_trace_length)] <= tc_use_len_hist[int'(tc_trace_length)] + 1;
-        if (int'(tc_trace_num_taken) <= MAX_TAKEN)
-          tc_use_taken_hist[int'(tc_trace_num_taken)] <= tc_use_taken_hist[int'(tc_trace_num_taken)] + 1;
-        if (int'(tc_trace_num_branches) <= CHUNKS_PER_TRACE)
-          tc_use_branch_hist[int'(tc_trace_num_branches)] <= tc_use_branch_hist[int'(tc_trace_num_branches)] + 1;
+      if (tc_pending_capture)
+        tc_dbg_hold_count_q <= tc_dbg_hold_count_q + 1;
 
-        if (tc_bench_active_q) begin
-          tc_bench_active_uses     <= tc_bench_active_uses + 1;
-          tc_bench_feed_instr_total <= tc_bench_feed_instr_total + int'(tc_trace_length);
+      if (tc_pending_start) begin
+        tc_dbg_pending_use_count_q <= tc_dbg_pending_use_count_q + 1;
+        tc_dbg_accept_count_q <= tc_dbg_accept_count_q + 1;
+      end
+
+      if (tc_feeding_done) begin
+        tc_dbg_feed_done_q <= tc_dbg_feed_done_q + 1;
+        if (tc_dbg_feed_done_q < 256) begin
+          $display("[TC-FEED-DONE] t=%0t len_q=%0d consumed_q=%b consumed_d=%b iq_cons=%b iq_ready=%0b iq_empty=%0b next_pc=0x%h",
+                   $time, tc_feeding_len_q, tc_feeding_consumed_q, tc_feeding_consumed_d,
+                   instr_queue_consumed, instr_queue_ready, instr_queue_empty, tc_feeding_next_pc_q);
         end
       end
 
-      if (tc_feeding_q) begin
-        tc_feed_cycles_total <= tc_feed_cycles_total + 1;
-        if (tc_bench_active_q)
-          tc_bench_feed_cycles_q <= tc_bench_feed_cycles_q + 1;
+      if (tc_feeding_start && (tc_dbg_feed_start_count_q < 96)) begin
+        tc_dbg_feed_start_count_q <= tc_dbg_feed_start_count_q + 1;
+        if (tc_pending_start) begin
+          $display("[TC-PENDING-USE] t=%0t pc0=0x%h len=%0d num_taken=%0d iq_ready=%0b iq_empty=%0b",
+                   $time, tc_pending_pcs_q[0], tc_pending_len_q, tc_pending_num_taken_q, instr_queue_ready, instr_queue_empty);
+          $display("[TC-FEED-START] #%0d t=%0t len=%0d next_pc=0x%h lookup_pc0=0x%h num_taken=%0d",
+                   tc_dbg_feed_start_count_q + 1, $time, tc_pending_len_q, tc_pending_next_pc_q,
+                   tc_pending_pcs_q[0], tc_pending_num_taken_q);
+          for (int k = 0; k < TRACE_LEN; k++) begin
+            if (k < int'(tc_pending_len_q)) begin
+              $display("[TC-FEED-START]   src[%0d] pc=0x%h instr=0x%08h cf=%0d taken_cf=%0b",
+                       k, tc_pending_pcs_q[k], tc_pending_instr_q[k],
+                       tc_replay_cf_type(tc_pending_instr_q[k]), tc_pending_taken_cf_q[k]);
+            end
+          end
+        end else begin
+          $display("[TC-FEED-START] #%0d t=%0t len=%0d next_pc=0x%h lookup_pc0=0x%h num_taken=%0d",
+                   tc_dbg_feed_start_count_q + 1, $time, tc_trace_length, tc_trace_next_pc,
+                   tc_trace_pcs[0], tc_trace_num_taken);
+          for (int k = 0; k < TRACE_LEN; k++) begin
+            if (k < int'(tc_trace_length)) begin
+              $display("[TC-FEED-START]   src[%0d] pc=0x%h instr=0x%08h cf=%0d taken_cf=%0b",
+                       k, tc_trace_pcs[k], tc_trace_instructions[k],
+                       tc_replay_cf_type(tc_trace_instructions[k]), tc_feeding_taken_cf_d[k]);
+            end
+          end
+        end
       end
 
-      if (tc_feeding_done)
-        tc_feeds_completed <= tc_feeds_completed + 1;
+      if (tc_feeding_q && (|replay_valid_iq) && (tc_dbg_replay_pkt_count_q < 256)) begin
+        tc_dbg_replay_pkt_count_q <= tc_dbg_replay_pkt_count_q + 1;
+        $display("[TC-REPLAY-PKT] #%0d t=%0t len_q=%0d consumed_q=%b consumed_d=%b iq_cons=%b iq_ready=%0b iq_empty=%0b",
+                 tc_dbg_replay_pkt_count_q + 1, $time, tc_feeding_len_q,
+                 tc_feeding_consumed_q, tc_feeding_consumed_d, instr_queue_consumed,
+                 instr_queue_ready, instr_queue_empty);
+        for (int k = 0; k < CVA6Cfg.INSTR_PER_FETCH; k++) begin
+          if (replay_valid_iq[k]) begin
+            $display("[TC-REPLAY-PKT]   dst[%0d]->src[%0d] pc=0x%h instr=0x%08h cf=%0d pred=0x%h",
+                     k, replay_slot_map_iq[k], replay_addr_iq[k], replay_instr_iq[k],
+                     replay_cf_type_iq[k], replay_predict_addr_iq[k]);
+          end
+        end
+      end
+
+      if (tc_lookup_result_valid && (tc_dbg_lookup_count_q < 80)) begin
+        if (tc_trace_hit) begin
+          if (tc_active_use) begin
+            $display("[TC-HIT-USE] t=%0t pc0=0x%h len=%0d num_taken=%0d last_taken_last=%0b iq_ready=%0b iq_empty=%0b",
+                     $time, tc_trace_pcs[0], tc_trace_length, tc_trace_num_taken, tc_trace_last_is_taken_cf, instr_queue_ready, instr_queue_empty);
+          end else if (tc_pending_capture) begin
+            $display("[TC-HIT-HOLD] t=%0t pc0=0x%h len=%0d num_taken=%0d last_taken_last=%0b iq_ready=%0b iq_empty=%0b",
+                     $time, tc_trace_pcs[0], tc_trace_length, tc_trace_num_taken, tc_trace_last_is_taken_cf, instr_queue_ready, instr_queue_empty);
+          end else if (tc_same_pc_rehit_block) begin
+            $display("[TC-REHIT-BLOCK] t=%0t pc0=0x%h len=%0d num_taken=%0d iq_ready=%0b iq_empty=%0b lock_pc=0x%h",
+                     $time, tc_trace_pcs[0], tc_trace_length, tc_trace_num_taken,
+                     instr_queue_ready, instr_queue_empty, tc_rehit_pc_q);
+          end else begin
+            $display("[TC-HIT-DROP] t=%0t pc0=0x%h len=%0d num_taken=%0d starts_ok=%0b last_taken_last=%0b iq_ready=%0b iq_empty=%0b pending=%0b feeding=%0b flush=%0b mispredict=%0b",
+                     $time, tc_trace_pcs[0], tc_trace_length, tc_trace_num_taken,
+                     tc_trace_starts_ok, tc_trace_last_is_taken_cf, instr_queue_ready,
+                     instr_queue_empty, tc_pending_q, tc_feeding_q, flush_i, is_mispredict);
+          end
+        end
+      end
     end
   end
 
-  `ifdef TRACE_CACHE_DEBUG_EVENTS
-  always_ff @(posedge clk_i) begin
-    if (tc_feeding_start) begin
-      $display("[TC-USE] id=%0d lookup_pc=0x%h start_pc=0x%h len=%0d branches=%0d taken=%0d next_pc=0x%h",
-               tc_replay_seq_q + 1, tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
-               tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
-      for (int i = 0; i < int'(tc_trace_length); i++) begin
-        $display("[TC-USE] id=%0d slot[%0d] pc=0x%h instr=0x%08h cf=%0d",
-                 tc_replay_seq_q + 1, i, tc_trace_pcs[i], tc_trace_instructions[i],
-                 tc_replay_cf_type(tc_trace_instructions[i]));
-      end
-      for (int i = 0; i < int'(tc_trace_num_taken); i++) begin
-        $display("[TC-USE] id=%0d taken_target[%0d]=0x%h",
-                 tc_replay_seq_q + 1, i, tc_trace_taken_targets[i]);
-      end
-    end
+  final begin
+    int unsigned tc_dbg_miss_count_q;
+    int unsigned tc_dbg_hit_rate_q;
+    int unsigned tc_dbg_accept_rate_q;
+    int unsigned tc_dbg_feed_pct_q;
+    int unsigned tc_dbg_pkt_total_q;
+    int unsigned tc_dbg_pkt_tc_share_q;
+    int unsigned tc_dbg_instr_total_q;
+    int unsigned tc_dbg_instr_tc_share_q;
 
-    if (tc_feeding_done && tc_feeding_q) begin
-      $display("[TC-USE-END] id=%0d next_fetch_pc=0x%h feed_cycles=%0d replayed_instr=%0d",
-               tc_replay_active_id_q, tc_feeding_next_pc_q,
-               tc_replay_cycle_count_q + 1, tc_feeding_len_q);
-    end
+    tc_dbg_miss_count_q  = tc_dbg_lookup_count_q - tc_dbg_hit_count_q;
+    if (tc_dbg_lookup_count_q > 0)
+      tc_dbg_hit_rate_q = (tc_dbg_hit_count_q * 100) / tc_dbg_lookup_count_q;
+    else
+      tc_dbg_hit_rate_q = 0;
+    if (tc_dbg_hit_count_q > 0)
+      tc_dbg_accept_rate_q = (tc_dbg_accept_count_q * 100) / tc_dbg_hit_count_q;
+    else
+      tc_dbg_accept_rate_q = 0;
+    if (tc_total_cycles_q > 0)
+      tc_dbg_feed_pct_q = (tc_dbg_feed_cycles_q * 100) / tc_total_cycles_q;
+    else
+      tc_dbg_feed_pct_q = 0;
+    tc_dbg_pkt_total_q   = tc_dbg_tc_pkt_cycles_q + tc_dbg_icache_pkt_cycles_q;
+    if (tc_dbg_pkt_total_q > 0)
+      tc_dbg_pkt_tc_share_q = (tc_dbg_tc_pkt_cycles_q * 100) / tc_dbg_pkt_total_q;
+    else
+      tc_dbg_pkt_tc_share_q = 0;
+    tc_dbg_instr_total_q = tc_dbg_tc_instr_total_q + tc_dbg_icache_instr_total_q;
+    if (tc_dbg_instr_total_q > 0)
+      tc_dbg_instr_tc_share_q = (tc_dbg_tc_instr_total_q * 100) / tc_dbg_instr_total_q;
+    else
+      tc_dbg_instr_tc_share_q = 0;
+
+    $display("[TC-FINAL] ========== Trace Cache summary ==========");
+    $display("[TC-FINAL] lookups=%0d hits=%0d misses=%0d hit_rate=%0d%%",
+             tc_dbg_lookup_count_q, tc_dbg_hit_count_q, tc_dbg_miss_count_q, tc_dbg_hit_rate_q);
+    $display("[TC-FINAL] accepted=%0d held=%0d pending_use=%0d rejected_not_ready=%0d rejected_policy=%0d accept_per_hit=%0d%%",
+             tc_dbg_accept_count_q, tc_dbg_hold_count_q, tc_dbg_pending_use_count_q,
+             tc_dbg_reject_not_ready_q, tc_dbg_reject_policy_q, tc_dbg_accept_rate_q);
+    $display("[TC-FINAL] replay_done=%0d replay_cycles=%0d replay_cycle_share=%0d%%",
+             tc_dbg_feed_done_q, tc_dbg_feed_cycles_q, tc_dbg_feed_pct_q);
+    $display("[TC-FINAL] frontend_use=%0d tc_pkt_cycles=%0d icache_pkt_cycles=%0d tc_pkt_share=%0d%%",
+             tc_dbg_feed_start_total_q, tc_dbg_tc_pkt_cycles_q, tc_dbg_icache_pkt_cycles_q, tc_dbg_pkt_tc_share_q);
+    $display("[TC-FINAL] frontend_instr_mix: tc_instr=%0d icache_instr=%0d tc_instr_share=%0d%% icache_blocked_cycles=%0d",
+             tc_dbg_tc_instr_total_q, tc_dbg_icache_instr_total_q, tc_dbg_instr_tc_share_q,
+             tc_dbg_icache_block_cycles_q);
+    $display("[TC-FINAL] pc_floor_breach=%0d (pc<0x80000000 after entering coremark region)",
+             tc_dbg_pc_floor_breach_q);
+    $display("[TC-FINAL] frontend_windows: total=%0d unaligned=%0d iq_not_ready=%0d mispredicts=%0d",
+             tc_dbg_window_total_q, tc_dbg_window_unaligned_q, tc_dbg_window_not_ready_q,
+             tc_dbg_mispredict_count_q);
+    $display("[TC-FINAL] window_cf_hist: cf0=%0d cf1=%0d cf2=%0d cf3=%0d cf4p=%0d",
+             tc_dbg_window_cf0_q, tc_dbg_window_cf1_q, tc_dbg_window_cf2_q,
+             tc_dbg_window_cf3_q, tc_dbg_window_cf4p_q);
+    $display("[TC-FINAL] window_taken_hist: tk0=%0d tk1=%0d tk2=%0d tk3=%0d tk4p=%0d",
+             tc_dbg_window_taken0_q, tc_dbg_window_taken1_q, tc_dbg_window_taken2_q,
+             tc_dbg_window_taken3_q, tc_dbg_window_taken4p_q);
+    $display("[TC-FINAL] trace_candidates: single_taken=%0d multi_taken=%0d",
+             tc_dbg_window_single_taken_q, tc_dbg_window_multi_taken_q);
+    $display("[TC-FINAL] miss_breakdown: empty=%0d pc=%0d path=%0d",
+             tc_dbg_miss_empty_q, tc_dbg_miss_pc_q, tc_dbg_miss_path_q);
+    $display("[TC-FINAL] ========================================");
   end
-  `endif
-
-  `ifdef TRACE_CACHE_DEBUG_REJECTS
-  always_ff @(posedge clk_i) begin
-    if (tc_active_hit && !tc_active_use) begin
-      if (!tc_trace_starts_ok) begin
-        $display("[TC-REJECT] lookup_pc=0x%h start_pc=0x%h reason=bad_start len=%0d branches=%0d taken=%0d next_pc=0x%h",
-                 tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
-                 tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
-      end else if (tc_trace_num_taken != TAKEN_CNT_WIDTH'(1)) begin
-        $display("[TC-REJECT] lookup_pc=0x%h start_pc=0x%h reason=num_taken len=%0d branches=%0d taken=%0d next_pc=0x%h",
-                 tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
-                 tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
-      end else if (!tc_trace_last_is_taken_cf) begin
-        $display("[TC-REJECT] lookup_pc=0x%h start_pc=0x%h reason=last_not_taken_cf len=%0d branches=%0d taken=%0d next_pc=0x%h",
-                 tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
-                 tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
-      end else if (tc_feeding_q) begin
-        $display("[TC-REJECT] lookup_pc=0x%h start_pc=0x%h reason=busy len=%0d branches=%0d taken=%0d next_pc=0x%h",
-                 tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
-                 tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
-      end else if (tc_trace_pcs[0] < PC_WIDTH'(64'h80001000)) begin
-        $display("[TC-REJECT] lookup_pc=0x%h start_pc=0x%h reason=low_pc len=%0d branches=%0d taken=%0d next_pc=0x%h",
-                 tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
-                 tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
-      end else begin
-        $display("[TC-REJECT] lookup_pc=0x%h start_pc=0x%h reason=other len=%0d branches=%0d taken=%0d next_pc=0x%h",
-                 tc_lookup_pc_q, tc_trace_pcs[0], tc_trace_length,
-                 tc_trace_num_branches, tc_trace_num_taken, tc_trace_next_pc);
-      end
-    end
-  end
-  `endif
-
-  // Summary prints moved to the benchmark-end event above.
 // pragma translate_on
-`endif
 
 endmodule

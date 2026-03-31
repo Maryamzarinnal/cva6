@@ -2,31 +2,17 @@
 import trace_cache_pkg::*;
 
 module trace_tag_compare (
-    input  logic [PC_WIDTH-1:0]  pc_i,
-    input  logic [GHR_WIDTH-1:0] ghr_i,
-    
-    input  logic                 valid_rd_i,
-    input  logic [TAG_W-1:0]     tag_rd_i,
-    
-    output logic                 hit_o,
-    output logic [TAG_W-1:0]     tag_new_o
+    input  logic [PC_WIDTH-1:0]                 base_pc_i,
+    input  logic [TRIGGER_BRANCH_CNT_WIDTH-1:0] num_branches_i,
+    input  logic [TRIGGER_BRANCH_BITS-1:0]      branch_flags_i,
+
+    input  trace_tag_t                          stored_tag_i,
+
+    output logic                                hit_o,
+    output trace_tag_t                          lookup_tag_o
 );
 
-  // ========================================================================
-  // Derived Constants
-  // ========================================================================
-  
-  // Tag width: 64-bit PC + GHR width
-  localparam int unsigned TAG_W = PC_WIDTH + GHR_WIDTH;  // 72 bits
-
-  // ========================================================================
-  // Tag Comparison Logic
-  // ========================================================================
-  
-  // Construct new tag from current PC and GHR
-  assign tag_new_o = {pc_i, ghr_i};
-  
-  // Tag hit when entry is valid AND tag matches
-  assign hit_o = valid_rd_i && (tag_new_o == tag_rd_i);
+  assign lookup_tag_o = make_trace_tag(base_pc_i, num_branches_i, branch_flags_i);
+  assign hit_o        = trace_tag_match(lookup_tag_o, stored_tag_i);
 
 endmodule

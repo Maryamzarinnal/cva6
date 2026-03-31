@@ -6,10 +6,10 @@ import riscv::*;
 // LRU picks the way to replace on write. Lookup runs when the frontend consumes a window;
 // SRAM has one cycle latency so the hit result is valid the next cycle. Builder and lookup
 // share the port (builder write blocks lookup that cycle).
-// MaxTraceInstr = max instructions per trace (e.g. one fetch window); must be <= TRACE_LEN.
+// MaxTraceInstr is the current recording policy (e.g. one fetch window) and must be <= TRACE_LEN.
 
 module trace_cache_top #(
-  parameter int unsigned MaxTraceInstr = TRACE_LEN
+  parameter int unsigned MaxTraceInstr = MAX_TRACE_INSTR
 ) (
   input  logic clk_i,
   input  logic rst_ni,
@@ -70,10 +70,6 @@ module trace_cache_top #(
   output logic [31:0]                                 tc_miss_path_o
 );
 
-`ifndef SYNTHESIS
-  initial $display("[TC-TOP-VERSION] 2026-03-23-stats-v3-runtime-summary");
-`endif
-
   initial assert (MaxTraceInstr <= TRACE_LEN)
     else $fatal(1, "trace_cache_top: MaxTraceInstr (%0d) must be <= TRACE_LEN (%0d)", MaxTraceInstr, TRACE_LEN);
 
@@ -88,7 +84,11 @@ module trace_cache_top #(
   assign instr_if.is_branch         = is_branch_i;
   assign instr_if.taken             = branch_taken_i;
   assign instr_if.target            = branch_target_i;
-  assign instr_if.consumed          = instr_queue_consumed_i & {SLOTS_PER_CYCLE{~flush_i}};
+  // IMPORTANT: consumed must be aligned with the same fetch-window domain as
+  // instr_if.{pc,inst,valid}. Using instr_queue_consumed_i here mixes two
+  // different timing domains and can pair a slot PC with a stale instruction.
+  // Feed the builder with the accepted fetch-window mask instead.
+  assign instr_if.consumed          = instr_if.valid;
   assign instr_if.serving_unaligned = serving_unaligned_i;
 
   logic [GHR_WIDTH-1:0] ghr;
@@ -107,6 +107,11 @@ module trace_cache_top #(
   logic [TRACE_WIDTH-1:0] mem_wdata [NUM_WAYS];
   logic [BE_WIDTH-1:0]    mem_be    [NUM_WAYS];
   logic [TRACE_WIDTH-1:0] mem_rdata [NUM_WAYS];
+  logic                   tag_req   [NUM_WAYS];
+  logic                   tag_we    [NUM_WAYS];
+  logic [TRACE_ADDRW-1:0] tag_addr  [NUM_WAYS];
+  trace_tag_t             tag_wdata [NUM_WAYS];
+  trace_tag_t             tag_rdata [NUM_WAYS];
 
   logic                   mem_req_builder;
   logic                   mem_we_builder;
@@ -139,20 +144,24 @@ module trace_cache_top #(
   end
 
   logic [TRACE_WIDTH-1:0] mem_wdata_final;
+  trace_tag_t             mem_tag_final;
   always_comb begin
     trace_data_t w;
-    logic [RESOLVED_ADDRW-1:0] idx;
-
     w = trace_data_t'(mem_wdata_builder);
-    for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
-      if (i < int'(w.num_branches)) begin
-        idx = mem_branch_pcs_builder[i][RESOLVED_ADDRW+3:4];
-        if (resolved_table_q[idx].valid &&
-            resolved_table_q[idx].pc_hi == mem_branch_pcs_builder[i][PC_WIDTH-1:10])
-          w.branch_flags[i] = resolved_table_q[idx].taken;
-      end
-    end
+
+    // Keep stored path metadata internally consistent.
+    // Overwriting only branch_flags with resolved outcomes can desynchronize it
+    // from num_taken/taken_targets captured by the builder and corrupt replay.
     mem_wdata_final = w;
+
+    // The split tag SRAM tracks only the trigger-window identity used at lookup
+    // time. We keep the existing trace payload format for now and derive the tag
+    // from the builder write data so the live path changes stay small.
+    mem_tag_final = make_trace_tag(
+      w.base_pc,
+      TRIGGER_BRANCH_CNT_WIDTH'(w.lookup_num_branches),
+      w.lookup_branch_flags[TRIGGER_BRANCH_BITS-1:0]
+    );
   end
 
   trace_builder #(
@@ -214,6 +223,10 @@ module trace_cache_top #(
       mem_addr[w]  = '0;
       mem_wdata[w] = '0;
       mem_be[w]    = {BE_WIDTH{1'b1}};
+      tag_req[w]   = 1'b0;
+      tag_we[w]    = 1'b0;
+      tag_addr[w]  = '0;
+      tag_wdata[w] = '0;
     end
 
     if (mem_req_builder) begin
@@ -222,16 +235,33 @@ module trace_cache_top #(
       mem_addr[wr_way]  = mem_addr_builder;
       mem_wdata[wr_way] = mem_wdata_final;
       mem_be[wr_way]    = mem_be_builder;
+      tag_req[wr_way]   = 1'b1;
+      tag_we[wr_way]    = 1'b1;
+      tag_addr[wr_way]  = mem_addr_builder;
+      tag_wdata[wr_way] = mem_tag_final;
     end else if (lookup_fire) begin
       for (int w = 0; w < NUM_WAYS; w++) begin
         mem_req[w]  = 1'b1;
         mem_we[w]   = 1'b0;
         mem_addr[w] = tc_index(lookup_base, branch_predictions_i);
+        tag_req[w]  = 1'b1;
+        tag_we[w]   = 1'b0;
+        tag_addr[w] = tc_index(lookup_base, branch_predictions_i);
       end
     end
   end
 
   for (genvar w = 0; w < NUM_WAYS; w++) begin : gen_ways
+    tag_sram i_tag_sram (
+      .clk_i,
+      .rst_ni,
+      .req_i   (tag_req[w]),
+      .we_i    (tag_we[w]),
+      .addr_i  (tag_addr[w]),
+      .wdata_i (tag_wdata[w]),
+      .rdata_o (tag_rdata[w])
+    );
+
     tc_sram #(
       .NumWords  (1 << TRACE_ADDRW),
       .DataWidth (TRACE_WIDTH),
@@ -250,37 +280,51 @@ module trace_cache_top #(
   end
 
   trace_data_t trace_read [NUM_WAYS];
+  trace_tag_t  trace_tag_read [NUM_WAYS];
   logic [NUM_WAYS-1:0] way_valid;
   logic [NUM_WAYS-1:0] pc_match;
   logic [NUM_WAYS-1:0] branch_count_match;
   logic [NUM_WAYS-1:0] branch_flags_match;
+  logic [NUM_WAYS-1:0] tag_hit_raw;
   logic [NUM_WAYS-1:0] way_hit;
+  trace_tag_t          lookup_tag_dbg [NUM_WAYS];
 
   for (genvar w = 0; w < NUM_WAYS; w++) begin : gen_tag_cmp
     assign trace_read[w] = mem_rdata[w];
-    assign way_valid[w]  = (trace_read[w].valid === 1'b1);
-    assign pc_match[w]   = way_valid[w] && (trace_read[w].base_pc == lookup_pc_q);
+    assign trace_tag_read[w] = tag_rdata[w];
+    assign way_valid[w]  = (trace_tag_read[w].valid === 1'b1);
+    assign pc_match[w]   = way_valid[w] && (trace_tag_read[w].base_pc == lookup_pc_q);
     assign branch_count_match[w] = way_valid[w] &&
-                                   (trace_read[w].lookup_num_branches == lookup_num_branches_q);
+                                   (trace_tag_read[w].num_branches ==
+                                    TRIGGER_BRANCH_CNT_WIDTH'(lookup_num_branches_q));
+
+    trace_tag_compare i_trace_tag_compare (
+      .base_pc_i      (lookup_pc_q),
+      .num_branches_i (TRIGGER_BRANCH_CNT_WIDTH'(lookup_num_branches_q)),
+      .branch_flags_i (branch_predictions_q[TRIGGER_BRANCH_BITS-1:0]),
+      .stored_tag_i   (trace_tag_read[w]),
+      .hit_o          (tag_hit_raw[w]),
+      .lookup_tag_o   (lookup_tag_dbg[w])
+    );
 
     always_comb begin
       branch_flags_match[w] = 1'b0;
       if (way_valid[w]) begin
         branch_flags_match[w] = 1'b1;
-        for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
-          if (i < int'(trace_read[w].lookup_num_branches)) begin
-            if (branch_predictions_q[i] != trace_read[w].lookup_branch_flags[i])
+        for (int i = 0; i < TRIGGER_BRANCH_BITS; i++) begin
+          if (i < int'(trace_tag_read[w].num_branches)) begin
+            if (branch_predictions_q[i] != trace_tag_read[w].branch_flags[i])
               branch_flags_match[w] = 1'b0;
           end
         end
       end
     end
+  end
 
-    assign way_hit[w] = way_valid[w] &&
-                        pc_match[w] &&
-                        branch_count_match[w] &&
-                        branch_flags_match[w] &&
-                        lookup_valid_q;
+  always_comb begin
+    for (int w = 0; w < NUM_WAYS; w++) begin
+      way_hit[w] = tag_hit_raw[w] & lookup_valid_q;
+    end
   end
 
   logic trace_hit;
@@ -398,9 +442,10 @@ module trace_cache_top #(
                               instr[6:0] == OpcodeJal    ||
                               instr[6:0] == OpcodeJalr))
               || ( is_rvc && (
-                     (instr[15:13] == OpcodeC1J)    ||
-                     (instr[15:13] == OpcodeC1Beqz) ||
-                     (instr[15:13] == OpcodeC1Bnez) ||
+                     (((instr[15:13] == OpcodeC1J)    ||
+                       (instr[15:13] == OpcodeC1Beqz) ||
+                       (instr[15:13] == OpcodeC1Bnez)) &&
+                      (instr[1:0]   == OpcodeC1)) ||
                      ((instr[15:13] == OpcodeC2JalrMvAdd) &&
                       (instr[6:2]   == 5'b00000) &&
                       (instr[1:0]   == OpcodeC2))
@@ -440,6 +485,8 @@ module trace_cache_top #(
   end
 
 `ifdef MODEL_TECH
+  initial $display("[TC-DEBUG] trace_cache_top: miss breakdown ACTIVE (MODEL_TECH defined)");
+
   int unsigned tc_miss_empty;
   int unsigned tc_miss_pc;
   int unsigned tc_miss_path;
@@ -467,6 +514,7 @@ module trace_cache_top #(
   assign tc_miss_pc_o    = tc_miss_pc;
   assign tc_miss_path_o  = tc_miss_path;
 `else
+  initial $display("[TC-DEBUG] trace_cache_top: miss breakdown DISABLED (MODEL_TECH not defined - add +define+MODEL_TECH to compile)");
   assign tc_miss_total_o = 32'b0;
   assign tc_miss_empty_o = 32'b0;
   assign tc_miss_pc_o    = 32'b0;
@@ -480,26 +528,88 @@ module trace_cache_top #(
       logic any_valid;
       any_valid = 1'b0;
       for (int w = 0; w < NUM_WAYS; w++)
-        if (trace_read[w].valid) any_valid = 1'b1;
+        if (way_valid[w]) any_valid = 1'b1;
 
       if (trace_hit) begin
         $display("[TC-LOOKUP] HIT at 0x%h (way %0d)", lookup_pc_q, hit_way_idx);
       end else if (any_valid) begin
         for (int w = 0; w < NUM_WAYS; w++) begin
-          if (trace_read[w].valid && !pc_match[w])
+          if (way_valid[w] && !pc_match[w])
             $display("[TC-LOOKUP] lookup PC 0x%h missed (way %0d had base_pc 0x%h)",
-                     lookup_pc_q, w, trace_read[w].base_pc);
-          else if (trace_read[w].valid && pc_match[w] &&
+                     lookup_pc_q, w, trace_tag_read[w].base_pc);
+          else if (way_valid[w] && pc_match[w] &&
                    (!branch_count_match[w] || !branch_flags_match[w]))
             $display("[TC-LOOKUP] BR MISS at 0x%h (way %0d): stored=%b lookup=%b stored_num=%0d lookup_num=%0d",
-                     lookup_pc_q, w, trace_read[w].lookup_branch_flags,
-                     branch_predictions_q, trace_read[w].lookup_num_branches, lookup_num_branches_q);
+                     lookup_pc_q, w, trace_tag_read[w].branch_flags,
+                     branch_predictions_q[TRIGGER_BRANCH_BITS-1:0],
+                     trace_tag_read[w].num_branches, lookup_num_branches_q);
         end
       end
     end
   end
   `endif
 
+  int unsigned tc_valid_lookups;
+  int unsigned tc_useful_hits;
+  int unsigned tc_recorded_traces;
+  int unsigned tc_lookup_requests;
+  int unsigned tc_lookup_blocked_by_builder;
+  int unsigned tc_tag_payload_mismatch;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      tc_valid_lookups <= 0;
+      tc_useful_hits   <= 0;
+      tc_recorded_traces <= 0;
+      tc_lookup_requests <= 0;
+      tc_lookup_blocked_by_builder <= 0;
+      tc_tag_payload_mismatch <= 0;
+    end else begin
+      if (mem_req_builder && mem_we_builder)
+        tc_recorded_traces <= tc_recorded_traces + 1;
+
+      if (lookup_valid_i)
+        tc_lookup_requests <= tc_lookup_requests + 1;
+      if (lookup_valid_i && mem_req_builder)
+        tc_lookup_blocked_by_builder <= tc_lookup_blocked_by_builder + 1;
+
+      if (lookup_valid_q) begin
+        logic any_valid;
+        any_valid = 1'b0;
+        for (int w = 0; w < NUM_WAYS; w++)
+          if (way_valid[w]) any_valid = 1'b1;
+        if (any_valid) begin
+          tc_valid_lookups <= tc_valid_lookups + 1;
+          if (trace_hit)
+            tc_useful_hits <= tc_useful_hits + 1;
+        end
+
+        if (trace_hit &&
+            ((trace_read[hit_way_idx].valid !== 1'b1) ||
+             (trace_read[hit_way_idx].base_pc != trace_tag_read[hit_way_idx].base_pc)))
+          tc_tag_payload_mismatch <= tc_tag_payload_mismatch + 1;
+      end
+    end
+  end
+
+  final begin
+    int unsigned tc_useful_rate;
+    if (tc_valid_lookups > 0)
+      tc_useful_rate = (tc_useful_hits * 100) / tc_valid_lookups;
+    else
+      tc_useful_rate = 0;
+
+    $display("[TC-BUILDER] recorded_traces=%0d lookup_requests=%0d blocked_by_builder=%0d",
+             tc_recorded_traces, tc_lookup_requests, tc_lookup_blocked_by_builder);
+    $display("[TC-USEFUL] valid_lookups=%0d hits=%0d rate=%0d%%",
+             tc_valid_lookups, tc_useful_hits, tc_useful_rate);
+    $display("[TC-SPLIT-TAG] payload_mismatch=%0d (tag hit but payload way did not line up)",
+             tc_tag_payload_mismatch);
+    `ifdef MODEL_TECH
+    $display("[TC-MISS-BREAKDOWN] total_misses=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why lookups missed)",
+             tc_miss_total, tc_miss_empty, tc_miss_pc, tc_miss_path);
+    `endif
+  end
 `endif
 
 endmodule
