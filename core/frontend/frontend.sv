@@ -361,11 +361,11 @@ module frontend
 
   assign is_mispredict = resolved_branch_i.valid & resolved_branch_i.is_mispredict;
 
-  // Keep the I$ request side alive while a hit is held in pending, but keep
-  // NPC/IQ side effects frozen until replay actually starts.
+  // Keep the I$ request side alive while a hit is held in pending. Pending is
+  // only a saved TC hit; it must not block natural IQ draining.
   assign icache_dreq_o.req     = instr_queue_ready & ~halt_frontend_i & ~tc_feeding_q;
   assign if_ready              = icache_dreq_i.ready & instr_queue_ready & ~halt_frontend_i &
-                                 ~tc_feeding_q & ~tc_pending_q;
+                                 ~tc_feeding_q;
   assign icache_dreq_o.kill_s1 = is_mispredict | flush_i | replay;
   assign icache_dreq_o.kill_s2 = icache_dreq_o.kill_s1 | bp_valid;
 
@@ -795,12 +795,8 @@ module frontend
       npc_d = {fetch_address[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] + 1,
                {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}};
 
-    if (tc_feeding_done && tc_feeding_q) begin
-      automatic logic [CVA6Cfg.VLEN-1:0] last_pc = tc_feeding_pcs_q[tc_feeding_len_q - 1];
-      automatic logic [1:0] last_instr_low = tc_feeding_instr_q[tc_feeding_len_q - 1][1:0];
-      automatic logic [CVA6Cfg.VLEN-1:0] instr_len = (last_instr_low != 2'b11) ? 2 : 4;
-      npc_d = last_pc + instr_len;
-    end
+    if (tc_feeding_done && tc_feeding_q)
+      npc_d = tc_feeding_next_pc_q;
 
     if (replay)          npc_d = replay_addr;
     if (is_mispredict)   npc_d = resolved_branch_i.target_address;
@@ -1178,12 +1174,22 @@ module frontend
                               !tc_trace_has_call &&
                               !tc_disable_replay_q;
 
-  // Conservative mode for bring-up: disable delayed pending use entirely.
-  // A trace is only used if it can be consumed immediately; otherwise the
-  // normal I-cache path continues and the hit is ignored for this instance.
-  assign tc_pending_capture = 1'b0;
+  // Capture a hit into pending when the IQ is still busy; if the IQ is already
+  // empty, tc_active_use handles the immediate handoff instead.
+  assign tc_pending_capture = tc_active_hit &&
+                              tc_trace_policy_ok &&
+                              !tc_feeding_q &&
+                              !tc_pending_q &&
+                              !tc_same_pc_rehit_block &&
+                              !tc_same_lookup_oneshot_block &&
+                              !instr_queue_empty;
 
-  assign tc_pending_start = 1'b0;
+  assign tc_pending_start = tc_pending_q &&
+                            instr_queue_ready &&
+                            instr_queue_empty &&
+                            !tc_feeding_q &&
+                            !flush_i &&
+                            !is_mispredict;
 
   assign tc_active_use = tc_active_hit &&
                          tc_trace_policy_ok &&
@@ -1557,7 +1563,7 @@ module frontend
              tc_dbg_accept_count_q, tc_dbg_hold_count_q, tc_dbg_pending_use_count_q,
              tc_dbg_reject_not_ready_q, tc_dbg_reject_policy_q, tc_dbg_accept_rate_q);
     $display("[TC-FINAL] immediate_use=%0d pending_enabled=%0b",
-             tc_dbg_immediate_use_count_q, 1'b0);
+             tc_dbg_immediate_use_count_q, 1'b1);
     $display("[TC-FINAL] replay_done=%0d replay_cycles=%0d replay_cycle_share=%0d%%",
              tc_dbg_feed_done_q, tc_dbg_feed_cycles_q, tc_dbg_feed_pct_q);
     $display("[TC-FINAL] frontend_use=%0d tc_pkt_cycles=%0d icache_pkt_cycles=%0d tc_pkt_share=%0d%%",
