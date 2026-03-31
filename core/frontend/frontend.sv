@@ -366,7 +366,7 @@ module frontend
   assign icache_dreq_o.req     = instr_queue_ready & ~halt_frontend_i & ~tc_feeding_q;
   assign if_ready              = icache_dreq_i.ready & instr_queue_ready & ~halt_frontend_i &
                                  ~tc_feeding_q;
-  assign icache_dreq_o.kill_s1 = is_mispredict | flush_i | replay;
+  assign icache_dreq_o.kill_s1 = is_mispredict | flush_i | replay | tc_feeding_start;
   assign icache_dreq_o.kill_s2 = icache_dreq_o.kill_s1 | bp_valid;
 
   bht_update_t bht_update;
@@ -516,15 +516,15 @@ module frontend
             all_replay_accepted = 1'b0;
         end
 
-        // Keep tc_feeding_q asserted until replayed instructions are both:
-        // 1) accepted into instr_queue and 2) fully drained from instr_queue.
-        // This avoids mode-switch races where replay-origin CFs are later
-        // consumed while tc_feeding_q is already low.
-        // Do not finish in the same cycle replay_valid_iq is still being
-        // presented/accepted. Otherwise tc_feeding_q can drop too early and
-        // replay-origin CFs get handled by the normal path.
+        // For the current suffix-only policy, traces fit in one frontend push
+        // and carry no replayed taken-CF metadata. In that case we can finish
+        // as soon as all replay slots were accepted. Fall back to the original
+        // multi-cycle condition for any future wider / CF-carrying policy.
         tc_feeding_done = all_replay_accepted &&
-                          !(|replay_valid_iq) ;
+                          (((tc_feeding_len_q <= TRACE_LEN_WIDTH'(CVA6Cfg.INSTR_PER_FETCH)) &&
+                            !(|tc_feeding_taken_cf_q))
+                             ? 1'b1
+                             : !(|replay_valid_iq));
 
         if (tc_feeding_done) begin
           tc_feeding_consumed_d = '0;
@@ -1112,7 +1112,7 @@ module frontend
       .branch_taken_i                 (tc_taken),
       .branch_target_i                (tc_target),
       .serving_unaligned_i            (serving_unaligned),
-      .flush_i                        (flush_i || is_mispredict || tc_feeding_q),
+      .flush_i                        (flush_i || is_mispredict),
       .instr_queue_ready_i            (instr_queue_ready && tc_record_enable),
       .instr_queue_consumed_i         (tc_record_enable ? instr_queue_consumed : '0),
       .branch_predictions_i           (tc_record_enable ? tc_lookup_branch_predictions : '0),
