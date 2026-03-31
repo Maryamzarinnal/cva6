@@ -116,6 +116,7 @@ module trace_cache_top #(
   logic                   mem_req_builder;
   logic                   mem_we_builder;
   logic [TRACE_ADDRW-1:0] mem_addr_builder;
+  trace_tag_t             mem_tag_builder;
   logic [TRACE_WIDTH-1:0] mem_wdata_builder;
   logic [BE_WIDTH-1:0]    mem_be_builder;
   logic [CHUNKS_PER_TRACE-1:0][PC_WIDTH-1:0] mem_branch_pcs_builder;
@@ -145,24 +146,8 @@ module trace_cache_top #(
 
   logic [TRACE_WIDTH-1:0] mem_wdata_final;
   trace_tag_t             mem_tag_final;
-  always_comb begin
-    trace_data_t w;
-    w = trace_data_t'(mem_wdata_builder);
-
-    // Keep stored path metadata internally consistent.
-    // Overwriting only branch_flags with resolved outcomes can desynchronize it
-    // from num_taken/taken_targets captured by the builder and corrupt replay.
-    mem_wdata_final = w;
-
-    // The split tag SRAM tracks only the trigger-window identity used at lookup
-    // time. We keep the existing trace payload format for now and derive the tag
-    // from the builder write data so the live path changes stay small.
-    mem_tag_final = make_trace_tag(
-      w.base_pc,
-      TRIGGER_BRANCH_CNT_WIDTH'(w.lookup_num_branches),
-      w.lookup_branch_flags[TRIGGER_BRANCH_BITS-1:0]
-    );
-  end
+  assign mem_wdata_final = mem_wdata_builder;
+  assign mem_tag_final   = mem_tag_builder;
 
   trace_builder #(
     .MAX_INSTR_PER_TRACE(MaxTraceInstr)
@@ -174,6 +159,7 @@ module trace_cache_top #(
     .flush_i          (flush_i),
     .trace_valid_o    (),
     .trace_data_o     (),
+    .mem_tag_o        (mem_tag_builder),
     .mem_req_o        (mem_req_builder),
     .mem_we_o         (mem_we_builder),
     .mem_addr_o       (mem_addr_builder),
@@ -584,9 +570,7 @@ module trace_cache_top #(
             tc_useful_hits <= tc_useful_hits + 1;
         end
 
-        if (trace_hit &&
-            ((trace_read[hit_way_idx].valid !== 1'b1) ||
-             (trace_read[hit_way_idx].base_pc != trace_tag_read[hit_way_idx].base_pc)))
+        if (trace_hit && (trace_read[hit_way_idx].valid !== 1'b1))
           tc_tag_payload_mismatch <= tc_tag_payload_mismatch + 1;
       end
     end
@@ -603,7 +587,7 @@ module trace_cache_top #(
              tc_recorded_traces, tc_lookup_requests, tc_lookup_blocked_by_builder);
     $display("[TC-USEFUL] valid_lookups=%0d hits=%0d rate=%0d%%",
              tc_valid_lookups, tc_useful_hits, tc_useful_rate);
-    $display("[TC-SPLIT-TAG] payload_mismatch=%0d (tag hit but payload way did not line up)",
+    $display("[TC-SPLIT-TAG] payload_mismatch=%0d (tag hit but payload slot was invalid)",
              tc_tag_payload_mismatch);
     `ifdef MODEL_TECH
     $display("[TC-MISS-BREAKDOWN] total_misses=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why lookups missed)",

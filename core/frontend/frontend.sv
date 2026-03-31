@@ -45,7 +45,6 @@ module frontend
     input logic [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_ready_i
 );
 
-
 `ifndef SYNTHESIS
   initial $display("[TC-RUN-MARKER] TC_FIX_V56_STABILIZE_PENDING_AND_RAS");
 `endif
@@ -112,6 +111,7 @@ module frontend
   logic [TAKEN_CNT_WIDTH-1:0]              tc_trace_mapped_num_taken;
   logic                                    tc_trace_branch_map_ok;
   logic                                    tc_trace_has_call;
+  logic                                    tc_lookup_cond;
 
   // TC pending-hit latch: preserve one conservative hit until the instr_queue becomes ready.
   logic                                    tc_pending_q, tc_pending_d;
@@ -364,7 +364,8 @@ module frontend
   // Keep the I$ request side alive while a hit is held in pending, but keep
   // NPC/IQ side effects frozen until replay actually starts.
   assign icache_dreq_o.req     = instr_queue_ready & ~halt_frontend_i & ~tc_feeding_q;
-  assign if_ready              = icache_dreq_i.ready & instr_queue_ready & ~halt_frontend_i & ~tc_feeding_q & ~tc_pending_q;
+  assign if_ready              = icache_dreq_i.ready & instr_queue_ready & ~halt_frontend_i &
+                                 ~tc_feeding_q & ~tc_pending_q;
   assign icache_dreq_o.kill_s1 = is_mispredict | flush_i | replay;
   assign icache_dreq_o.kill_s2 = icache_dreq_o.kill_s1 | bp_valid;
 
@@ -956,7 +957,6 @@ module frontend
 
   instr_queue #(
       .CVA6Cfg      (CVA6Cfg),
-      .BRANCH_FLAGS_W(CHUNKS_PER_TRACE),
       .fetch_entry_t(fetch_entry_t)
   ) i_instr_queue (
       .clk_i,
@@ -1060,7 +1060,6 @@ module frontend
     end
   end
 
-  logic tc_lookup_cond;
   // Do not launch a new TC lookup from instructions that are currently being
   // replayed by the TC itself, or in the exact cycle replay is launched.
   // Otherwise the consumed taken branch that triggered replay can still create
@@ -1168,34 +1167,23 @@ module frontend
   assign tc_active_hit = tc_lookup_result_valid && tc_trace_hit &&
                          (tc_trace_length != '0) && !flush_i && !is_mispredict;
 
-  // Replay policy:
-  // - exactly one taken control-flow
-  // - branch map must be consistent
-  // - no calls, because the current replay path does not preserve RAS side effects
+  // Replay policy for the suffix model:
+  // - the trigger-window branch stays on the normal frontend path
+  // - the replay payload is straight-line suffix only, so it must contain no CF metadata
+  // - no calls, because the current replay path still does not preserve RAS side effects
   assign tc_trace_policy_ok = tc_trace_starts_ok &&
                               tc_trace_branch_map_ok &&
-                              (tc_trace_num_taken == TAKEN_CNT_WIDTH'(1)) &&
+                              (tc_trace_num_branches == BR_CNT_WIDTH'(0)) &&
+                              (tc_trace_num_taken == TAKEN_CNT_WIDTH'(0)) &&
                               !tc_trace_has_call &&
                               !tc_disable_replay_q;
 
-  // Capture a hit into pending only while the normal IQ path is still draining.
-  // If the queue is already empty, use the trace immediately through tc_active_use.
-  assign tc_pending_capture = tc_active_hit &&
-                              tc_trace_policy_ok &&
-                              instr_queue_ready &&
-                              !instr_queue_empty &&
-                              !tc_feeding_q &&
-                              !tc_pending_q &&
-                              !tc_same_pc_rehit_block &&
-                              !tc_same_lookup_oneshot_block;
+  // Conservative mode for bring-up: disable delayed pending use entirely.
+  // A trace is only used if it can be consumed immediately; otherwise the
+  // normal I-cache path continues and the hit is ignored for this instance.
+  assign tc_pending_capture = 1'b0;
 
-  assign tc_pending_start = tc_pending_q &&
-                            instr_queue_ready &&
-                            instr_queue_empty &&
-                            !tc_feeding_q &&
-                            !flush_i &&
-                            !is_mispredict &&
-                            !tc_same_pc_rehit_block;
+  assign tc_pending_start = 1'b0;
 
   assign tc_active_use = tc_active_hit &&
                          tc_trace_policy_ok &&
@@ -1217,6 +1205,7 @@ module frontend
   int unsigned tc_dbg_feed_cycles_q;
   int unsigned tc_dbg_hold_count_q;
   int unsigned tc_dbg_pending_use_count_q;
+  int unsigned tc_dbg_immediate_use_count_q;
   int unsigned tc_dbg_miss_empty_q;
   int unsigned tc_dbg_miss_pc_q;
   int unsigned tc_dbg_miss_path_q;
@@ -1246,6 +1235,13 @@ module frontend
   int unsigned tc_dbg_window_single_taken_q;
   int unsigned tc_dbg_window_multi_taken_q;
   int unsigned tc_dbg_mispredict_count_q;
+  int unsigned tc_dbg_trigger_single_cond_q;
+  int unsigned tc_dbg_trigger_single_jump_q;
+  int unsigned tc_dbg_trigger_single_call_q;
+  int unsigned tc_dbg_trigger_single_return_q;
+  int unsigned tc_dbg_trigger_single_jalr_q;
+  int unsigned tc_dbg_trigger_single_unaligned_q;
+  int unsigned tc_dbg_trigger_single_not_ready_q;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -1259,6 +1255,7 @@ module frontend
       tc_dbg_feed_cycles_q      <= 0;
       tc_dbg_hold_count_q       <= 0;
       tc_dbg_pending_use_count_q <= 0;
+      tc_dbg_immediate_use_count_q <= 0;
       tc_dbg_miss_empty_q       <= 0;
       tc_dbg_miss_pc_q          <= 0;
       tc_dbg_miss_path_q        <= 0;
@@ -1288,10 +1285,18 @@ module frontend
       tc_dbg_window_single_taken_q <= 0;
       tc_dbg_window_multi_taken_q <= 0;
       tc_dbg_mispredict_count_q <= 0;
+      tc_dbg_trigger_single_cond_q <= 0;
+      tc_dbg_trigger_single_jump_q <= 0;
+      tc_dbg_trigger_single_call_q <= 0;
+      tc_dbg_trigger_single_return_q <= 0;
+      tc_dbg_trigger_single_jalr_q <= 0;
+      tc_dbg_trigger_single_unaligned_q <= 0;
+      tc_dbg_trigger_single_not_ready_q <= 0;
     end else begin
       int unsigned src_cnt;
       int unsigned cf_cnt;
       int unsigned taken_cnt;
+      int unsigned first_taken_idx;
       tc_total_cycles_q <= tc_total_cycles_q + 1;
 
       if (resolved_branch_i.valid && resolved_branch_i.is_mispredict)
@@ -1348,11 +1353,15 @@ module frontend
       if (tc_icache_sidefx_en && (|instruction_valid) && addr[0][31]) begin
         cf_cnt = 0;
         taken_cnt = 0;
+        first_taken_idx = SLOTS_PER_CYCLE;
         for (int k = 0; k < SLOTS_PER_CYCLE; k++) begin
           if (instruction_valid[k] && tc_is_branch[k])
             cf_cnt++;
-          if (tc_raw_taken[k])
+          if (tc_raw_taken[k]) begin
             taken_cnt++;
+            if (first_taken_idx == SLOTS_PER_CYCLE)
+              first_taken_idx = k;
+          end
         end
 
         tc_dbg_window_total_q <= tc_dbg_window_total_q + 1;
@@ -1377,6 +1386,24 @@ module frontend
           tc_dbg_window_single_taken_q <= tc_dbg_window_single_taken_q + 1;
         else if (taken_cnt > 1)
           tc_dbg_window_multi_taken_q <= tc_dbg_window_multi_taken_q + 1;
+
+        if (taken_cnt == 1 && first_taken_idx < SLOTS_PER_CYCLE) begin
+          if (serving_unaligned)
+            tc_dbg_trigger_single_unaligned_q <= tc_dbg_trigger_single_unaligned_q + 1;
+          if (!instr_queue_ready)
+            tc_dbg_trigger_single_not_ready_q <= tc_dbg_trigger_single_not_ready_q + 1;
+
+          if (is_call[first_taken_idx])
+            tc_dbg_trigger_single_call_q <= tc_dbg_trigger_single_call_q + 1;
+          else if (is_return[first_taken_idx])
+            tc_dbg_trigger_single_return_q <= tc_dbg_trigger_single_return_q + 1;
+          else if (is_jalr[first_taken_idx])
+            tc_dbg_trigger_single_jalr_q <= tc_dbg_trigger_single_jalr_q + 1;
+          else if (is_jump[first_taken_idx])
+            tc_dbg_trigger_single_jump_q <= tc_dbg_trigger_single_jump_q + 1;
+          else if (is_branch[first_taken_idx])
+            tc_dbg_trigger_single_cond_q <= tc_dbg_trigger_single_cond_q + 1;
+        end
       end
 
       if (fetch_entry_valid_o[0] && fetch_entry_ready_i[0] &&
@@ -1408,6 +1435,11 @@ module frontend
         tc_dbg_accept_count_q <= tc_dbg_accept_count_q + 1;
       end
 
+      if (tc_active_use) begin
+        tc_dbg_immediate_use_count_q <= tc_dbg_immediate_use_count_q + 1;
+        tc_dbg_accept_count_q <= tc_dbg_accept_count_q + 1;
+      end
+
       if (tc_feeding_done) begin
         tc_dbg_feed_done_q <= tc_dbg_feed_done_q + 1;
         if (tc_dbg_feed_done_q < 256) begin
@@ -1422,7 +1454,7 @@ module frontend
         if (tc_pending_start) begin
           $display("[TC-PENDING-USE] t=%0t pc0=0x%h len=%0d num_taken=%0d iq_ready=%0b iq_empty=%0b",
                    $time, tc_pending_pcs_q[0], tc_pending_len_q, tc_pending_num_taken_q, instr_queue_ready, instr_queue_empty);
-          $display("[TC-FEED-START] #%0d t=%0t len=%0d next_pc=0x%h lookup_pc0=0x%h num_taken=%0d",
+          $display("[TC-FEED-START] #%0d t=%0t len=%0d next_pc=0x%h src0_pc=0x%h num_taken=%0d",
                    tc_dbg_feed_start_count_q + 1, $time, tc_pending_len_q, tc_pending_next_pc_q,
                    tc_pending_pcs_q[0], tc_pending_num_taken_q);
           for (int k = 0; k < TRACE_LEN; k++) begin
@@ -1433,7 +1465,7 @@ module frontend
             end
           end
         end else begin
-          $display("[TC-FEED-START] #%0d t=%0t len=%0d next_pc=0x%h lookup_pc0=0x%h num_taken=%0d",
+          $display("[TC-FEED-START] #%0d t=%0t len=%0d next_pc=0x%h src0_pc=0x%h num_taken=%0d",
                    tc_dbg_feed_start_count_q + 1, $time, tc_trace_length, tc_trace_next_pc,
                    tc_trace_pcs[0], tc_trace_num_taken);
           for (int k = 0; k < TRACE_LEN; k++) begin
@@ -1524,6 +1556,8 @@ module frontend
     $display("[TC-FINAL] accepted=%0d held=%0d pending_use=%0d rejected_not_ready=%0d rejected_policy=%0d accept_per_hit=%0d%%",
              tc_dbg_accept_count_q, tc_dbg_hold_count_q, tc_dbg_pending_use_count_q,
              tc_dbg_reject_not_ready_q, tc_dbg_reject_policy_q, tc_dbg_accept_rate_q);
+    $display("[TC-FINAL] immediate_use=%0d pending_enabled=%0b",
+             tc_dbg_immediate_use_count_q, 1'b0);
     $display("[TC-FINAL] replay_done=%0d replay_cycles=%0d replay_cycle_share=%0d%%",
              tc_dbg_feed_done_q, tc_dbg_feed_cycles_q, tc_dbg_feed_pct_q);
     $display("[TC-FINAL] frontend_use=%0d tc_pkt_cycles=%0d icache_pkt_cycles=%0d tc_pkt_share=%0d%%",
@@ -1544,6 +1578,12 @@ module frontend
              tc_dbg_window_taken3_q, tc_dbg_window_taken4p_q);
     $display("[TC-FINAL] trace_candidates: single_taken=%0d multi_taken=%0d",
              tc_dbg_window_single_taken_q, tc_dbg_window_multi_taken_q);
+    $display("[TC-FINAL] single_taken_kind: cond=%0d jump=%0d call=%0d return=%0d jalr=%0d",
+             tc_dbg_trigger_single_cond_q, tc_dbg_trigger_single_jump_q,
+             tc_dbg_trigger_single_call_q, tc_dbg_trigger_single_return_q,
+             tc_dbg_trigger_single_jalr_q);
+    $display("[TC-FINAL] single_taken_blockers: unaligned=%0d iq_not_ready=%0d",
+             tc_dbg_trigger_single_unaligned_q, tc_dbg_trigger_single_not_ready_q);
     $display("[TC-FINAL] miss_breakdown: empty=%0d pc=%0d path=%0d",
              tc_dbg_miss_empty_q, tc_dbg_miss_pc_q, tc_dbg_miss_path_q);
     $display("[TC-FINAL] ========================================");

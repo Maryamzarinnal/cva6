@@ -2,15 +2,11 @@
 import trace_cache_pkg::*;
 import riscv::*;
 
-// Builds a trace from fetch windows: start at the window where a branch is taken, then keep
-// adding instructions from the next window(s) until we hit MAX_INSTR_PER_TRACE (one fetch
-// window worth, e.g. 4). Tag = (base_pc, branch_flags). We fill at fetch; on write we overwrite
-// branch_flags with resolved outcomes when we have them (Rotenberg-style). Stored as 16-bit
-// chunks; valid_chunks marks instruction starts. MAX_INSTR_PER_TRACE must be <= TRACE_LEN.
-//
-// IMPORTANT SAFETY RULE:
-//   Any trace containing indirect control flow (jalr / c.jr / c.jalr) is dropped and never
-//   committed. Those targets are dynamic and not safe to replay from historical trace data.
+// Builds a suffix-only trace:
+// - Tag = trigger fetch-window identity (base PC + branch pattern in that window)
+// - Payload = straight-line instructions after the taken branch target
+// - The trigger branch/window itself is never stored in the payload
+// - Recording stops before the next control-flow, on unaligned trouble, or at MAX_INSTR_PER_TRACE
 
 module trace_builder #(
   parameter int unsigned MAX_INSTR_PER_TRACE = MAX_TRACE_INSTR
@@ -25,6 +21,7 @@ module trace_builder #(
 
     output logic                   trace_valid_o,
     output logic [TRACE_WIDTH-1:0] trace_data_o,
+    output trace_tag_t             mem_tag_o,
 
     output logic                   mem_req_o,
     output logic                   mem_we_o,
@@ -35,57 +32,30 @@ module trace_builder #(
 );
 
   localparam int unsigned CHUNK_PTR_W = $clog2(CHUNKS_PER_TRACE + 1);
-  localparam int unsigned BR_CNT_W    = BR_CNT_WIDTH;
   localparam int unsigned START_CNT_W = $clog2(TRACE_LEN + 1);
-  localparam int unsigned TAKEN_CNT_W = TAKEN_CNT_WIDTH;
 
-  typedef enum logic [1:0] {
+  typedef enum logic {
     IDLE,
     ACCUM
   } state_t;
 
-  function automatic logic is_indirect_cf_instr(input logic [INSTR_WIDTH-1:0] instr);
-    logic is_rvc;
-    begin
-      is_rvc = (instr[1:0] != 2'b11);
-
-      // 32-bit jalr
-      if (!is_rvc && (instr[6:0] == OpcodeJalr)) begin
-        is_indirect_cf_instr = 1'b1;
-      end
-      // compressed c.jr / c.jalr family (also catches the same encoding family used earlier)
-      else if (is_rvc &&
-               (instr[15:13] == OpcodeC2JalrMvAdd) &&
-               (instr[6:2]   == 5'b00000) &&
-               (instr[1:0]   == OpcodeC2)) begin
-        is_indirect_cf_instr = 1'b1;
-      end
-      else begin
-        is_indirect_cf_instr = 1'b0;
-      end
-    end
+  function automatic logic is_compressed_instr(input logic [INSTR_WIDTH-1:0] instr);
+    is_compressed_instr = (instr[1:0] != 2'b11);
   endfunction
 
   state_t state_q, state_d;
-  trace_data_t trace_q, trace_d;
-  logic [CHUNK_PTR_W-1:0] chunk_ptr_q, chunk_ptr_d;
-  logic [BR_CNT_W-1:0]    br_cnt_q, br_cnt_d;
-  logic [START_CNT_W-1:0] instr_start_cnt_q, instr_start_cnt_d;
-  logic [PC_WIDTH-1:0]    last_branch_target_q, last_branch_target_d;
-  logic [PC_WIDTH-1:0]    last_instr_pc_q, last_instr_pc_d;
-  logic                   last_instr_compressed_q, last_instr_compressed_d;
-  logic                   last_instr_was_taken_q, last_instr_was_taken_d;
-  logic                   has_indirect_cf_q, has_indirect_cf_d;
 
-  logic [TRACE_ADDRW-1:0] sram_wr_addr_q, sram_wr_addr_d;
+  trace_data_t active_payload_q, active_payload_d;
+  trace_tag_t  active_tag_q, active_tag_d;
+  logic [CHUNK_PTR_W-1:0] active_chunk_ptr_q, active_chunk_ptr_d;
+  logic [START_CNT_W-1:0] active_instr_cnt_q, active_instr_cnt_d;
+  logic [PC_WIDTH-1:0]    expected_pc_q, expected_pc_d;
+  logic                   has_suffix_instr_q, has_suffix_instr_d;
+
+  logic [TRACE_ADDRW-1:0] commit_addr_q, commit_addr_d;
+  trace_tag_t             commit_tag_q, commit_tag_d;
   logic                   commit_valid_q, commit_valid_d;
-  logic [TRACE_WIDTH-1:0] commit_data_q,  commit_data_d;
-  logic [CHUNKS_PER_TRACE-1:0][PC_WIDTH-1:0] branch_pcs_q, branch_pcs_d;
-  logic [CHUNKS_PER_TRACE-1:0][PC_WIDTH-1:0] commit_branch_pcs_q, commit_branch_pcs_d;
-  logic [GHR_WIDTH-1:0]   trace_start_ghr_q, trace_start_ghr_d;
-  logic [CHUNK_PTR_W-1:0] commit_chunk_ptr_q, commit_chunk_ptr_d;
-  logic [TAKEN_CNT_W-1:0] taken_cnt_q, taken_cnt_d;
-  logic                   serving_unaligned_q;
+  logic [TRACE_WIDTH-1:0] commit_data_q, commit_data_d;
 
 `ifndef SYNTHESIS
   logic dbg_evt_start_any;
@@ -94,6 +64,8 @@ module trace_builder #(
   logic dbg_evt_start_unaligned_taken;
   logic dbg_evt_accum_pc_gap;
   logic dbg_evt_finalize_any;
+  logic dbg_evt_finalize_unaligned;
+  logic dbg_evt_finalize_stop_cf;
   logic dbg_evt_finalize_trace_full;
   logic dbg_evt_finalize_len_limit;
   logic dbg_evt_finalize_taken_limit;
@@ -101,6 +73,7 @@ module trace_builder #(
   logic dbg_evt_outcome_drop_duplicate;
   logic dbg_evt_outcome_drop_indirect;
   logic dbg_evt_outcome_drop_not_single;
+  logic dbg_evt_outcome_drop_no_suffix;
 
   longint unsigned dbg_start_any_q;
   longint unsigned dbg_start_single_taken_q;
@@ -108,6 +81,8 @@ module trace_builder #(
   longint unsigned dbg_start_unaligned_taken_q;
   longint unsigned dbg_accum_pc_gap_q;
   longint unsigned dbg_finalize_any_q;
+  longint unsigned dbg_finalize_unaligned_q;
+  longint unsigned dbg_finalize_stop_cf_q;
   longint unsigned dbg_finalize_trace_full_q;
   longint unsigned dbg_finalize_len_limit_q;
   longint unsigned dbg_finalize_taken_limit_q;
@@ -115,127 +90,100 @@ module trace_builder #(
   longint unsigned dbg_outcome_drop_duplicate_q;
   longint unsigned dbg_outcome_drop_indirect_q;
   longint unsigned dbg_outcome_drop_not_single_q;
+  longint unsigned dbg_outcome_drop_no_suffix_q;
+  longint unsigned dbg_payload_len0_q;
+  longint unsigned dbg_payload_len1_q;
+  longint unsigned dbg_payload_len2_q;
+  longint unsigned dbg_payload_len3_q;
+  longint unsigned dbg_payload_len4p_q;
 `endif
 
-  // Per-set duplicate filter: remembers the last committed (pc, flags) per set.
+  // Per-set duplicate filter: remembers the last committed trigger tag per set.
   logic                        dup_valid [(1 << TRACE_ADDRW)];
   logic [PC_WIDTH-1:0]         dup_pc    [(1 << TRACE_ADDRW)];
   logic [CHUNKS_PER_TRACE-1:0] dup_flags [(1 << TRACE_ADDRW)];
   logic [BR_CNT_WIDTH-1:0]     dup_num_branches [(1 << TRACE_ADDRW)];
 
-  assign instr_i.ready      = 1'b1;
-  assign mem_req_o          = commit_valid_q;
-  assign mem_we_o           = commit_valid_q;
-  assign mem_addr_o         = sram_wr_addr_q;
-  assign mem_wdata_o        = commit_data_q;
-  assign mem_be_o           = {BE_WIDTH{1'b1}};
-  assign mem_branch_pcs_o   = commit_branch_pcs_q;
-  assign trace_valid_o      = commit_valid_q;
-  assign trace_data_o       = commit_data_q;
+  assign instr_i.ready    = 1'b1;
+  assign mem_req_o        = commit_valid_q;
+  assign mem_we_o         = commit_valid_q;
+  assign mem_addr_o       = commit_addr_q;
+  assign mem_tag_o        = commit_tag_q;
+  assign mem_wdata_o      = commit_data_q;
+  assign mem_be_o         = {BE_WIDTH{1'b1}};
+  assign mem_branch_pcs_o = '0;
+  assign trace_valid_o    = commit_valid_q;
+  assign trace_data_o     = commit_data_q;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      state_q                 <= IDLE;
-      trace_q                 <= '0;
-      chunk_ptr_q             <= '0;
-      br_cnt_q                <= '0;
-      instr_start_cnt_q       <= '0;
-      last_branch_target_q    <= '0;
-      last_instr_pc_q         <= '0;
-      last_instr_compressed_q <= 1'b0;
-      last_instr_was_taken_q  <= 1'b0;
-      has_indirect_cf_q       <= 1'b0;
-      sram_wr_addr_q          <= '0;
-      commit_valid_q          <= 1'b0;
-      commit_data_q           <= '0;
-      branch_pcs_q            <= '0;
-      commit_branch_pcs_q     <= '0;
-      trace_start_ghr_q       <= '0;
-      commit_chunk_ptr_q      <= '0;
-      taken_cnt_q             <= '0;
-      serving_unaligned_q     <= 1'b0;
+      state_q             <= IDLE;
+      active_payload_q    <= '0;
+      active_tag_q        <= '0;
+      active_chunk_ptr_q  <= '0;
+      active_instr_cnt_q  <= '0;
+      expected_pc_q       <= '0;
+      has_suffix_instr_q  <= 1'b0;
+      commit_addr_q       <= '0;
+      commit_tag_q        <= '0;
+      commit_valid_q      <= 1'b0;
+      commit_data_q       <= '0;
     end else begin
-      state_q                 <= state_d;
-      trace_q                 <= trace_d;
-      chunk_ptr_q             <= chunk_ptr_d;
-      br_cnt_q                <= br_cnt_d;
-      instr_start_cnt_q       <= instr_start_cnt_d;
-      last_branch_target_q    <= last_branch_target_d;
-      last_instr_pc_q         <= last_instr_pc_d;
-      last_instr_compressed_q <= last_instr_compressed_d;
-      last_instr_was_taken_q  <= last_instr_was_taken_d;
-      has_indirect_cf_q       <= has_indirect_cf_d;
-      sram_wr_addr_q          <= sram_wr_addr_d;
-      commit_valid_q          <= commit_valid_d;
-      commit_data_q           <= commit_data_d;
-      branch_pcs_q            <= branch_pcs_d;
-      commit_branch_pcs_q     <= commit_branch_pcs_d;
-      trace_start_ghr_q       <= trace_start_ghr_d;
-      commit_chunk_ptr_q      <= commit_chunk_ptr_d;
-      taken_cnt_q             <= taken_cnt_d;
-      serving_unaligned_q     <= flush_i ? 1'b0 : instr_i.serving_unaligned;
+      state_q             <= state_d;
+      active_payload_q    <= active_payload_d;
+      active_tag_q        <= active_tag_d;
+      active_chunk_ptr_q  <= active_chunk_ptr_d;
+      active_instr_cnt_q  <= active_instr_cnt_d;
+      expected_pc_q       <= expected_pc_d;
+      has_suffix_instr_q  <= has_suffix_instr_d;
+      commit_addr_q       <= commit_addr_d;
+      commit_tag_q        <= commit_tag_d;
+      commit_valid_q      <= commit_valid_d;
+      commit_data_q       <= commit_data_d;
     end
   end
 
   always_comb begin
-    logic [CHUNK_PTR_W-1:0] temp_chunk_ptr;
-    logic [BR_CNT_W-1:0]    temp_br_cnt;
-    logic [START_CNT_W-1:0] temp_start_cnt;
-    logic [TAKEN_CNT_W-1:0] temp_taken_cnt;
-    logic                   temp_has_indirect_cf;
-    logic                   is_compressed;
-    logic                   has_space;
-    logic                   found_taken;
-    logic [CHUNK_PTR_W-1:0] branch_slot;
-    logic                   hit_taken;
-    logic                   trace_full;
-    logic [PC_WIDTH-1:0]    expected_pc;
-    logic                   expected_pc_valid;
-    logic                   slot_pc_matches;
-    logic [PC_WIDTH-1:0]    next_pc_calc;
-    logic                   is_indirect_slot;
-    logic                   stop_before_slot;
-    int unsigned            idle_taken_cnt;
-    logic                   pc_gap_seen;
+    logic [PC_WIDTH-1:0] trigger_base_pc;
+    logic [PC_WIDTH-1:0] trigger_target_pc;
+    logic [TRIGGER_BRANCH_BITS-1:0] trigger_flags;
+    logic trigger_base_pc_valid;
+    int unsigned trigger_cf_cnt;
+    int unsigned trigger_taken_cnt;
+    logic [CHUNKS_PER_TRACE-1:0] candidate_flags;
+    logic [TRACE_ADDRW-1:0] candidate_addr;
+    logic is_duplicate;
+    logic stop_suffix_now;
+    logic finalize_now;
+    logic finalize_len_limit;
+    logic any_consumed_now;
 
-    state_d                 = state_q;
-    trace_d                 = trace_q;
-    chunk_ptr_d             = chunk_ptr_q;
-    br_cnt_d                = br_cnt_q;
-    instr_start_cnt_d       = instr_start_cnt_q;
-    last_branch_target_d    = last_branch_target_q;
-    last_instr_pc_d         = last_instr_pc_q;
-    last_instr_compressed_d = last_instr_compressed_q;
-    last_instr_was_taken_d  = last_instr_was_taken_q;
-    has_indirect_cf_d       = has_indirect_cf_q;
-    sram_wr_addr_d          = sram_wr_addr_q;
-    commit_valid_d          = 1'b0;
-    commit_data_d           = commit_data_q;
-    commit_branch_pcs_d     = commit_branch_pcs_q;
-    branch_pcs_d            = branch_pcs_q;
-    trace_start_ghr_d       = trace_start_ghr_q;
-    commit_chunk_ptr_d      = commit_chunk_ptr_q;
-    taken_cnt_d             = taken_cnt_q;
+    state_d            = state_q;
+    active_payload_d   = active_payload_q;
+    active_tag_d       = active_tag_q;
+    active_chunk_ptr_d = active_chunk_ptr_q;
+    active_instr_cnt_d = active_instr_cnt_q;
+    expected_pc_d      = expected_pc_q;
+    has_suffix_instr_d = has_suffix_instr_q;
 
-    temp_chunk_ptr          = '0;
-    temp_br_cnt             = '0;
-    temp_start_cnt          = '0;
-    temp_taken_cnt          = '0;
-    temp_has_indirect_cf    = has_indirect_cf_q;
-    is_compressed           = 1'b0;
-    has_space               = 1'b0;
-    found_taken             = 1'b0;
-    branch_slot             = '0;
-    hit_taken               = 1'b0;
-    trace_full              = 1'b0;
-    expected_pc             = '0;
-    expected_pc_valid       = 1'b0;
-    slot_pc_matches         = 1'b1;
-    next_pc_calc            = '0;
-    is_indirect_slot        = 1'b0;
-    stop_before_slot        = 1'b0;
-    idle_taken_cnt          = 0;
-    pc_gap_seen             = 1'b0;
+    commit_addr_d      = commit_addr_q;
+    commit_tag_d       = commit_tag_q;
+    commit_valid_d     = 1'b0;
+    commit_data_d      = commit_data_q;
+
+    trigger_base_pc       = '0;
+    trigger_target_pc     = '0;
+    trigger_flags         = '0;
+    trigger_base_pc_valid = 1'b0;
+    trigger_cf_cnt        = 0;
+    trigger_taken_cnt     = 0;
+    candidate_flags       = '0;
+    candidate_addr        = '0;
+    is_duplicate          = 1'b0;
+    stop_suffix_now       = 1'b0;
+    finalize_now          = 1'b0;
+    finalize_len_limit    = 1'b0;
+    any_consumed_now      = 1'b0;
 
 `ifndef SYNTHESIS
     dbg_evt_start_any               = 1'b0;
@@ -244,6 +192,8 @@ module trace_builder #(
     dbg_evt_start_unaligned_taken   = 1'b0;
     dbg_evt_accum_pc_gap            = 1'b0;
     dbg_evt_finalize_any            = 1'b0;
+    dbg_evt_finalize_unaligned      = 1'b0;
+    dbg_evt_finalize_stop_cf        = 1'b0;
     dbg_evt_finalize_trace_full     = 1'b0;
     dbg_evt_finalize_len_limit      = 1'b0;
     dbg_evt_finalize_taken_limit    = 1'b0;
@@ -251,320 +201,201 @@ module trace_builder #(
     dbg_evt_outcome_drop_duplicate  = 1'b0;
     dbg_evt_outcome_drop_indirect   = 1'b0;
     dbg_evt_outcome_drop_not_single = 1'b0;
+    dbg_evt_outcome_drop_no_suffix  = 1'b0;
 `endif
 
     if (flush_i) begin
-      state_d                 = IDLE;
-      chunk_ptr_d             = '0;
-      br_cnt_d                = '0;
-      instr_start_cnt_d       = '0;
-      trace_d                 = '0;
-      last_instr_pc_d         = '0;
-      last_instr_compressed_d = 1'b0;
-      last_instr_was_taken_d  = 1'b0;
-      has_indirect_cf_d       = 1'b0;
-      taken_cnt_d             = '0;
+      state_d            = IDLE;
+      active_payload_d   = '0;
+      active_tag_d       = '0;
+      active_chunk_ptr_d = '0;
+      active_instr_cnt_d = '0;
+      expected_pc_d      = '0;
+      has_suffix_instr_d = 1'b0;
     end else begin
       case (state_q)
-
         IDLE: begin
           for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
-            if (instr_i.consumed[i] && instr_i.valid[i] &&
-                instr_i.is_branch[i] && instr_i.taken[i]) begin
-              idle_taken_cnt = idle_taken_cnt + 1;
-              if (!found_taken) begin
-                found_taken = 1'b1;
-                branch_slot = CHUNK_PTR_W'(i);
+            if (instr_i.consumed[i] && instr_i.valid[i]) begin
+              any_consumed_now = 1'b1;
+              if (!trigger_base_pc_valid) begin
+                trigger_base_pc = instr_i.pc[i];
+                trigger_base_pc_valid = 1'b1;
+              end
+
+              if (instr_i.is_branch[i]) begin
+                if (trigger_cf_cnt < TRIGGER_BRANCH_BITS)
+                  trigger_flags[trigger_cf_cnt] = instr_i.taken[i];
+                trigger_cf_cnt++;
+              end
+
+              if (instr_i.is_branch[i] && instr_i.taken[i]) begin
+                trigger_taken_cnt++;
+                if (trigger_taken_cnt == 1)
+                  trigger_target_pc = instr_i.target[i];
               end
             end
           end
 
-          // Unaligned windows are currently unsafe for TC tags/data because the 64-bit
-          // instr_realign path still has known-bad address/instruction reconstruction.
-          if (|instr_i.consumed && (instr_i.serving_unaligned || serving_unaligned_q)) begin
+          if (any_consumed_now && instr_i.serving_unaligned) begin
 `ifndef SYNTHESIS
-            if (idle_taken_cnt != 0)
+            if (trigger_taken_cnt != 0)
               dbg_evt_start_unaligned_taken = 1'b1;
 `endif
-          end else if (|instr_i.consumed) begin
-            if (found_taken) begin
+          end else if (trigger_taken_cnt != 0) begin
 `ifndef SYNTHESIS
-              dbg_evt_start_any = 1'b1;
-              if (idle_taken_cnt == 1)
-                dbg_evt_start_single_taken = 1'b1;
-              else
-                dbg_evt_start_multi_taken = 1'b1;
+            dbg_evt_start_any = 1'b1;
+            if (trigger_taken_cnt == 1)
+              dbg_evt_start_single_taken = 1'b1;
+            else
+              dbg_evt_start_multi_taken = 1'b1;
 `endif
-              trace_start_ghr_d       = ghr_i;
-              temp_chunk_ptr          = '0;
-              temp_br_cnt             = '0;
-              temp_start_cnt          = '0;
-              temp_taken_cnt          = '0;
-              temp_has_indirect_cf    = 1'b0;
-              chunk_ptr_d             = '0;
-              br_cnt_d                = '0;
-              instr_start_cnt_d       = '0;
-              trace_d                 = '0;
-              last_instr_pc_d         = '0;
-              last_instr_compressed_d = 1'b0;
-              last_instr_was_taken_d  = 1'b0;
-              has_indirect_cf_d       = 1'b0;
-              expected_pc_valid       = 1'b0;
-
-              for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
-                if (instr_i.consumed[i] && instr_i.valid[i] &&
-                    (CHUNK_PTR_W'(i) <= branch_slot) &&
-                    (temp_start_cnt < START_CNT_W'(MAX_INSTR_PER_TRACE))) begin
-                  slot_pc_matches = !expected_pc_valid || (instr_i.pc[i] == expected_pc);
-                  if (!slot_pc_matches) begin
-                    continue;
-                  end
-
-                  if (temp_start_cnt == 0)
-                    trace_d.base_pc = instr_i.pc[i];
-
-                  if (is_indirect_cf_instr(instr_i.inst[i]))
-                    temp_has_indirect_cf = 1'b1;
-
-                  is_compressed = (instr_i.inst[i][1:0] != 2'b11);
-
-                  last_instr_pc_d         = instr_i.pc[i];
-                  last_instr_compressed_d = is_compressed;
-                  last_instr_was_taken_d  = instr_i.is_branch[i] && instr_i.taken[i];
-
-                  if (!is_compressed) begin
-                    trace_d.chunks[temp_chunk_ptr]         = instr_i.inst[i][15:0];
-                    trace_d.chunks[temp_chunk_ptr+1]       = instr_i.inst[i][31:16];
-                    trace_d.valid_chunks[temp_chunk_ptr]   = 1'b1;
-                    trace_d.valid_chunks[temp_chunk_ptr+1] = 1'b0;
-                    temp_chunk_ptr = temp_chunk_ptr + 2;
-                  end else begin
-                    trace_d.chunks[temp_chunk_ptr]       = instr_i.inst[i][15:0];
-                    trace_d.valid_chunks[temp_chunk_ptr] = 1'b1;
-                    temp_chunk_ptr = temp_chunk_ptr + 1;
-                  end
-                  temp_start_cnt = temp_start_cnt + START_CNT_W'(1);
-                  next_pc_calc = (instr_i.is_branch[i] && instr_i.taken[i])
-                                ? instr_i.target[i]
-                                : (instr_i.pc[i] + (is_compressed ? PC_WIDTH'(64'd2)
-                                                                  : PC_WIDTH'(64'd4)));
-                  expected_pc       = next_pc_calc;
-                  expected_pc_valid = 1'b1;
-
-                  if (instr_i.is_branch[i]) begin
-                    trace_d.lookup_branch_flags[temp_br_cnt] = instr_i.taken[i];
-                    trace_d.branch_flags[temp_br_cnt]        = instr_i.taken[i];
-                    branch_pcs_d[temp_br_cnt]                = instr_i.pc[i];
-
-                    if (instr_i.taken[i]) begin
-                      last_branch_target_d = instr_i.target[i];
-                      if (temp_taken_cnt < TAKEN_CNT_W'(MAX_TAKEN)) begin
-                        trace_d.taken_targets[temp_taken_cnt] = instr_i.target[i];
-                        temp_taken_cnt = temp_taken_cnt + TAKEN_CNT_W'(1);
-                      end
-                    end
-
-                    temp_br_cnt = temp_br_cnt + 1;
-                  end
-                end
-              end
-
-              trace_d.lookup_num_branches = BR_CNT_W'(temp_br_cnt);
-              trace_d.num_branches        = BR_CNT_W'(temp_br_cnt);
-              trace_d.num_taken           = temp_taken_cnt;
-              chunk_ptr_d                 = temp_chunk_ptr;
-              br_cnt_d                    = temp_br_cnt;
-              instr_start_cnt_d           = temp_start_cnt;
-              taken_cnt_d                 = temp_taken_cnt;
-              has_indirect_cf_d           = temp_has_indirect_cf;
-              state_d                     = ACCUM;
+            if (trigger_taken_cnt == 1 && trigger_base_pc_valid) begin
+              active_payload_d                 = '0;
+              active_payload_d.base_pc         = trigger_target_pc;
+              active_payload_d.target_addr     = trigger_target_pc;
+              active_tag_d                     = make_trace_tag(
+                                                  trigger_base_pc,
+                                                  TRIGGER_BRANCH_CNT_WIDTH'(trigger_cf_cnt),
+                                                  trigger_flags
+                                                );
+              active_chunk_ptr_d               = '0;
+              active_instr_cnt_d               = '0;
+              expected_pc_d                    = trigger_target_pc;
+              has_suffix_instr_d               = 1'b0;
+              state_d                          = ACCUM;
             end
           end
         end
 
         ACCUM: begin
-          // Keep accumulating only on aligned windows. Do not flush progress on
-          // unaligned cycles; just wait for the next aligned consumed window.
-          if (|instr_i.consumed && !instr_i.serving_unaligned && !serving_unaligned_q) begin
-            temp_chunk_ptr       = chunk_ptr_q;
-            temp_br_cnt          = br_cnt_q;
-            temp_start_cnt       = instr_start_cnt_q;
-            temp_taken_cnt       = taken_cnt_q;
-            temp_has_indirect_cf = has_indirect_cf_q;
-            hit_taken            = 1'b0;
-            trace_full           = 1'b0;
-            if (instr_start_cnt_q != '0) begin
-              expected_pc_valid = 1'b1;
-              expected_pc = last_instr_was_taken_q
-                            ? last_branch_target_q
-                            : (last_instr_pc_q + (last_instr_compressed_q ? PC_WIDTH'(64'd2)
-                                                                          : PC_WIDTH'(64'd4)));
-            end
-
+          if (|instr_i.consumed && instr_i.serving_unaligned) begin
+            finalize_now = 1'b1;
+`ifndef SYNTHESIS
+            dbg_evt_finalize_any        = 1'b1;
+            dbg_evt_finalize_unaligned  = 1'b1;
+            dbg_evt_finalize_trace_full = 1'b1;
+`endif
+          end else if (|instr_i.consumed) begin
             for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
-              is_compressed = (instr_i.inst[i][1:0] != 2'b11);
-              is_indirect_slot = is_indirect_cf_instr(instr_i.inst[i]);
-              has_space = is_compressed ?
-                          (temp_chunk_ptr + 1 <= CHUNKS_PER_TRACE) :
-                          (temp_chunk_ptr + 2 <= CHUNKS_PER_TRACE);
-              slot_pc_matches = !expected_pc_valid || (instr_i.pc[i] == expected_pc);
-              // Conservative bring-up rule:
-              // once the trace already contains the trigger taken branch, end the trace
-              // before absorbing another taken CF or an indirect CF into the payload.
-              // This preserves the current "single taken, no indirect" policy while
-              // avoiding wasting most finalized traces on a drop at commit time.
-              stop_before_slot = (temp_chunk_ptr > 0) &&
-                                 (temp_taken_cnt != '0) &&
-                                 (is_indirect_slot ||
-                                  (instr_i.is_branch[i] && instr_i.taken[i]));
+              logic is_rvc;
+              logic [PC_WIDTH-1:0] next_pc_calc;
 
-              if (instr_i.consumed[i] && instr_i.valid[i] &&
-                  has_space && !hit_taken && slot_pc_matches && !stop_before_slot &&
-                  (temp_start_cnt < START_CNT_W'(MAX_INSTR_PER_TRACE))) begin
+              if (!(instr_i.consumed[i] && instr_i.valid[i]))
+                continue;
 
-                if (is_indirect_slot)
-                  temp_has_indirect_cf = 1'b1;
+              if (instr_i.pc[i] != expected_pc_q) begin
+`ifndef SYNTHESIS
+                dbg_evt_accum_pc_gap = 1'b1;
+`endif
+                continue;
+              end
 
-                last_instr_pc_d         = instr_i.pc[i];
-                last_instr_compressed_d = is_compressed;
-                last_instr_was_taken_d  = instr_i.is_branch[i] && instr_i.taken[i];
+              if (instr_i.is_branch[i]) begin
+                stop_suffix_now = 1'b1;
+                finalize_now    = 1'b1;
+`ifndef SYNTHESIS
+                dbg_evt_finalize_any        = 1'b1;
+                dbg_evt_finalize_stop_cf    = 1'b1;
+                dbg_evt_finalize_trace_full = 1'b1;
+`endif
+                break;
+              end
 
-                if (!is_compressed) begin
-                  trace_d.chunks[temp_chunk_ptr]         = instr_i.inst[i][15:0];
-                  trace_d.chunks[temp_chunk_ptr+1]       = instr_i.inst[i][31:16];
-                  trace_d.valid_chunks[temp_chunk_ptr]   = 1'b1;
-                  trace_d.valid_chunks[temp_chunk_ptr+1] = 1'b0;
-                  temp_chunk_ptr = temp_chunk_ptr + 2;
-                end else begin
-                  trace_d.chunks[temp_chunk_ptr]       = instr_i.inst[i][15:0];
-                  trace_d.valid_chunks[temp_chunk_ptr] = 1'b1;
-                  temp_chunk_ptr = temp_chunk_ptr + 1;
-                end
-                temp_start_cnt = temp_start_cnt + START_CNT_W'(1);
-                next_pc_calc = (instr_i.is_branch[i] && instr_i.taken[i])
-                              ? instr_i.target[i]
-                              : (instr_i.pc[i] + (is_compressed ? PC_WIDTH'(64'd2)
-                                                                : PC_WIDTH'(64'd4)));
-                expected_pc       = next_pc_calc;
-                expected_pc_valid = 1'b1;
+              is_rvc = is_compressed_instr(instr_i.inst[i]);
+              if ((!is_rvc && (active_chunk_ptr_q + 2 > CHUNKS_PER_TRACE)) ||
+                  ( is_rvc && (active_chunk_ptr_q + 1 > CHUNKS_PER_TRACE))) begin
+                finalize_now = 1'b1;
+`ifndef SYNTHESIS
+                dbg_evt_finalize_any        = 1'b1;
+                dbg_evt_finalize_trace_full = 1'b1;
+`endif
+                break;
+              end
 
-                if (instr_i.is_branch[i]) begin
-                  trace_d.branch_flags[temp_br_cnt] = instr_i.taken[i];
-                  branch_pcs_d[temp_br_cnt]         = instr_i.pc[i];
+              if (active_instr_cnt_q >= START_CNT_W'(MAX_INSTR_PER_TRACE)) begin
+                finalize_now = 1'b1;
+                finalize_len_limit = 1'b1;
+`ifndef SYNTHESIS
+                dbg_evt_finalize_any       = 1'b1;
+                dbg_evt_finalize_len_limit = 1'b1;
+`endif
+                break;
+              end
 
-                  if (instr_i.taken[i]) begin
-                    last_branch_target_d = instr_i.target[i];
+              active_payload_d.valid_chunks[active_chunk_ptr_q] = 1'b1;
+              active_payload_d.chunks[active_chunk_ptr_q]       = instr_i.inst[i][15:0];
+              if (is_rvc) begin
+                active_chunk_ptr_d = active_chunk_ptr_q + CHUNK_PTR_W'(1);
+              end else begin
+                active_payload_d.valid_chunks[active_chunk_ptr_q + 1] = 1'b0;
+                active_payload_d.chunks[active_chunk_ptr_q + 1]       = instr_i.inst[i][31:16];
+                active_chunk_ptr_d = active_chunk_ptr_q + CHUNK_PTR_W'(2);
+              end
 
-                    if (temp_taken_cnt < TAKEN_CNT_W'(MAX_TAKEN)) begin
-                      trace_d.taken_targets[temp_taken_cnt] = instr_i.target[i];
-                      temp_taken_cnt = temp_taken_cnt + TAKEN_CNT_W'(1);
-                    end
+              active_instr_cnt_d  = active_instr_cnt_q + START_CNT_W'(1);
+              next_pc_calc        = instr_i.pc[i] + (is_rvc ? PC_WIDTH'(64'd2) : PC_WIDTH'(64'd4));
+              expected_pc_d       = next_pc_calc;
+              active_payload_d.target_addr = next_pc_calc;
+              has_suffix_instr_d  = 1'b1;
 
-                    hit_taken = 1'b1;
-                  end
-
-                  temp_br_cnt = temp_br_cnt + 1;
-                end
-              // End the trace before a second taken CF or indirect CF poisons a
-              // would-be single-taken trace. We want to commit what we already
-              // captured instead of carrying on to an avoidable drop_not_single /
-              // drop_indirect outcome.
-              end else if (instr_i.consumed[i] && instr_i.valid[i] &&
-                           has_space && !hit_taken && slot_pc_matches &&
-                           (temp_start_cnt < START_CNT_W'(MAX_INSTR_PER_TRACE)) &&
-                           stop_before_slot) begin
-                trace_full = 1'b1;
-                hit_taken = 1'b1;
-              // If PC mismatches the expected stitched path, skip this slot and
-              // wait for a later aligned window; do not prematurely terminate
-              // the trace (that creates pathological short traces).
-              end else if (instr_i.consumed[i] && instr_i.valid[i] &&
-                           has_space && !hit_taken && !slot_pc_matches &&
-                           (temp_start_cnt < START_CNT_W'(MAX_INSTR_PER_TRACE))) begin
-                pc_gap_seen = 1'b1;
-              end else if (instr_i.consumed[i] && instr_i.valid[i] &&
-                           (!has_space ||
-                            (temp_start_cnt >= START_CNT_W'(MAX_INSTR_PER_TRACE)))) begin
-                trace_full = 1'b1;
+              if (active_instr_cnt_d >= START_CNT_W'(MAX_INSTR_PER_TRACE)) begin
+                finalize_now = 1'b1;
+                finalize_len_limit = 1'b1;
+`ifndef SYNTHESIS
+                dbg_evt_finalize_any       = 1'b1;
+                dbg_evt_finalize_len_limit = 1'b1;
+`endif
+                break;
               end
             end
+          end
 
-`ifndef SYNTHESIS
-            if (pc_gap_seen)
-              dbg_evt_accum_pc_gap = 1'b1;
-`endif
+          if (finalize_now) begin
+            candidate_flags[TRIGGER_BRANCH_BITS-1:0] = active_tag_q.branch_flags;
+            candidate_addr = tc_index(active_tag_q.base_pc, candidate_flags);
+            is_duplicate = dup_valid[candidate_addr]
+                         && (active_tag_q.base_pc      == dup_pc[candidate_addr])
+                         && (candidate_flags           == dup_flags[candidate_addr])
+                         && (BR_CNT_WIDTH'(active_tag_q.num_branches) == dup_num_branches[candidate_addr]);
 
-            chunk_ptr_d             = temp_chunk_ptr;
-            br_cnt_d                = temp_br_cnt;
-            instr_start_cnt_d       = temp_start_cnt;
-            taken_cnt_d             = temp_taken_cnt;
-            has_indirect_cf_d       = temp_has_indirect_cf;
-            trace_d.num_branches    = BR_CNT_W'(temp_br_cnt);
-            trace_d.num_taken       = temp_taken_cnt;
+            if (has_suffix_instr_q || has_suffix_instr_d) begin
+              active_payload_d.valid        = 1'b1;
+              active_payload_d.lookup_branch_flags = '0;
+              active_payload_d.lookup_num_branches = '0;
+              active_payload_d.branch_flags = '0;
+              active_payload_d.num_branches = '0;
+              active_payload_d.num_taken    = '0;
+              active_payload_d.taken_targets = '0;
 
-            if (trace_full ||
-                (temp_start_cnt >= START_CNT_W'(MAX_INSTR_PER_TRACE) && temp_chunk_ptr > 0) ||
-                (temp_taken_cnt >= TAKEN_CNT_W'(MAX_TAKEN) && temp_chunk_ptr > 0)) begin
-              logic [TRACE_ADDRW-1:0] candidate_addr;
-              logic                   is_duplicate;
-
-              commit_chunk_ptr_d  = temp_chunk_ptr;
-              trace_d.valid       = 1'b1;
-
-              trace_d.target_addr = last_instr_was_taken_d
-                                    ? last_branch_target_d
-                                    : last_instr_pc_d + (last_instr_compressed_d ? 64'h2 : 64'h4);
-
-              candidate_addr = tc_index(trace_d.base_pc, trace_d.lookup_branch_flags);
-
-              is_duplicate = dup_valid[candidate_addr]
-                           && (trace_d.base_pc             == dup_pc[candidate_addr])
-                           && (trace_d.lookup_branch_flags == dup_flags[candidate_addr])
-                           && (trace_d.lookup_num_branches == dup_num_branches[candidate_addr]);
-
-`ifndef SYNTHESIS
-              dbg_evt_finalize_any = 1'b1;
-              if (trace_full)
-                dbg_evt_finalize_trace_full = 1'b1;
-              if (temp_start_cnt >= START_CNT_W'(MAX_INSTR_PER_TRACE) && temp_chunk_ptr > 0)
-                dbg_evt_finalize_len_limit = 1'b1;
-              if (temp_taken_cnt >= TAKEN_CNT_W'(MAX_TAKEN) && temp_chunk_ptr > 0)
-                dbg_evt_finalize_taken_limit = 1'b1;
-`endif
-
-              // Functional bring-up policy:
-              // keep only single-taken, non-indirect traces in SRAM.
-              if (!is_duplicate && !temp_has_indirect_cf &&
-                  (temp_taken_cnt == TAKEN_CNT_W'(1))) begin
-                sram_wr_addr_d      = candidate_addr;
-                commit_valid_d      = 1'b1;
-                commit_data_d       = trace_d;
-                commit_branch_pcs_d = branch_pcs_d;
+              if (!is_duplicate) begin
+                commit_addr_d  = candidate_addr;
+                commit_tag_d   = active_tag_q;
+                commit_valid_d = 1'b1;
+                commit_data_d  = active_payload_d;
 `ifndef SYNTHESIS
                 dbg_evt_outcome_commit = 1'b1;
 `endif
               end else begin
 `ifndef SYNTHESIS
-                if (is_duplicate)
-                  dbg_evt_outcome_drop_duplicate = 1'b1;
-                else if (temp_has_indirect_cf)
-                  dbg_evt_outcome_drop_indirect = 1'b1;
-                else
-                  dbg_evt_outcome_drop_not_single = 1'b1;
+                dbg_evt_outcome_drop_duplicate = 1'b1;
 `endif
               end
-
-              state_d                 = IDLE;
-              chunk_ptr_d             = '0;
-              br_cnt_d                = '0;
-              instr_start_cnt_d       = '0;
-              taken_cnt_d             = '0;
-              has_indirect_cf_d       = 1'b0;
-              trace_d                 = '0;
+            end else begin
+`ifndef SYNTHESIS
+              dbg_evt_outcome_drop_no_suffix = 1'b1;
+`endif
             end
+
+            state_d            = IDLE;
+            active_payload_d   = '0;
+            active_tag_d       = '0;
+            active_chunk_ptr_d = '0;
+            active_instr_cnt_d = '0;
+            expected_pc_d      = '0;
+            has_suffix_instr_d = 1'b0;
           end
         end
-
       endcase
     end
   end
@@ -573,18 +404,22 @@ module trace_builder #(
     if (!rst_ni) begin
       for (int i = 0; i < (1 << TRACE_ADDRW); i++) begin
         dup_valid[i] <= 1'b0;
+        dup_pc[i] <= '0;
+        dup_flags[i] <= '0;
         dup_num_branches[i] <= '0;
       end
     end else if (commit_valid_d) begin
-      trace_data_t dup_tmp;
-      dup_tmp = trace_data_t'(commit_data_d);
-      dup_valid[sram_wr_addr_d] <= 1'b1;
-      dup_pc[sram_wr_addr_d]    <= dup_tmp.base_pc;
-      dup_flags[sram_wr_addr_d] <= dup_tmp.lookup_branch_flags;
-      dup_num_branches[sram_wr_addr_d] <= dup_tmp.lookup_num_branches;
+      logic [CHUNKS_PER_TRACE-1:0] dup_flags_tmp;
+      dup_flags_tmp = '0;
+      dup_flags_tmp[TRIGGER_BRANCH_BITS-1:0] = commit_tag_d.branch_flags;
+      dup_valid[commit_addr_d] <= 1'b1;
+      dup_pc[commit_addr_d] <= commit_tag_d.base_pc;
+      dup_flags[commit_addr_d] <= dup_flags_tmp;
+      dup_num_branches[commit_addr_d] <= BR_CNT_WIDTH'(commit_tag_d.num_branches);
     end
   end
 
+`ifndef SYNTHESIS
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       dbg_start_any_q               <= 0;
@@ -593,6 +428,8 @@ module trace_builder #(
       dbg_start_unaligned_taken_q   <= 0;
       dbg_accum_pc_gap_q            <= 0;
       dbg_finalize_any_q            <= 0;
+      dbg_finalize_unaligned_q      <= 0;
+      dbg_finalize_stop_cf_q        <= 0;
       dbg_finalize_trace_full_q     <= 0;
       dbg_finalize_len_limit_q      <= 0;
       dbg_finalize_taken_limit_q    <= 0;
@@ -600,6 +437,12 @@ module trace_builder #(
       dbg_outcome_drop_duplicate_q  <= 0;
       dbg_outcome_drop_indirect_q   <= 0;
       dbg_outcome_drop_not_single_q <= 0;
+      dbg_outcome_drop_no_suffix_q  <= 0;
+      dbg_payload_len0_q            <= 0;
+      dbg_payload_len1_q            <= 0;
+      dbg_payload_len2_q            <= 0;
+      dbg_payload_len3_q            <= 0;
+      dbg_payload_len4p_q           <= 0;
     end else begin
       if (dbg_evt_start_any)
         dbg_start_any_q <= dbg_start_any_q + 1;
@@ -613,6 +456,10 @@ module trace_builder #(
         dbg_accum_pc_gap_q <= dbg_accum_pc_gap_q + 1;
       if (dbg_evt_finalize_any)
         dbg_finalize_any_q <= dbg_finalize_any_q + 1;
+      if (dbg_evt_finalize_unaligned)
+        dbg_finalize_unaligned_q <= dbg_finalize_unaligned_q + 1;
+      if (dbg_evt_finalize_stop_cf)
+        dbg_finalize_stop_cf_q <= dbg_finalize_stop_cf_q + 1;
       if (dbg_evt_finalize_trace_full)
         dbg_finalize_trace_full_q <= dbg_finalize_trace_full_q + 1;
       if (dbg_evt_finalize_len_limit)
@@ -627,53 +474,36 @@ module trace_builder #(
         dbg_outcome_drop_indirect_q <= dbg_outcome_drop_indirect_q + 1;
       if (dbg_evt_outcome_drop_not_single)
         dbg_outcome_drop_not_single_q <= dbg_outcome_drop_not_single_q + 1;
-    end
-  end
+      if (dbg_evt_outcome_drop_no_suffix)
+        dbg_outcome_drop_no_suffix_q <= dbg_outcome_drop_no_suffix_q + 1;
 
-`ifndef SYNTHESIS
-  `ifdef TRACE_CACHE_DEBUG_VERBOSE
-  always_ff @(posedge clk_i) begin
-    if (commit_valid_q) begin
-      trace_data_t dbg;
-      dbg = trace_data_t'(commit_data_q);
-      $display("[TC-BUILDER] ---- TRACE COMMITTED (non-duplicate) ----");
-      $display("[TC-BUILDER]   SRAM addr  = %0d", sram_wr_addr_q);
-      $display("[TC-BUILDER]   base_pc    = 0x%h", dbg.base_pc);
-      $display("[TC-BUILDER]   HASH: pc[%0d:4]=0x%h ^ pc[%0d:%0d]=0x%h ^ pc[%0d:%0d]=0x%h ^ flags[1:0]=%b => set=%0d",
-               TRACE_ADDRW+3,
-               dbg.base_pc[TRACE_ADDRW+3:4],
-               2*TRACE_ADDRW+3, TRACE_ADDRW+4,
-               dbg.base_pc[2*TRACE_ADDRW+3:TRACE_ADDRW+4],
-               3*TRACE_ADDRW+3, 2*TRACE_ADDRW+4,
-               dbg.base_pc[3*TRACE_ADDRW+3:2*TRACE_ADDRW+4],
-               dbg.branch_flags[TC_INDEX_FLAG_BITS-1:0],
-               sram_wr_addr_q);
-      $display("[TC-BUILDER]   target     = 0x%h", dbg.target_addr);
-      $display("[TC-BUILDER]   #branches  = %0d", dbg.num_branches);
-      $display("[TC-BUILDER]   #taken     = %0d", dbg.num_taken);
-      $display("[TC-BUILDER]   br_flags   = %b", dbg.branch_flags);
-      $display("[TC-BUILDER]   chunks used= %0d", commit_chunk_ptr_q);
-      for (int i = 0; i < CHUNKS_PER_TRACE; i++) begin
-        if (dbg.valid_chunks[i])
-          $display("[TC-BUILDER]   chunk[%0d]  = 0x%h (instr start)", i, dbg.chunks[i]);
-        else if (i > 0 && dbg.valid_chunks[i-1])
-          $display("[TC-BUILDER]   chunk[%0d]  = 0x%h (instr high half)", i, dbg.chunks[i]);
+      if (dbg_evt_finalize_any) begin
+        unique case (int'(active_instr_cnt_d))
+          0:       dbg_payload_len0_q  <= dbg_payload_len0_q + 1;
+          1:       dbg_payload_len1_q  <= dbg_payload_len1_q + 1;
+          2:       dbg_payload_len2_q  <= dbg_payload_len2_q + 1;
+          3:       dbg_payload_len3_q  <= dbg_payload_len3_q + 1;
+          default: dbg_payload_len4p_q <= dbg_payload_len4p_q + 1;
+        endcase
       end
-      $display("[TC-BUILDER] ---------------------------");
     end
   end
-  `endif
 
   final begin
     $display("[TC-BUILDER-DBG] starts: any=%0d single_taken=%0d multi_taken=%0d unaligned_taken=%0d",
              dbg_start_any_q, dbg_start_single_taken_q, dbg_start_multi_taken_q,
              dbg_start_unaligned_taken_q);
-    $display("[TC-BUILDER-DBG] accum: pc_gap_windows=%0d finalizations=%0d cause_trace_full=%0d cause_len_limit=%0d cause_taken_limit=%0d",
-             dbg_accum_pc_gap_q, dbg_finalize_any_q, dbg_finalize_trace_full_q,
+    $display("[TC-BUILDER-DBG] accum: pc_gap_windows=%0d finalizations=%0d stop_unaligned=%0d stop_cf=%0d cause_trace_full=%0d cause_len_limit=%0d cause_taken_limit=%0d",
+             dbg_accum_pc_gap_q, dbg_finalize_any_q, dbg_finalize_unaligned_q,
+             dbg_finalize_stop_cf_q, dbg_finalize_trace_full_q,
              dbg_finalize_len_limit_q, dbg_finalize_taken_limit_q);
-    $display("[TC-BUILDER-DBG] outcomes: commit=%0d drop_duplicate=%0d drop_indirect=%0d drop_not_single=%0d",
+    $display("[TC-BUILDER-DBG] outcomes: commit=%0d drop_duplicate=%0d drop_indirect=%0d drop_not_single=%0d drop_no_suffix=%0d",
              dbg_outcome_commit_q, dbg_outcome_drop_duplicate_q,
-             dbg_outcome_drop_indirect_q, dbg_outcome_drop_not_single_q);
+             dbg_outcome_drop_indirect_q, dbg_outcome_drop_not_single_q,
+             dbg_outcome_drop_no_suffix_q);
+    $display("[TC-BUILDER-DBG] payload_len_hist: len0=%0d len1=%0d len2=%0d len3=%0d len4p=%0d",
+             dbg_payload_len0_q, dbg_payload_len1_q, dbg_payload_len2_q,
+             dbg_payload_len3_q, dbg_payload_len4p_q);
   end
 `endif
 
