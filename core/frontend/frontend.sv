@@ -130,7 +130,7 @@ module frontend
   logic [CVA6Cfg.VLEN-1:0]                 tc_lookup_oneshot_pc_q, tc_lookup_oneshot_pc_d;
   logic                                    tc_same_lookup_oneshot_block;
 
-  // TC feeding registers
+  // Legacy feeding registers kept inert while we move to one-shot TC pushes.
   logic                                    tc_feeding_q, tc_feeding_d;
   logic [TRACE_LEN_WIDTH-1:0]              tc_feeding_len_q, tc_feeding_len_d;
   logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   tc_feeding_instr_q, tc_feeding_instr_d;
@@ -147,8 +147,6 @@ module frontend
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]                   replay_valid_iq;
   cf_t  [CVA6Cfg.INSTR_PER_FETCH-1:0]                   replay_cf_type_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] replay_predict_addr_iq;
-  logic [CVA6Cfg.INSTR_PER_FETCH-1:0][TRACE_LEN_WIDTH-1:0] replay_slot_map_iq;
-
   // MUX outputs to instr_queue
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0]             instr_to_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] addr_to_iq;
@@ -282,7 +280,7 @@ module frontend
   logic [CHUNKS_PER_TRACE-1:0] tc_active_branch_flags;
   logic [CHUNKS_PER_TRACE-1:0] restored_branch_flags;
 
-  assign tc_icache_sidefx_en = !tc_feeding_q && !tc_pending_q && !tc_feeding_start;
+  assign tc_icache_sidefx_en = !tc_pending_q && !tc_pending_start;
 
   for (genvar i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
     assign is_branch[i] = tc_icache_sidefx_en & instruction_valid[i] & (rvi_branch[i] | rvc_branch[i]);
@@ -363,10 +361,10 @@ module frontend
 
   // Keep the I$ request side alive while a hit is held in pending. Pending is
   // only a saved TC hit; it must not block natural IQ draining.
-  assign icache_dreq_o.req     = instr_queue_ready & ~halt_frontend_i & ~tc_feeding_q;
+  assign icache_dreq_o.req     = instr_queue_ready & ~halt_frontend_i & ~tc_pending_q;
   assign if_ready              = icache_dreq_i.ready & instr_queue_ready & ~halt_frontend_i &
-                                 ~tc_feeding_q;
-  assign icache_dreq_o.kill_s1 = is_mispredict | flush_i | replay | tc_feeding_start;
+                                 ~tc_pending_q;
+  assign icache_dreq_o.kill_s1 = is_mispredict | flush_i | replay | tc_pending_start;
   assign icache_dreq_o.kill_s2 = icache_dreq_o.kill_s1 | bp_valid;
 
   bht_update_t bht_update;
@@ -439,98 +437,43 @@ module frontend
   end
 
   // -----------------------------------------------------------------------
-  // TC: Present trace to instr_queue
-  // Compact remaining unconsumed trace slots before re-feeding them.
-  // instr_queue replay accounting assumes a dense packet that starts at slot 0;
-  // leaving holes after partial consumption corrupts replay_addr / FIFO alignment.
+  // TC: Present the pending suffix as a one-shot packet into instr_queue.
   // -----------------------------------------------------------------------
   always_comb begin
     automatic cf_t cf_local;
-    automatic int compact_idx;
-    automatic int next_unconsumed;
 
     replay_instr_iq        = '0;
     replay_addr_iq         = '0;
     replay_valid_iq        = '0;
     replay_cf_type_iq      = '{default: ariane_pkg::NoCF};
     replay_predict_addr_iq = '0;
-    replay_slot_map_iq     = '0;
-    compact_idx            = 0;
 
     for (int s = 0; s < TRACE_LEN; s++) begin
-      if ((s < int'(tc_feeding_len_q)) && !tc_feeding_consumed_q[s] &&
-          (compact_idx < CVA6Cfg.INSTR_PER_FETCH)) begin
-        cf_local = tc_feeding_taken_cf_q[s] ?
-                   tc_replay_cf_type(tc_feeding_instr_q[s]) : ariane_pkg::NoCF;
+      if (s < int'(tc_pending_len_q)) begin
+        cf_local = tc_pending_taken_cf_q[s] ?
+                   tc_replay_cf_type(tc_pending_instr_q[s]) : ariane_pkg::NoCF;
 
-        replay_valid_iq[compact_idx]    = 1'b1;
-        replay_instr_iq[compact_idx]    = tc_feeding_instr_q[s];
-        replay_addr_iq[compact_idx]     = tc_feeding_pcs_q[s];
-        replay_cf_type_iq[compact_idx]  = cf_local;
-        replay_slot_map_iq[compact_idx] = s;
+        replay_valid_iq[s]       = 1'b1;
+        replay_instr_iq[s]       = tc_pending_instr_q[s];
+        replay_addr_iq[s]        = tc_pending_pcs_q[s];
+        replay_cf_type_iq[s]     = cf_local;
 
         if (cf_local != ariane_pkg::NoCF) begin
-          next_unconsumed = -1;
-          for (int t = s + 1; t < TRACE_LEN; t++) begin
-            if ((t < int'(tc_feeding_len_q)) && !tc_feeding_consumed_q[t] && (next_unconsumed < 0))
-              next_unconsumed = t;
-          end
-
-          if (next_unconsumed >= 0)
-            replay_predict_addr_iq[compact_idx] = tc_feeding_pcs_q[next_unconsumed];
+          if (s + 1 < int'(tc_pending_len_q))
+            replay_predict_addr_iq[s] = tc_pending_pcs_q[s + 1];
           else
-            replay_predict_addr_iq[compact_idx] = tc_feeding_next_pc_q;
+            replay_predict_addr_iq[s] = tc_pending_next_pc_q;
         end
-
-        compact_idx++;
       end
     end
   end
 
   // -----------------------------------------------------------------------
-  // TC: Consumed mask + feeding done
+  // TC: one-shot push keeps legacy feeding state inert.
   // -----------------------------------------------------------------------
   always_comb begin
-    logic all_replay_accepted;
-
-    tc_feeding_consumed_d = tc_feeding_consumed_q;
-    tc_feeding_done       = 1'b0;
-    all_replay_accepted   = 1'b1;
-
-    // ex_valid_i can pulse during ordinary backend activity; rely on the
-    // architectural redirect controls (flush/set_pc/eret) to clear replay state.
-    if (flush_i || is_mispredict || set_pc_commit_i || eret_i) begin
-      tc_feeding_consumed_d = '0;
-    end else begin
-      if (tc_feeding_start)
-        tc_feeding_consumed_d = '0;
-
-      if (tc_feeding_q) begin
-        for (int j = 0; j < CVA6Cfg.INSTR_PER_FETCH; j++) begin
-          if (replay_valid_iq[j] && instr_queue_consumed[j])
-            tc_feeding_consumed_d[replay_slot_map_iq[j]] = 1'b1;
-        end
-
-        for (int j = 0; j < TRACE_LEN; j++) begin
-          if ((j < int'(tc_feeding_len_q)) && !tc_feeding_consumed_d[j])
-            all_replay_accepted = 1'b0;
-        end
-
-        // For the current suffix-only policy, traces fit in one frontend push
-        // and carry no replayed taken-CF metadata. In that case we can finish
-        // as soon as all replay slots were accepted. Fall back to the original
-        // multi-cycle condition for any future wider / CF-carrying policy.
-        tc_feeding_done = all_replay_accepted &&
-                          (((tc_feeding_len_q <= TRACE_LEN_WIDTH'(CVA6Cfg.INSTR_PER_FETCH)) &&
-                            !(|tc_feeding_taken_cf_q))
-                             ? 1'b1
-                             : !(|replay_valid_iq));
-
-        if (tc_feeding_done) begin
-          tc_feeding_consumed_d = '0;
-        end
-      end
-    end
+    tc_feeding_consumed_d = '0;
+    tc_feeding_done       = tc_pending_start;
   end
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -689,67 +632,30 @@ module frontend
                                         (trace_cache_pkg::pc_align_16(tc_trace_pcs[0][CVA6Cfg.VLEN-1:0]) ==
                                          trace_cache_pkg::pc_align_16(tc_lookup_oneshot_pc_q));
 
-  assign tc_feeding_start = (tc_active_use || tc_pending_start) && !tc_feeding_q;
+  assign tc_feeding_start = tc_pending_start;
 
   always_comb begin
-    automatic int br_idx;
-
-    tc_feeding_d         = tc_feeding_q;
-    tc_feeding_len_d     = tc_feeding_len_q;
-    tc_feeding_instr_d   = tc_feeding_instr_q;
-    tc_feeding_pcs_d     = tc_feeding_pcs_q;
-    tc_feeding_next_pc_d = tc_feeding_next_pc_q;
-    tc_feeding_taken_cf_d = tc_feeding_taken_cf_q;
-
-    // Keep replay feeding alive across transient ex_valid_i pulses.
-    if (flush_i || is_mispredict || set_pc_commit_i || eret_i) begin
-      tc_feeding_d          = 1'b0;
-      tc_feeding_taken_cf_d = '0;
-    end else if (tc_feeding_done) begin
-      tc_feeding_d          = 1'b0;
-      tc_feeding_taken_cf_d = '0;
-    end else if (tc_feeding_start) begin
-      tc_feeding_d          = 1'b1;
-      tc_feeding_taken_cf_d = '0;
-      if (tc_pending_start) begin
-        tc_feeding_len_d      = tc_pending_len_q;
-        tc_feeding_instr_d    = tc_pending_instr_q;
-        tc_feeding_pcs_d      = tc_pending_pcs_q;
-        tc_feeding_next_pc_d  = tc_pending_next_pc_q;
-        tc_feeding_taken_cf_d = tc_pending_taken_cf_q;
-      end else begin
-        tc_feeding_len_d      = tc_trace_length;
-        tc_feeding_instr_d    = tc_trace_instructions;
-        tc_feeding_next_pc_d  = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
-        br_idx = 0;
-        for (int k = 0; k < TRACE_LEN; k++) begin
-          tc_feeding_pcs_d[k] = tc_trace_pcs[k][CVA6Cfg.VLEN-1:0];
-
-          if ((k < int'(tc_trace_length)) &&
-              (tc_replay_cf_type(tc_trace_instructions[k]) != ariane_pkg::NoCF) &&
-              (br_idx < int'(tc_trace_num_branches))) begin
-            tc_feeding_taken_cf_d[k] = tc_trace_branch_flags[br_idx];
-            br_idx++;
-          end
-        end
-      end
-    end
+    tc_feeding_d          = 1'b0;
+    tc_feeding_len_d      = '0;
+    tc_feeding_instr_d    = '0;
+    tc_feeding_pcs_d      = '0;
+    tc_feeding_next_pc_d  = '0;
+    tc_feeding_taken_cf_d = '0;
   end
 
   // -----------------------------------------------------------------------
   // MUX: TC feeding vs normal I-cache
   // -----------------------------------------------------------------------
-  assign instr_to_iq            = tc_feeding_q ? replay_instr_iq   : instr;
-  assign addr_to_iq             = tc_feeding_q ? replay_addr_iq    : addr;
-  assign valid_to_iq            = tc_feeding_q ? replay_valid_iq
-                                               : ((tc_pending_q || tc_feeding_start) ? '0
-                                                                                     : instruction_valid);
-  assign cf_type_to_iq          = tc_feeding_q ? replay_cf_type_iq : cf_type;
-  assign exception_to_iq        = tc_feeding_q ? ariane_pkg::FE_NONE : icache_ex_valid_q;
-  assign exception_addr_to_iq   = tc_feeding_q ? '0 : icache_vaddr_q;
-  assign exception_gpaddr_to_iq = tc_feeding_q ? '0 : icache_gpaddr_q;
-  assign exception_tinst_to_iq  = tc_feeding_q ? '0 : icache_tinst_q;
-  assign exception_gva_to_iq    = tc_feeding_q ? 1'b0 : icache_gva_q;
+  assign instr_to_iq            = tc_pending_start ? replay_instr_iq   : instr;
+  assign addr_to_iq             = tc_pending_start ? replay_addr_iq    : addr;
+  assign valid_to_iq            = tc_pending_start ? replay_valid_iq
+                                                   : (tc_pending_q ? '0 : instruction_valid);
+  assign cf_type_to_iq          = tc_pending_start ? replay_cf_type_iq : cf_type;
+  assign exception_to_iq        = tc_pending_start ? ariane_pkg::FE_NONE : icache_ex_valid_q;
+  assign exception_addr_to_iq   = tc_pending_start ? '0 : icache_vaddr_q;
+  assign exception_gpaddr_to_iq = tc_pending_start ? '0 : icache_gpaddr_q;
+  assign exception_tinst_to_iq  = tc_pending_start ? '0 : icache_tinst_q;
+  assign exception_gva_to_iq    = tc_pending_start ? 1'b0 : icache_gva_q;
   always_comb begin
     replay_predict_addr_single_iq = '0;
     for (int r = 0; r < CVA6Cfg.INSTR_PER_FETCH; r++) begin
@@ -759,14 +665,14 @@ module frontend
   end
 
   for (genvar gi = 0; gi < CVA6Cfg.INSTR_PER_FETCH; gi++) begin : gen_predict_addr_mux
-    assign predict_addr_to_iq[gi] = tc_feeding_q ? replay_predict_addr_single_iq : predict_address;
+    assign predict_addr_to_iq[gi] = tc_pending_start ? replay_predict_addr_single_iq : predict_address;
   end
 
   always_comb begin
     tc_active_branch_flags = '0;
-    if (tc_feeding_q) begin
+    if (tc_pending_start) begin
       for (int bf = 0; bf < TRACE_LEN; bf++)
-        tc_active_branch_flags[bf] = tc_feeding_taken_cf_q[bf];
+        tc_active_branch_flags[bf] = tc_pending_taken_cf_q[bf];
     end
   end
 
@@ -795,8 +701,8 @@ module frontend
       npc_d = {fetch_address[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] + 1,
                {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}};
 
-    if (tc_feeding_done && tc_feeding_q)
-      npc_d = tc_feeding_next_pc_q;
+    if (tc_pending_start)
+      npc_d = tc_pending_next_pc_q;
 
     if (replay)          npc_d = replay_addr;
     if (is_mispredict)   npc_d = resolved_branch_i.target_address;
@@ -962,7 +868,7 @@ module frontend
       // windows; flushing/reseeding the queue on these events prevents stale
       // pc/address FIFO state from escaping into fetch_entry_o.
       .flush_i            (flush_i || is_mispredict || set_pc_commit_i || eret_i ||
-                           ex_valid_i || tc_feeding_start),
+                           ex_valid_i),
       .instr_i            (instr_to_iq),
       .addr_i             (addr_to_iq),
       .exception_i        (exception_to_iq),
@@ -983,7 +889,8 @@ module frontend
       .fetch_entry_o      (fetch_entry_o),
       .fetch_entry_valid_o(fetch_entry_valid_o),
       .fetch_entry_ready_i(fetch_entry_ready_i),
-      .tc_feeding_i       (tc_feeding_q)
+      .tc_feeding_i       (tc_pending_start),
+      .reseed_pc_i        (tc_pending_start)
   );
 
   // -----------------------------------------------------------------------
@@ -1003,11 +910,7 @@ module frontend
   logic                                     tc_record_enable;
 
   assign tc_window_eligible = !serving_unaligned && !halt_i && !halt_frontend_i && !debug_mode_i;
-  // Also block the exact cycle replay starts. tc_feeding_q only goes high
-  // after the clock edge, but tc_feeding_start is already combinationally
-  // asserted in the launch cycle. Without this, the consumed taken branch
-  // that triggered replay can still launch one more lookup in that same cycle.
-  assign tc_record_enable = tc_window_eligible && !tc_feeding_q && !tc_feeding_start
+  assign tc_record_enable = tc_window_eligible && !tc_pending_q && !tc_pending_start
                           && addr[0][31];
 
   for (genvar i = 0; i < SLOTS_PER_CYCLE; i++) begin : gen_tc_signals
@@ -1056,12 +959,8 @@ module frontend
     end
   end
 
-  // Do not launch a new TC lookup from instructions that are currently being
-  // replayed by the TC itself, or in the exact cycle replay is launched.
-  // Otherwise the consumed taken branch that triggered replay can still create
-  // one more lookup before tc_feeding_q rises, and that re-hits one cycle later.
   assign tc_lookup_cond = (|instr_queue_consumed) && consumed_has_taken_branch &&
-                          tc_record_enable && !tc_feeding_q && !tc_feeding_start;
+                          tc_record_enable;
 
   always_comb begin
     integer br_idx;
@@ -1174,31 +1073,19 @@ module frontend
                               !tc_trace_has_call &&
                               !tc_disable_replay_q;
 
-  // Capture a hit into pending when the IQ is still busy; if the IQ is already
-  // empty, tc_active_use handles the immediate handoff instead.
   assign tc_pending_capture = tc_active_hit &&
                               tc_trace_policy_ok &&
-                              !tc_feeding_q &&
                               !tc_pending_q &&
                               !tc_same_pc_rehit_block &&
-                              !tc_same_lookup_oneshot_block &&
-                              !instr_queue_empty;
+                              !tc_same_lookup_oneshot_block;
 
   assign tc_pending_start = tc_pending_q &&
                             instr_queue_ready &&
                             instr_queue_empty &&
-                            !tc_feeding_q &&
                             !flush_i &&
                             !is_mispredict;
 
-  assign tc_active_use = tc_active_hit &&
-                         tc_trace_policy_ok &&
-                         instr_queue_ready &&
-                         instr_queue_empty &&
-                         !tc_feeding_q &&
-                         !tc_pending_q &&
-                         !tc_same_pc_rehit_block &&
-                         !tc_same_lookup_oneshot_block;
+  assign tc_active_use = 1'b0;
 
 // pragma translate_off
   longint unsigned tc_total_cycles_q;
@@ -1314,15 +1201,11 @@ module frontend
         if (tc_trace_hit) begin
           tc_dbg_hit_count_q <= tc_dbg_hit_count_q + 1;
 
-          if (!tc_feeding_q) begin
-            if (tc_trace_policy_ok) begin
-              if (tc_active_use)
-                tc_dbg_accept_count_q <= tc_dbg_accept_count_q + 1;
-              else if (!tc_pending_capture)
-                tc_dbg_reject_not_ready_q <= tc_dbg_reject_not_ready_q + 1;
-            end else begin
-              tc_dbg_reject_policy_q <= tc_dbg_reject_policy_q + 1;
-            end
+          if (tc_trace_policy_ok) begin
+            if (!tc_pending_capture)
+              tc_dbg_reject_not_ready_q <= tc_dbg_reject_not_ready_q + 1;
+          end else begin
+            tc_dbg_reject_policy_q <= tc_dbg_reject_policy_q + 1;
           end
         end else begin
           if (tc_miss_reason_empty) tc_dbg_miss_empty_q <= tc_dbg_miss_empty_q + 1;
@@ -1331,7 +1214,7 @@ module frontend
         end
       end
 
-      if (tc_feeding_q)
+      if (tc_pending_q)
         tc_dbg_feed_cycles_q <= tc_dbg_feed_cycles_q + 1;
 
       if (tc_feeding_start)
@@ -1349,11 +1232,11 @@ module frontend
       end
 
       if ((|instruction_valid) && addr[0][31] && serving_unaligned &&
-          !tc_feeding_q && !tc_feeding_start)
+          !tc_pending_q && !tc_pending_start)
         tc_dbg_window_unaligned_q <= tc_dbg_window_unaligned_q + 1;
 
       if ((|instruction_valid) && addr[0][31] && tc_window_eligible &&
-          !instr_queue_ready && !tc_feeding_q && !tc_feeding_start)
+          !instr_queue_ready && !tc_pending_q && !tc_pending_start)
         tc_dbg_window_not_ready_q <= tc_dbg_window_not_ready_q + 1;
 
       if (tc_icache_sidefx_en && (|instruction_valid) && addr[0][31]) begin
@@ -1425,7 +1308,7 @@ module frontend
         end
       end
 
-      if (tc_feeding_q && (|replay_valid_iq)) begin
+      if (tc_pending_start && (|replay_valid_iq)) begin
         tc_dbg_tc_pkt_cycles_q <= tc_dbg_tc_pkt_cycles_q + 1;
         src_cnt = 0;
         for (int k = 0; k < CVA6Cfg.INSTR_PER_FETCH; k++)
@@ -1441,17 +1324,12 @@ module frontend
         tc_dbg_accept_count_q <= tc_dbg_accept_count_q + 1;
       end
 
-      if (tc_active_use) begin
-        tc_dbg_immediate_use_count_q <= tc_dbg_immediate_use_count_q + 1;
-        tc_dbg_accept_count_q <= tc_dbg_accept_count_q + 1;
-      end
-
       if (tc_feeding_done) begin
         tc_dbg_feed_done_q <= tc_dbg_feed_done_q + 1;
         if (tc_dbg_feed_done_q < 256) begin
-          $display("[TC-FEED-DONE] t=%0t len_q=%0d consumed_q=%b consumed_d=%b iq_cons=%b iq_ready=%0b iq_empty=%0b next_pc=0x%h",
-                   $time, tc_feeding_len_q, tc_feeding_consumed_q, tc_feeding_consumed_d,
-                   instr_queue_consumed, instr_queue_ready, instr_queue_empty, tc_feeding_next_pc_q);
+          $display("[TC-FEED-DONE] t=%0t len_q=%0d iq_cons=%b iq_ready=%0b iq_empty=%0b next_pc=0x%h",
+                   $time, tc_pending_len_q, instr_queue_consumed, instr_queue_ready,
+                   instr_queue_empty, tc_pending_next_pc_q);
         end
       end
 
@@ -1470,30 +1348,18 @@ module frontend
                        tc_replay_cf_type(tc_pending_instr_q[k]), tc_pending_taken_cf_q[k]);
             end
           end
-        end else begin
-          $display("[TC-FEED-START] #%0d t=%0t len=%0d next_pc=0x%h src0_pc=0x%h num_taken=%0d",
-                   tc_dbg_feed_start_count_q + 1, $time, tc_trace_length, tc_trace_next_pc,
-                   tc_trace_pcs[0], tc_trace_num_taken);
-          for (int k = 0; k < TRACE_LEN; k++) begin
-            if (k < int'(tc_trace_length)) begin
-              $display("[TC-FEED-START]   src[%0d] pc=0x%h instr=0x%08h cf=%0d taken_cf=%0b",
-                       k, tc_trace_pcs[k], tc_trace_instructions[k],
-                       tc_replay_cf_type(tc_trace_instructions[k]), tc_feeding_taken_cf_d[k]);
-            end
-          end
         end
       end
 
-      if (tc_feeding_q && (|replay_valid_iq) && (tc_dbg_replay_pkt_count_q < 256)) begin
+      if (tc_pending_start && (|replay_valid_iq) && (tc_dbg_replay_pkt_count_q < 256)) begin
         tc_dbg_replay_pkt_count_q <= tc_dbg_replay_pkt_count_q + 1;
-        $display("[TC-REPLAY-PKT] #%0d t=%0t len_q=%0d consumed_q=%b consumed_d=%b iq_cons=%b iq_ready=%0b iq_empty=%0b",
-                 tc_dbg_replay_pkt_count_q + 1, $time, tc_feeding_len_q,
-                 tc_feeding_consumed_q, tc_feeding_consumed_d, instr_queue_consumed,
+        $display("[TC-REPLAY-PKT] #%0d t=%0t len_q=%0d iq_cons=%b iq_ready=%0b iq_empty=%0b",
+                 tc_dbg_replay_pkt_count_q + 1, $time, tc_pending_len_q, instr_queue_consumed,
                  instr_queue_ready, instr_queue_empty);
         for (int k = 0; k < CVA6Cfg.INSTR_PER_FETCH; k++) begin
           if (replay_valid_iq[k]) begin
             $display("[TC-REPLAY-PKT]   dst[%0d]->src[%0d] pc=0x%h instr=0x%08h cf=%0d pred=0x%h",
-                     k, replay_slot_map_iq[k], replay_addr_iq[k], replay_instr_iq[k],
+                     k, k, replay_addr_iq[k], replay_instr_iq[k],
                      replay_cf_type_iq[k], replay_predict_addr_iq[k]);
           end
         end
@@ -1501,10 +1367,7 @@ module frontend
 
       if (tc_lookup_result_valid && (tc_dbg_lookup_count_q < 80)) begin
         if (tc_trace_hit) begin
-          if (tc_active_use) begin
-            $display("[TC-HIT-USE] t=%0t pc0=0x%h len=%0d num_taken=%0d last_taken_last=%0b iq_ready=%0b iq_empty=%0b",
-                     $time, tc_trace_pcs[0], tc_trace_length, tc_trace_num_taken, tc_trace_last_is_taken_cf, instr_queue_ready, instr_queue_empty);
-          end else if (tc_pending_capture) begin
+          if (tc_pending_capture) begin
             $display("[TC-HIT-HOLD] t=%0t pc0=0x%h len=%0d num_taken=%0d last_taken_last=%0b iq_ready=%0b iq_empty=%0b",
                      $time, tc_trace_pcs[0], tc_trace_length, tc_trace_num_taken, tc_trace_last_is_taken_cf, instr_queue_ready, instr_queue_empty);
           end else if (tc_same_pc_rehit_block) begin

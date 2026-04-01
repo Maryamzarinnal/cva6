@@ -43,6 +43,7 @@ module instr_queue
     input ariane_pkg::cf_t [CVA6Cfg.INSTR_PER_FETCH-1:0] cf_type_i,
     // Trace cache: bypass branch_mask so multiple CFs pass through
     input logic tc_feeding_i,
+    input logic reseed_pc_i,
     output logic replay_o,
     output logic [CVA6Cfg.VLEN-1:0] replay_addr_o,
     output logic [BRANCH_FLAGS_W-1:0] branch_flags_o,
@@ -407,7 +408,7 @@ module instr_queue
         if (fetch_entry_fire[NID]) pc_d = pc_j[2];
       end
     end
-    if (valid_i[0] && reset_address_q) begin
+    if (valid_i[0] && (reset_address_q || reseed_pc_i)) begin
       pc_d = addr_i[0];
       reset_address_d = 1'b0;
     end
