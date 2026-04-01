@@ -118,7 +118,8 @@ module instr_queue
   // address_out: use single address FIFO (stable baseline semantics).
   always_comb begin
     address_out = '0;
-    address_out = addr_data_out_single;
+    if (!empty_address_single)
+      address_out = addr_data_out_single;
   end
 
   assign empty_o = &instr_queue_empty;
