@@ -112,6 +112,7 @@ module frontend
   logic [TAKEN_CNT_WIDTH-1:0]              tc_trace_mapped_num_taken;
   logic                                    tc_trace_branch_map_ok;
   logic                                    tc_trace_has_call;
+  logic                                    tc_trace_has_indirect;
   logic                                    tc_lookup_cond;
 
   // TC pending-hit latch: preserve one conservative hit until the instr_queue becomes ready.
@@ -121,6 +122,8 @@ module frontend
   logic [TRACE_LEN-1:0][CVA6Cfg.VLEN-1:0]  tc_pending_pcs_q, tc_pending_pcs_d;
   logic [CVA6Cfg.VLEN-1:0]                 tc_pending_next_pc_q, tc_pending_next_pc_d;
   logic [TRACE_LEN-1:0]                    tc_pending_taken_cf_q, tc_pending_taken_cf_d;
+  logic [TRACE_LEN-1:0]                    tc_pending_cf_q, tc_pending_cf_d;
+  logic [BR_CNT_WIDTH-1:0]                 tc_pending_num_branches_q, tc_pending_num_branches_d;
   logic [TAKEN_CNT_WIDTH-1:0]              tc_pending_num_taken_q, tc_pending_num_taken_d;
   logic                                    tc_pending_capture;
   logic                                    tc_pending_start;
@@ -431,9 +434,15 @@ module frontend
 
   always_comb begin
     tc_trace_has_call = 1'b0;
+    tc_trace_has_indirect = 1'b0;
     for (int i = 0; i < TRACE_LEN; i++) begin
-      if ((i < int'(tc_trace_length)) && tc_replay_is_call(tc_trace_instructions[i]))
-        tc_trace_has_call = 1'b1;
+      if (i < int'(tc_trace_length)) begin
+        if (tc_replay_is_call(tc_trace_instructions[i]))
+          tc_trace_has_call = 1'b1;
+        if ((tc_replay_cf_type(tc_trace_instructions[i]) == ariane_pkg::JumpR) ||
+            (tc_replay_cf_type(tc_trace_instructions[i]) == ariane_pkg::Return))
+          tc_trace_has_indirect = 1'b1;
+      end
     end
   end
 
@@ -451,7 +460,7 @@ module frontend
 
     for (int s = 0; s < TRACE_LEN; s++) begin
       if (s < int'(tc_pending_len_q)) begin
-        cf_local = tc_pending_taken_cf_q[s] ?
+        cf_local = tc_pending_cf_q[s] ?
                    tc_replay_cf_type(tc_pending_instr_q[s]) : ariane_pkg::NoCF;
 
         replay_valid_iq[s]       = 1'b1;
@@ -485,6 +494,8 @@ module frontend
       tc_pending_pcs_q      <= '0;
       tc_pending_next_pc_q  <= '0;
       tc_pending_taken_cf_q <= '0;
+      tc_pending_cf_q       <= '0;
+      tc_pending_num_branches_q <= '0;
       tc_pending_num_taken_q <= '0;
       tc_rehit_block_q      <= 1'b0;
       tc_rehit_pc_q         <= '0;
@@ -504,6 +515,8 @@ module frontend
       tc_pending_pcs_q      <= tc_pending_pcs_d;
       tc_pending_next_pc_q  <= tc_pending_next_pc_d;
       tc_pending_taken_cf_q <= tc_pending_taken_cf_d;
+      tc_pending_cf_q       <= tc_pending_cf_d;
+      tc_pending_num_branches_q <= tc_pending_num_branches_d;
       tc_pending_num_taken_q <= tc_pending_num_taken_d;
       tc_rehit_block_q      <= tc_rehit_block_d;
       tc_rehit_pc_q         <= tc_rehit_pc_d;
@@ -528,20 +541,28 @@ module frontend
     tc_pending_pcs_d      = tc_pending_pcs_q;
     tc_pending_next_pc_d  = tc_pending_next_pc_q;
     tc_pending_taken_cf_d = tc_pending_taken_cf_q;
+    tc_pending_cf_d       = tc_pending_cf_q;
+    tc_pending_num_branches_d = tc_pending_num_branches_q;
     tc_pending_num_taken_d = tc_pending_num_taken_q;
 
     // Keep pending trace data across transient ex_valid_i pulses.
     if (flush_i || is_mispredict || set_pc_commit_i || eret_i) begin
       tc_pending_d          = 1'b0;
       tc_pending_taken_cf_d = '0;
+      tc_pending_cf_d       = '0;
+      tc_pending_num_branches_d = '0;
       tc_pending_num_taken_d = '0;
     end else if (tc_feeding_start) begin
       tc_pending_d          = 1'b0;
       tc_pending_taken_cf_d = '0;
+      tc_pending_cf_d       = '0;
+      tc_pending_num_branches_d = '0;
       tc_pending_num_taken_d = '0;
     end else if (tc_pending_start) begin
       tc_pending_d          = 1'b0;
       tc_pending_taken_cf_d = '0;
+      tc_pending_cf_d       = '0;
+      tc_pending_num_branches_d = '0;
       tc_pending_num_taken_d = '0;
     end else if (tc_pending_capture) begin
       tc_pending_d          = 1'b1;
@@ -549,6 +570,8 @@ module frontend
       tc_pending_instr_d    = tc_trace_instructions;
       tc_pending_next_pc_d  = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
       tc_pending_taken_cf_d = '0;
+      tc_pending_cf_d       = '0;
+      tc_pending_num_branches_d = tc_trace_num_branches;
       tc_pending_num_taken_d = tc_trace_num_taken;
       br_idx = 0;
       for (int k = 0; k < TRACE_LEN; k++) begin
@@ -557,6 +580,7 @@ module frontend
         if ((k < int'(tc_trace_length)) &&
             (tc_replay_cf_type(tc_trace_instructions[k]) != ariane_pkg::NoCF) &&
             (br_idx < int'(tc_trace_num_branches))) begin
+          tc_pending_cf_d[k] = 1'b1;
           tc_pending_taken_cf_d[k] = tc_trace_branch_flags[br_idx];
           br_idx++;
         end
@@ -1065,15 +1089,16 @@ module frontend
   assign tc_active_hit = tc_lookup_result_valid && tc_trace_hit &&
                          (tc_trace_length != '0) && !flush_i && !is_mispredict;
 
-  // Replay policy for the suffix model:
+  // Replay policy for phase-1 direct multi-block traces:
   // - the trigger-window branch stays on the normal frontend path
-  // - the replay payload is straight-line suffix only, so it must contain no CF metadata
-  // - no calls, because the current replay path still does not preserve RAS side effects
+  // - allow direct branches/jumps inside the payload
+  // - still reject indirect CFs and calls, because the current replay path
+  //   still does not preserve those side effects cleanly
   assign tc_trace_policy_ok = tc_trace_starts_ok &&
                               tc_trace_branch_map_ok &&
-                              (tc_trace_num_branches == BR_CNT_WIDTH'(0)) &&
-                              (tc_trace_num_taken == TAKEN_CNT_WIDTH'(0)) &&
+                              (tc_trace_num_taken <= TAKEN_CNT_WIDTH'(1)) &&
                               !tc_trace_has_call &&
+                              !tc_trace_has_indirect &&
                               !tc_disable_replay_q;
 
   assign tc_pending_capture = tc_active_hit &&
@@ -1098,6 +1123,7 @@ module frontend
   int unsigned tc_dbg_accept_count_q;
   int unsigned tc_dbg_reject_not_ready_q;
   int unsigned tc_dbg_reject_used_q;
+  int unsigned tc_dbg_reject_indirect_q;
   int unsigned tc_dbg_reject_policy_q;
   int unsigned tc_dbg_feed_done_q;
   int unsigned tc_dbg_feed_cycles_q;
@@ -1133,6 +1159,7 @@ module frontend
   int unsigned tc_dbg_window_single_taken_q;
   int unsigned tc_dbg_window_multi_taken_q;
   int unsigned tc_dbg_mispredict_count_q;
+  int unsigned tc_dbg_accept_multiblock_q;
   int unsigned tc_dbg_trigger_single_cond_q;
   int unsigned tc_dbg_trigger_single_jump_q;
   int unsigned tc_dbg_trigger_single_call_q;
@@ -1149,6 +1176,7 @@ module frontend
       tc_dbg_accept_count_q     <= 0;
       tc_dbg_reject_not_ready_q <= 0;
       tc_dbg_reject_used_q      <= 0;
+      tc_dbg_reject_indirect_q  <= 0;
       tc_dbg_reject_policy_q    <= 0;
       tc_dbg_feed_done_q        <= 0;
       tc_dbg_feed_cycles_q      <= 0;
@@ -1184,6 +1212,7 @@ module frontend
       tc_dbg_window_single_taken_q <= 0;
       tc_dbg_window_multi_taken_q <= 0;
       tc_dbg_mispredict_count_q <= 0;
+      tc_dbg_accept_multiblock_q <= 0;
       tc_dbg_trigger_single_cond_q <= 0;
       tc_dbg_trigger_single_jump_q <= 0;
       tc_dbg_trigger_single_call_q <= 0;
@@ -1213,6 +1242,8 @@ module frontend
             else if (!tc_pending_capture)
               tc_dbg_reject_not_ready_q <= tc_dbg_reject_not_ready_q + 1;
           end else begin
+            if (tc_trace_has_indirect || tc_trace_has_call)
+              tc_dbg_reject_indirect_q <= tc_dbg_reject_indirect_q + 1;
             tc_dbg_reject_policy_q <= tc_dbg_reject_policy_q + 1;
           end
         end else begin
@@ -1334,6 +1365,8 @@ module frontend
       if (tc_pending_start) begin
         tc_dbg_pending_use_count_q <= tc_dbg_pending_use_count_q + 1;
         tc_dbg_accept_count_q <= tc_dbg_accept_count_q + 1;
+        if (tc_pending_num_branches_q != BR_CNT_WIDTH'(0))
+          tc_dbg_accept_multiblock_q <= tc_dbg_accept_multiblock_q + 1;
       end
 
       if (tc_feeding_done) begin
@@ -1350,9 +1383,9 @@ module frontend
         if (tc_pending_start) begin
           $display("[TC-PENDING-USE] t=%0t pc0=0x%h len=%0d num_taken=%0d iq_ready=%0b iq_empty=%0b",
                    $time, tc_pending_pcs_q[0], tc_pending_len_q, tc_pending_num_taken_q, instr_queue_ready, instr_queue_empty);
-          $display("[TC-FEED-START] #%0d t=%0t len=%0d next_pc=0x%h src0_pc=0x%h num_taken=%0d",
+          $display("[TC-FEED-START] #%0d t=%0t len=%0d next_pc=0x%h src0_pc=0x%h num_br=%0d num_taken=%0d",
                    tc_dbg_feed_start_count_q + 1, $time, tc_pending_len_q, tc_pending_next_pc_q,
-                   tc_pending_pcs_q[0], tc_pending_num_taken_q);
+                   tc_pending_pcs_q[0], tc_pending_num_branches_q, tc_pending_num_taken_q);
           for (int k = 0; k < TRACE_LEN; k++) begin
             if (k < int'(tc_pending_len_q)) begin
               $display("[TC-FEED-START]   src[%0d] pc=0x%h instr=0x%08h cf=%0d taken_cf=%0b",
@@ -1437,6 +1470,8 @@ module frontend
     $display("[TC-FINAL] accepted=%0d held=%0d pending_use=%0d rejected_not_ready=%0d rejected_used=%0d rejected_policy=%0d accept_per_hit=%0d%%",
              tc_dbg_accept_count_q, tc_dbg_hold_count_q, tc_dbg_pending_use_count_q,
              tc_dbg_reject_not_ready_q, tc_dbg_reject_used_q, tc_dbg_reject_policy_q, tc_dbg_accept_rate_q);
+    $display("[TC-FINAL] multiblock: accepted=%0d rejected_indirect=%0d",
+             tc_dbg_accept_multiblock_q, tc_dbg_reject_indirect_q);
     $display("[TC-FINAL] immediate_use=%0d pending_enabled=%0b",
              tc_dbg_immediate_use_count_q, 1'b1);
     $display("[TC-FINAL] replay_done=%0d replay_cycles=%0d replay_cycle_share=%0d%%",

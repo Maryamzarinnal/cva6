@@ -43,6 +43,42 @@ module trace_builder #(
     is_compressed_instr = (instr[1:0] != 2'b11);
   endfunction
 
+  function automatic logic is_direct_trace_cf(input logic [INSTR_WIDTH-1:0] instr);
+    logic is_rvc;
+    begin
+      is_rvc = is_compressed_instr(instr);
+      if (!is_rvc) begin
+        is_direct_trace_cf = (instr[6:0] == riscv::OpcodeBranch) ||
+                             ((instr[6:0] == riscv::OpcodeJal) && (instr[11:7] == 5'd0));
+      end else begin
+        is_direct_trace_cf =
+            ((instr[1:0] == riscv::OpcodeC1) &&
+             ((instr[15:13] == riscv::OpcodeC1Beqz) ||
+              (instr[15:13] == riscv::OpcodeC1Bnez) ||
+              (instr[15:13] == riscv::OpcodeC1J)));
+      end
+    end
+  endfunction
+
+  function automatic logic is_rejected_trace_cf(input logic [INSTR_WIDTH-1:0] instr);
+    logic is_rvc;
+    begin
+      is_rvc = is_compressed_instr(instr);
+      if (!is_rvc) begin
+        is_rejected_trace_cf = (instr[6:0] == riscv::OpcodeJalr) ||
+                               ((instr[6:0] == riscv::OpcodeJal) &&
+                                ((instr[11:7] == 5'd1) || (instr[11:7] == 5'd5)));
+      end else begin
+        is_rejected_trace_cf =
+            ((instr[1:0] == riscv::OpcodeC2) &&
+             (instr[15:13] == riscv::OpcodeC2JalrMvAdd) &&
+             (instr[6:2] == 5'b00000)) ||
+            ((instr[1:0] == riscv::OpcodeC1) &&
+             (instr[15:13] == riscv::OpcodeC1Jal));
+      end
+    end
+  endfunction
+
   state_t state_q, state_d;
 
   trace_data_t active_payload_q, active_payload_d;
@@ -156,6 +192,8 @@ module trace_builder #(
     logic stop_suffix_now;
     logic finalize_now;
     logic finalize_len_limit;
+    logic finalize_taken_limit;
+    logic finalize_reject_indirect;
     logic any_consumed_now;
 
     state_d            = state_q;
@@ -183,6 +221,8 @@ module trace_builder #(
     stop_suffix_now       = 1'b0;
     finalize_now          = 1'b0;
     finalize_len_limit    = 1'b0;
+    finalize_taken_limit  = 1'b0;
+    finalize_reject_indirect = 1'b0;
     any_consumed_now      = 1'b0;
 
 `ifndef SYNTHESIS
@@ -269,6 +309,18 @@ module trace_builder #(
         end
 
         ACCUM: begin
+          logic [CHUNK_PTR_W-1:0] chunk_ptr_work;
+          logic [START_CNT_W-1:0] instr_cnt_work;
+          logic [PC_WIDTH-1:0]    expected_pc_work;
+          logic                   has_suffix_work;
+          trace_data_t            payload_work;
+
+          chunk_ptr_work  = active_chunk_ptr_q;
+          instr_cnt_work  = active_instr_cnt_q;
+          expected_pc_work = expected_pc_q;
+          has_suffix_work  = has_suffix_instr_q;
+          payload_work     = active_payload_q;
+
           if (|instr_i.consumed && instr_i.serving_unaligned) begin
             finalize_now = 1'b1;
 `ifndef SYNTHESIS
@@ -278,22 +330,30 @@ module trace_builder #(
 `endif
           end else if (|instr_i.consumed) begin
             for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
+              logic is_direct_cf;
+              logic is_rejected_cf;
+              logic cf_taken;
               logic is_rvc;
               logic [PC_WIDTH-1:0] next_pc_calc;
 
               if (!(instr_i.consumed[i] && instr_i.valid[i]))
                 continue;
 
-              if (instr_i.pc[i] != expected_pc_q) begin
+              if (instr_i.pc[i] != expected_pc_work) begin
 `ifndef SYNTHESIS
                 dbg_evt_accum_pc_gap = 1'b1;
 `endif
                 continue;
               end
 
-              if (instr_i.is_branch[i]) begin
-                stop_suffix_now = 1'b1;
-                finalize_now    = 1'b1;
+              is_rvc         = is_compressed_instr(instr_i.inst[i]);
+              is_direct_cf   = instr_i.is_branch[i] && is_direct_trace_cf(instr_i.inst[i]);
+              is_rejected_cf = instr_i.is_branch[i] && is_rejected_trace_cf(instr_i.inst[i]);
+              cf_taken       = instr_i.is_branch[i] && instr_i.taken[i];
+
+              if (instr_i.is_branch[i] && !is_direct_cf) begin
+                finalize_now = 1'b1;
+                finalize_reject_indirect = is_rejected_cf;
 `ifndef SYNTHESIS
                 dbg_evt_finalize_any        = 1'b1;
                 dbg_evt_finalize_stop_cf    = 1'b1;
@@ -302,9 +362,8 @@ module trace_builder #(
                 break;
               end
 
-              is_rvc = is_compressed_instr(instr_i.inst[i]);
-              if ((!is_rvc && (active_chunk_ptr_q + 2 > CHUNKS_PER_TRACE)) ||
-                  ( is_rvc && (active_chunk_ptr_q + 1 > CHUNKS_PER_TRACE))) begin
+              if ((!is_rvc && (chunk_ptr_work + 2 > CHUNKS_PER_TRACE)) ||
+                  ( is_rvc && (chunk_ptr_work + 1 > CHUNKS_PER_TRACE))) begin
                 finalize_now = 1'b1;
 `ifndef SYNTHESIS
                 dbg_evt_finalize_any        = 1'b1;
@@ -313,7 +372,7 @@ module trace_builder #(
                 break;
               end
 
-              if (active_instr_cnt_q >= START_CNT_W'(MAX_INSTR_PER_TRACE)) begin
+              if (instr_cnt_work >= START_CNT_W'(MAX_INSTR_PER_TRACE)) begin
                 finalize_now = 1'b1;
                 finalize_len_limit = 1'b1;
 `ifndef SYNTHESIS
@@ -323,23 +382,56 @@ module trace_builder #(
                 break;
               end
 
-              active_payload_d.valid_chunks[active_chunk_ptr_q] = 1'b1;
-              active_payload_d.chunks[active_chunk_ptr_q]       = instr_i.inst[i][15:0];
+              if (instr_i.is_branch[i] &&
+                  (payload_work.num_branches >= BR_CNT_WIDTH'(CHUNKS_PER_TRACE))) begin
+                finalize_now = 1'b1;
+`ifndef SYNTHESIS
+                dbg_evt_finalize_any        = 1'b1;
+                dbg_evt_finalize_trace_full = 1'b1;
+`endif
+                break;
+              end
+
+              if (cf_taken && instr_i.is_branch[i] &&
+                  (payload_work.num_taken >= TAKEN_CNT_WIDTH'(1))) begin
+                finalize_now = 1'b1;
+                finalize_taken_limit = 1'b1;
+`ifndef SYNTHESIS
+                dbg_evt_finalize_any        = 1'b1;
+                dbg_evt_finalize_taken_limit = 1'b1;
+`endif
+                break;
+              end
+
+              payload_work.valid_chunks[chunk_ptr_work] = 1'b1;
+              payload_work.chunks[chunk_ptr_work]       = instr_i.inst[i][15:0];
               if (is_rvc) begin
-                active_chunk_ptr_d = active_chunk_ptr_q + CHUNK_PTR_W'(1);
+                chunk_ptr_work = chunk_ptr_work + CHUNK_PTR_W'(1);
               end else begin
-                active_payload_d.valid_chunks[active_chunk_ptr_q + 1] = 1'b0;
-                active_payload_d.chunks[active_chunk_ptr_q + 1]       = instr_i.inst[i][31:16];
-                active_chunk_ptr_d = active_chunk_ptr_q + CHUNK_PTR_W'(2);
+                payload_work.valid_chunks[chunk_ptr_work + 1] = 1'b0;
+                payload_work.chunks[chunk_ptr_work + 1]       = instr_i.inst[i][31:16];
+                chunk_ptr_work = chunk_ptr_work + CHUNK_PTR_W'(2);
               end
 
-              active_instr_cnt_d  = active_instr_cnt_q + START_CNT_W'(1);
-              next_pc_calc        = instr_i.pc[i] + (is_rvc ? PC_WIDTH'(64'd2) : PC_WIDTH'(64'd4));
-              expected_pc_d       = next_pc_calc;
-              active_payload_d.target_addr = next_pc_calc;
-              has_suffix_instr_d  = 1'b1;
+              instr_cnt_work = instr_cnt_work + START_CNT_W'(1);
+              next_pc_calc   = instr_i.pc[i] + (is_rvc ? PC_WIDTH'(64'd2) : PC_WIDTH'(64'd4));
+              expected_pc_work = next_pc_calc;
+              payload_work.target_addr = next_pc_calc;
+              has_suffix_work = 1'b1;
 
-              if (active_instr_cnt_d >= START_CNT_W'(MAX_INSTR_PER_TRACE)) begin
+              if (instr_i.is_branch[i]) begin
+                payload_work.branch_flags[payload_work.num_branches] = cf_taken;
+                payload_work.num_branches = payload_work.num_branches + BR_CNT_WIDTH'(1);
+
+                if (cf_taken) begin
+                  payload_work.taken_targets[payload_work.num_taken] = instr_i.target[i];
+                  payload_work.num_taken = payload_work.num_taken + TAKEN_CNT_WIDTH'(1);
+                  expected_pc_work = instr_i.target[i];
+                  payload_work.target_addr = instr_i.target[i];
+                end
+              end
+
+              if (instr_cnt_work >= START_CNT_W'(MAX_INSTR_PER_TRACE)) begin
                 finalize_now = 1'b1;
                 finalize_len_limit = 1'b1;
 `ifndef SYNTHESIS
@@ -348,8 +440,17 @@ module trace_builder #(
 `endif
                 break;
               end
+
+              if (instr_i.is_branch[i] && cf_taken)
+                break;
             end
           end
+
+          active_payload_d   = payload_work;
+          active_chunk_ptr_d = chunk_ptr_work;
+          active_instr_cnt_d = instr_cnt_work;
+          expected_pc_d      = expected_pc_work;
+          has_suffix_instr_d = has_suffix_work;
 
           if (finalize_now) begin
             candidate_flags[TRIGGER_BRANCH_BITS-1:0] = active_tag_q.branch_flags;
@@ -363,10 +464,6 @@ module trace_builder #(
               active_payload_d.valid        = 1'b1;
               active_payload_d.lookup_branch_flags = '0;
               active_payload_d.lookup_num_branches = '0;
-              active_payload_d.branch_flags = '0;
-              active_payload_d.num_branches = '0;
-              active_payload_d.num_taken    = '0;
-              active_payload_d.taken_targets = '0;
 
               if (!is_duplicate) begin
                 commit_addr_d  = candidate_addr;
@@ -383,7 +480,10 @@ module trace_builder #(
               end
             end else begin
 `ifndef SYNTHESIS
-              dbg_evt_outcome_drop_no_suffix = 1'b1;
+              if (finalize_reject_indirect)
+                dbg_evt_outcome_drop_indirect = 1'b1;
+              else
+                dbg_evt_outcome_drop_no_suffix = 1'b1;
 `endif
             end
 
