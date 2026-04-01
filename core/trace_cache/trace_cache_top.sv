@@ -54,6 +54,7 @@ module trace_cache_top #(
   // Ordered targets of taken control-flow instructions in this trace
   output logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]          trace_taken_targets_o,
   output logic [TAKEN_CNT_WIDTH-1:0]                  trace_num_taken_o,
+  output logic                                        trace_used_o,
 
   // High when this cycle's trace_hit_o is for a lookup we actually did (we fired); use for hit/miss counting
   output logic                                        lookup_result_valid_o,
@@ -67,7 +68,8 @@ module trace_cache_top #(
   output logic [31:0]                                 tc_miss_total_o,
   output logic [31:0]                                 tc_miss_empty_o,
   output logic [31:0]                                 tc_miss_pc_o,
-  output logic [31:0]                                 tc_miss_path_o
+  output logic [31:0]                                 tc_miss_path_o,
+  input  logic                                        mark_used_i
 );
 
   initial assert (MaxTraceInstr <= TRACE_LEN)
@@ -199,6 +201,7 @@ module trace_cache_top #(
   end
 
   logic lru [(1 << TRACE_ADDRW)];
+  logic [NUM_WAYS-1:0] used_q [(1 << TRACE_ADDRW)];
   logic wr_way;
   assign wr_way = ~lru[mem_addr_builder];
 
@@ -307,15 +310,19 @@ module trace_cache_top #(
     end
   end
 
+  logic [NUM_WAYS-1:0] raw_way_hit;
   always_comb begin
     for (int w = 0; w < NUM_WAYS; w++) begin
-      way_hit[w] = tag_hit_raw[w] & lookup_valid_q;
+      raw_way_hit[w] = tag_hit_raw[w] & lookup_valid_q;
+      way_hit[w]     = raw_way_hit[w] & ~used_q[lookup_set_q][w];
     end
   end
 
+  logic raw_trace_hit;
   logic trace_hit;
-  assign trace_hit   = |way_hit;
-  assign trace_hit_o = trace_hit;
+  assign raw_trace_hit = |raw_way_hit;
+  assign trace_hit     = |way_hit;
+  assign trace_hit_o   = trace_hit;
 
   logic any_valid_in_set;
   logic any_pc_match_in_set;
@@ -332,7 +339,15 @@ module trace_cache_top #(
   assign miss_reason_pc_o    = lookup_valid_q && !trace_hit &&  any_valid_in_set && !any_pc_match_in_set;
   assign miss_reason_path_o  = lookup_valid_q && !trace_hit &&  any_valid_in_set &&  any_pc_match_in_set;
 
+  logic [$clog2(NUM_WAYS)-1:0] raw_hit_way_idx;
   logic [$clog2(NUM_WAYS)-1:0] hit_way_idx;
+  always_comb begin
+    raw_hit_way_idx = '0;
+    for (int w = NUM_WAYS-1; w >= 0; w--) begin
+      if (raw_way_hit[w]) raw_hit_way_idx = w[$clog2(NUM_WAYS)-1:0];
+    end
+  end
+
   always_comb begin
     hit_way_idx = '0;
     for (int w = NUM_WAYS-1; w >= 0; w--) begin
@@ -460,15 +475,28 @@ module trace_cache_top #(
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      for (int s = 0; s < (1 << TRACE_ADDRW); s++)
+      for (int s = 0; s < (1 << TRACE_ADDRW); s++) begin
         lru[s] <= 1'b0;
+        used_q[s] <= '0;
+      end
+    end else if (flush_i) begin
+      for (int s = 0; s < (1 << TRACE_ADDRW); s++) begin
+        lru[s] <= 1'b0;
+        used_q[s] <= '0;
+      end
     end else begin
       if (trace_hit)
         lru[lookup_set_q] <= hit_way_idx[0];
       if (mem_req_builder)
         lru[mem_addr_builder] <= wr_way;
+      if (mem_req_builder && mem_we_builder)
+        used_q[mem_addr_builder][wr_way] <= 1'b0;
+      if (mark_used_i && trace_hit)
+        used_q[lookup_set_q][hit_way_idx] <= 1'b1;
     end
   end
+
+  assign trace_used_o = raw_trace_hit && used_q[lookup_set_q][raw_hit_way_idx];
 
 `ifdef MODEL_TECH
   initial $display("[TC-DEBUG] trace_cache_top: miss breakdown ACTIVE (MODEL_TECH defined)");

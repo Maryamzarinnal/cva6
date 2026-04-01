@@ -103,6 +103,7 @@ module frontend
   logic [31:0]                             tc_miss_total, tc_miss_empty, tc_miss_pc, tc_miss_path;
   logic                                    tc_lookup_result_valid;
   logic                                    tc_miss_reason_empty, tc_miss_reason_pc, tc_miss_reason_path;
+  logic                                    tc_trace_used;
   logic                                    tc_active_use;
   logic                                    tc_active_hit;
   logic                                    tc_trace_starts_ok;
@@ -1033,6 +1034,7 @@ module frontend
       .trace_num_branches_o           (tc_trace_num_branches),
       .trace_taken_targets_o          (tc_trace_taken_targets),
       .trace_num_taken_o              (tc_trace_num_taken),
+      .trace_used_o                   (tc_trace_used),
       .lookup_result_valid_o          (tc_lookup_result_valid),
       .miss_reason_empty_o            (tc_miss_reason_empty),
       .miss_reason_pc_o               (tc_miss_reason_pc),
@@ -1040,7 +1042,8 @@ module frontend
       .tc_miss_total_o                (tc_miss_total),
       .tc_miss_empty_o                (tc_miss_empty),
       .tc_miss_pc_o                   (tc_miss_pc),
-      .tc_miss_path_o                 (tc_miss_path)
+      .tc_miss_path_o                 (tc_miss_path),
+      .mark_used_i                    (tc_pending_capture)
   );
 
   logic tc_trace_policy_ok;
@@ -1076,6 +1079,7 @@ module frontend
   assign tc_pending_capture = tc_active_hit &&
                               tc_trace_policy_ok &&
                               !tc_pending_q &&
+                              !tc_trace_used &&
                               !tc_same_pc_rehit_block &&
                               !tc_same_lookup_oneshot_block;
 
@@ -1093,6 +1097,7 @@ module frontend
   int unsigned tc_dbg_hit_count_q;
   int unsigned tc_dbg_accept_count_q;
   int unsigned tc_dbg_reject_not_ready_q;
+  int unsigned tc_dbg_reject_used_q;
   int unsigned tc_dbg_reject_policy_q;
   int unsigned tc_dbg_feed_done_q;
   int unsigned tc_dbg_feed_cycles_q;
@@ -1143,6 +1148,7 @@ module frontend
       tc_dbg_hit_count_q        <= 0;
       tc_dbg_accept_count_q     <= 0;
       tc_dbg_reject_not_ready_q <= 0;
+      tc_dbg_reject_used_q      <= 0;
       tc_dbg_reject_policy_q    <= 0;
       tc_dbg_feed_done_q        <= 0;
       tc_dbg_feed_cycles_q      <= 0;
@@ -1202,15 +1208,21 @@ module frontend
           tc_dbg_hit_count_q <= tc_dbg_hit_count_q + 1;
 
           if (tc_trace_policy_ok) begin
-            if (!tc_pending_capture)
+            if (tc_trace_used)
+              tc_dbg_reject_used_q <= tc_dbg_reject_used_q + 1;
+            else if (!tc_pending_capture)
               tc_dbg_reject_not_ready_q <= tc_dbg_reject_not_ready_q + 1;
           end else begin
             tc_dbg_reject_policy_q <= tc_dbg_reject_policy_q + 1;
           end
         end else begin
-          if (tc_miss_reason_empty) tc_dbg_miss_empty_q <= tc_dbg_miss_empty_q + 1;
-          if (tc_miss_reason_pc)    tc_dbg_miss_pc_q    <= tc_dbg_miss_pc_q + 1;
-          if (tc_miss_reason_path)  tc_dbg_miss_path_q  <= tc_dbg_miss_path_q + 1;
+          if (tc_trace_used && tc_trace_policy_ok)
+            tc_dbg_reject_used_q <= tc_dbg_reject_used_q + 1;
+          else begin
+            if (tc_miss_reason_empty) tc_dbg_miss_empty_q <= tc_dbg_miss_empty_q + 1;
+            if (tc_miss_reason_pc)    tc_dbg_miss_pc_q    <= tc_dbg_miss_pc_q + 1;
+            if (tc_miss_reason_path)  tc_dbg_miss_path_q  <= tc_dbg_miss_path_q + 1;
+          end
         end
       end
 
@@ -1422,9 +1434,9 @@ module frontend
     $display("[TC-FINAL] ========== Trace Cache summary ==========");
     $display("[TC-FINAL] lookups=%0d hits=%0d misses=%0d hit_rate=%0d%%",
              tc_dbg_lookup_count_q, tc_dbg_hit_count_q, tc_dbg_miss_count_q, tc_dbg_hit_rate_q);
-    $display("[TC-FINAL] accepted=%0d held=%0d pending_use=%0d rejected_not_ready=%0d rejected_policy=%0d accept_per_hit=%0d%%",
+    $display("[TC-FINAL] accepted=%0d held=%0d pending_use=%0d rejected_not_ready=%0d rejected_used=%0d rejected_policy=%0d accept_per_hit=%0d%%",
              tc_dbg_accept_count_q, tc_dbg_hold_count_q, tc_dbg_pending_use_count_q,
-             tc_dbg_reject_not_ready_q, tc_dbg_reject_policy_q, tc_dbg_accept_rate_q);
+             tc_dbg_reject_not_ready_q, tc_dbg_reject_used_q, tc_dbg_reject_policy_q, tc_dbg_accept_rate_q);
     $display("[TC-FINAL] immediate_use=%0d pending_enabled=%0b",
              tc_dbg_immediate_use_count_q, 1'b1);
     $display("[TC-FINAL] replay_done=%0d replay_cycles=%0d replay_cycle_share=%0d%%",
