@@ -500,20 +500,44 @@ module instr_queue
     end
   endfunction
 
+  function automatic logic iq_has_program_order_hole(
+      input logic [CVA6Cfg.INSTR_PER_FETCH-1:0] valid_prog_i,
+      input logic [CVA6Cfg.INSTR_PER_FETCH-1:0] pushed_prog_i
+  );
+    logic seen_miss;
+    begin
+      iq_has_program_order_hole = 1'b0;
+      seen_miss = 1'b0;
+      for (int h = 0; h < CVA6Cfg.INSTR_PER_FETCH; h++) begin
+        if (valid_prog_i[h] && !pushed_prog_i[h])
+          seen_miss = 1'b1;
+        else if (valid_prog_i[h] && pushed_prog_i[h] && seen_miss)
+          iq_has_program_order_hole = 1'b1;
+      end
+    end
+  endfunction
+
   logic [7:0] iq_addr_underflow_guard_q;
   logic [7:0] iq_replay_req_debug_q;
-  logic [7:0] iq_push_hole_debug_q;
+  logic [7:0] iq_prog_hole_debug_q;
   always_ff @(posedge clk_i or negedge rst_ni) begin
+    int expected_replay_idx;
     if (!rst_ni || flush_i) begin
       iq_addr_underflow_guard_q <= '0;
       iq_replay_req_debug_q <= '0;
-      iq_push_hole_debug_q <= '0;
+      iq_prog_hole_debug_q <= '0;
     end else if (pop_branch_flags_single && empty_branch_flags_single &&
                  (iq_addr_underflow_guard_q < 8'h20)) begin
       iq_addr_underflow_guard_q <= iq_addr_underflow_guard_q + 1'b1;
       $display("[IQ-BRANCHFLAGS-UNDERFLOW-GUARD] t=%0t pop_single while empty pc_q=0x%h idx_ds_q=%b tc_feeding=%0b",
                $time, pc_q, idx_ds_q, tc_feeding_i);
     end else begin
+      expected_replay_idx = -1;
+      for (int j = 0; j < CVA6Cfg.INSTR_PER_FETCH; j++) begin
+        if ((expected_replay_idx == -1) && valid[j] && !consumed_o[j])
+          expected_replay_idx = j;
+      end
+
       if ((instr_overflow || address_overflow) && (iq_replay_req_debug_q < 8'h40)) begin
         iq_replay_req_debug_q <= iq_replay_req_debug_q + 1'b1;
         $display("[IQ-REPLAY-REQ] t=%0t idx_is_q=%0d valid=%b fifo_pos=%b full=%b push=%b push_fifo=%b ovf=%b addr_ovf=%0b shamt=%0d replay_addr=0x%h tc_feeding=%0b",
@@ -522,11 +546,15 @@ module instr_queue
                  replay_addr_o, tc_feeding_i);
       end
 
-      if (iq_has_push_hole(push_instr_fifo) && (iq_push_hole_debug_q < 8'h40)) begin
-        iq_push_hole_debug_q <= iq_push_hole_debug_q + 1'b1;
-        $display("[IQ-PUSH-HOLE] t=%0t idx_is_q=%0d valid=%b fifo_pos=%b full=%b push=%b push_fifo=%b ovf=%b shamt=%0d replay_addr=0x%h",
-                 $time, idx_is_q, valid, fifo_pos, instr_queue_full, push_instr,
-                 push_instr_fifo, instr_overflow_fifo, shamt, replay_addr_o);
+      if (iq_has_program_order_hole(valid, consumed_o) && (iq_prog_hole_debug_q < 8'h40)) begin
+        iq_prog_hole_debug_q <= iq_prog_hole_debug_q + 1'b1;
+        $display("[IQ-PROG-HOLE] t=%0t idx_is_q=%0d valid=%b consumed=%b fifo_pos=%b full=%b push=%b push_fifo=%b ovf=%b shamt=%0d expected_idx=%0d expected_addr=0x%h replay_addr=0x%h phys_hole=%0b",
+                 $time, idx_is_q, valid, consumed_o, fifo_pos, instr_queue_full,
+                 push_instr, push_instr_fifo, instr_overflow_fifo, shamt,
+                 expected_replay_idx,
+                 (expected_replay_idx >= 0) ? addr_i[expected_replay_idx] : '0,
+                 replay_addr_o,
+                 iq_has_push_hole(push_instr_fifo));
       end
     end
   end
