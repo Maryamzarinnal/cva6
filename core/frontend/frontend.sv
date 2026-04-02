@@ -151,6 +151,7 @@ module frontend
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]                   replay_valid_iq;
   cf_t  [CVA6Cfg.INSTR_PER_FETCH-1:0]                   replay_cf_type_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] replay_predict_addr_iq;
+  logic [CHUNKS_PER_TRACE-1:0]                          tc_branch_predictions;
   // MUX outputs to instr_queue
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0]             instr_to_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] addr_to_iq;
@@ -902,7 +903,7 @@ module frontend
       .exception_tinst_i  (exception_tinst_to_iq),
       .exception_gva_i    (exception_gva_to_iq),
       .predict_address_i  (predict_addr_to_iq),
-      .branch_flags_i     (tc_active_branch_flags),
+      .branch_flags_i     (tc_pending_start ? tc_active_branch_flags : tc_branch_predictions),
       .cf_type_i          (cf_type_to_iq),
       .valid_i            (valid_to_iq),
       .consumed_o         (instr_queue_consumed),
@@ -928,7 +929,6 @@ module frontend
   logic [SLOTS_PER_CYCLE-1:0]               tc_raw_taken;
   logic [SLOTS_PER_CYCLE-1:0]               tc_taken;
   logic [SLOTS_PER_CYCLE-1:0][PC_WIDTH-1:0] tc_target;
-  logic [CHUNKS_PER_TRACE-1:0]              tc_branch_predictions;
   logic [CHUNKS_PER_TRACE-1:0]              tc_lookup_branch_predictions;
   logic [BR_CNT_WIDTH-1:0]                  tc_lookup_num_branches;
   logic                                     tc_window_eligible;
@@ -1112,7 +1112,10 @@ module frontend
                             instr_queue_ready &&
                             instr_queue_empty &&
                             !flush_i &&
-                            !is_mispredict;
+                            !is_mispredict &&
+                            !set_pc_commit_i &&
+                            !eret_i &&
+                            !ex_valid_i;
 
   assign tc_active_use = 1'b0;
 
@@ -1143,6 +1146,9 @@ module frontend
   int unsigned tc_dbg_icache_block_cycles_q;
   logic        tc_dbg_seen_coremark_pc_q;
   int unsigned tc_dbg_pc_floor_breach_q;
+  int unsigned tc_dbg_replay_remaining_q;
+  int unsigned tc_dbg_replay_deq_trace_count_q;
+  logic        tc_dbg_post_replay_armed_q;
   int unsigned tc_dbg_window_total_q;
   int unsigned tc_dbg_window_unaligned_q;
   int unsigned tc_dbg_window_not_ready_q;
@@ -1196,6 +1202,9 @@ module frontend
       tc_dbg_icache_block_cycles_q <= 0;
       tc_dbg_seen_coremark_pc_q <= 1'b0;
       tc_dbg_pc_floor_breach_q <= 0;
+      tc_dbg_replay_remaining_q <= 0;
+      tc_dbg_replay_deq_trace_count_q <= 0;
+      tc_dbg_post_replay_armed_q <= 1'b0;
       tc_dbg_window_total_q <= 0;
       tc_dbg_window_unaligned_q <= 0;
       tc_dbg_window_not_ready_q <= 0;
@@ -1225,7 +1234,22 @@ module frontend
       int unsigned cf_cnt;
       int unsigned taken_cnt;
       int unsigned first_taken_idx;
+      int unsigned deq_count;
+      int unsigned replay_remaining_after;
       tc_total_cycles_q <= tc_total_cycles_q + 1;
+      deq_count = 0;
+      replay_remaining_after = tc_dbg_replay_remaining_q;
+      for (int p = 0; p < CVA6Cfg.NrIssuePorts; p++) begin
+        if (fetch_entry_valid_o[p] && fetch_entry_ready_i[p])
+          deq_count++;
+      end
+
+      if (tc_dbg_replay_remaining_q != 0 && deq_count != 0) begin
+        if (deq_count >= tc_dbg_replay_remaining_q)
+          replay_remaining_after = 0;
+        else
+          replay_remaining_after = tc_dbg_replay_remaining_q - deq_count;
+      end
 
       if (resolved_branch_i.valid && resolved_branch_i.is_mispredict)
         tc_dbg_mispredict_count_q <= tc_dbg_mispredict_count_q + 1;
@@ -1351,6 +1375,58 @@ module frontend
         end
       end
 
+      if (flush_i || is_mispredict) begin
+        tc_dbg_replay_remaining_q <= 0;
+        tc_dbg_post_replay_armed_q <= 1'b0;
+      end else begin
+        if (tc_pending_start) begin
+          tc_dbg_replay_remaining_q <= tc_pending_len_q;
+          tc_dbg_post_replay_armed_q <= 1'b0;
+        end else begin
+          if (tc_dbg_replay_remaining_q != 0 && deq_count != 0) begin
+            if (deq_count >= tc_dbg_replay_remaining_q) begin
+              tc_dbg_replay_remaining_q <= 0;
+              tc_dbg_post_replay_armed_q <= 1'b1;
+            end else begin
+              tc_dbg_replay_remaining_q <= tc_dbg_replay_remaining_q - deq_count;
+            end
+          end
+
+          if (tc_dbg_post_replay_armed_q && deq_count != 0)
+            tc_dbg_post_replay_armed_q <= 1'b0;
+        end
+      end
+
+      if ((tc_dbg_replay_remaining_q != 0) && (deq_count != 0) &&
+          (tc_dbg_replay_deq_trace_count_q < 256)) begin
+        for (int p = 0; p < CVA6Cfg.NrIssuePorts; p++) begin
+          if (fetch_entry_valid_o[p] && fetch_entry_ready_i[p]) begin
+            $display("[TC-REPLAY-DEQ] t=%0t port=%0d pc_out=0x%h instr=0x%08h cf=%0d pred=0x%h rem_before=%0d rem_after=%0d npc_q=0x%h",
+                     $time,
+                     p,
+                     fetch_entry_o[p].address,
+                     fetch_entry_o[p].instruction,
+                     fetch_entry_o[p].branch_predict.cf,
+                     fetch_entry_o[p].branch_predict.predict_address,
+                     tc_dbg_replay_remaining_q,
+                     replay_remaining_after,
+                     npc_q);
+          end
+        end
+        tc_dbg_replay_deq_trace_count_q <= tc_dbg_replay_deq_trace_count_q + deq_count;
+      end
+
+      if (tc_dbg_post_replay_armed_q && deq_count != 0) begin
+        $display("[TC-POST-REPLAY] t=%0t pc_out=0x%h instr=0x%08h cf=%0d npc_q=0x%h expected_next=0x%h match=%0b",
+                 $time,
+                 fetch_entry_o[0].address,
+                 fetch_entry_o[0].instruction,
+                 fetch_entry_o[0].branch_predict.cf,
+                 npc_q,
+                 tc_pending_next_pc_q,
+                 (fetch_entry_o[0].address == tc_pending_next_pc_q));
+      end
+
       if (tc_pending_start && (|replay_valid_iq)) begin
         tc_dbg_tc_pkt_cycles_q <= tc_dbg_tc_pkt_cycles_q + 1;
         src_cnt = 0;
@@ -1407,6 +1483,14 @@ module frontend
                      k, k, replay_addr_iq[k], replay_instr_iq[k],
                      replay_cf_type_iq[k], replay_predict_addr_iq[k]);
           end
+        end
+        if (tc_pending_len_q != '0) begin
+          $display("[TC-NPC-CHECK] t=%0t last_pc=0x%h next_pc=0x%h expected_next=0x%h",
+                   $time,
+                   tc_pending_pcs_q[tc_pending_len_q-1],
+                   tc_pending_next_pc_q,
+                   tc_pending_pcs_q[tc_pending_len_q-1] +
+                     ((tc_pending_instr_q[tc_pending_len_q-1][1:0] != 2'b11) ? 64'd2 : 64'd4));
         end
       end
 
