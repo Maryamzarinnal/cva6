@@ -11,10 +11,12 @@
 // Author: Florian Zaruba, ETH Zurich
 // Date: 26.10.2018
 //
-// Description: Instruction Queue with per-slot address FIFOs for trace cache support.
-//   Modified: predict_address_i is now per-slot [INSTR_PER_FETCH][VLEN].
-//   4 address FIFOs (one per instruction slot) replace the single address FIFO.
-//   tc_feeding_i bypasses branch_mask so all valid trace instructions pass through.
+// Description: Instruction Queue with per-slot predict-address FIFOs.
+//   Modified: predict_address_i is per-slot [INSTR_PER_FETCH][VLEN].
+//   Predict addresses track the same physical instruction FIFOs instead of
+//   collapsing through one shared address path. Branch flags remain a separate
+//   single FIFO snapshot because the current frontend still launches at most
+//   one taken control-flow per packet.
 
 module instr_queue
   import ariane_pkg::*;
@@ -74,19 +76,18 @@ module instr_queue
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] instr_queue_full;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] instr_queue_empty;
   logic                               instr_overflow;
-  // Per-slot address FIFOs
+  // Per-slot predict-address FIFOs aligned with the instruction FIFOs.
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] addr_data_out;
+  logic [CVA6Cfg.INSTR_PER_FETCH-1:0] empty_addr;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] push_addr, pop_addr;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] full_addr;
-  logic [CVA6Cfg.VLEN-1:0]            addr_data_out_single;
-  logic                               pop_address_single;
-  logic                               full_address_single;
-  logic                               empty_address_single;
-  logic [CVA6Cfg.VLEN-1:0]            address_out;
-  logic [ADDR_FIFO_W-1:0]             addr_fifo_din, addr_fifo_dout;
   logic                               push_address;
   logic                               full_address;
   logic                               address_overflow;
+  logic                               pop_branch_flags_single;
+  logic                               full_branch_flags_single;
+  logic                               empty_branch_flags_single;
+  logic [BRANCH_FLAGS_W-1:0]          branch_flags_out_single;
   logic                               tc_replay_pkt_can_push;
 
   logic [CVA6Cfg.LOG2_INSTR_PER_FETCH-1:0] idx_is_d, idx_is_q;
@@ -115,16 +116,9 @@ module instr_queue
   // Duplicate & rotate predict addresses (same rotation as instructions)
   logic [CVA6Cfg.INSTR_PER_FETCH*2-1:0][CVA6Cfg.VLEN-1:0] pred_addr_dup;
 
-  // address_out: use single address FIFO (stable baseline semantics).
-  always_comb begin
-    address_out = '0;
-    if (!empty_address_single)
-      address_out = addr_data_out_single;
-  end
-
   assign empty_o = &instr_queue_empty;
 
-  assign full_address = full_address_single;
+  assign full_address = (|full_addr) | full_branch_flags_single;
   assign ready_o = ~(|instr_queue_full) & ~full_address;
   // During trace-cache replay, only enqueue when the full packet can be accepted.
   // This prevents partial packet insertion that can reorder replay semantics.
@@ -246,7 +240,8 @@ module instr_queue
       push_address |= push_addr_attempt[i];
     end
   end
-  assign address_overflow = full_address_single & push_address;
+  assign address_overflow = (|(full_addr & push_addr_attempt)) |
+                            (full_branch_flags_single & push_address);
   // Replay backpressure is handled by tc_feeding consumed bookkeeping.
   // Keep legacy replay request behavior for non-TC traffic only.
   assign replay_o = tc_feeding_i ? 1'b0 : (instr_overflow | address_overflow);
@@ -284,6 +279,7 @@ module instr_queue
     always_comb begin
       idx_ds_d  = idx_ds_q;
       pop_instr = '0;
+      pop_addr  = '0;
       for (int unsigned i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
         fetch_entry_o[i].instruction = '0;
         fetch_entry_o[i].address = pc_j[i];
@@ -293,7 +289,7 @@ module instr_queue
         fetch_entry_o[i].ex.tval2 = '0;
         fetch_entry_o[i].ex.gva = 1'b0;
         fetch_entry_o[i].ex.tinst = '0;
-        fetch_entry_o[i].branch_predict.predict_address = address_out;
+        fetch_entry_o[i].branch_predict.predict_address = '0;
         fetch_entry_o[i].branch_predict.cf = ariane_pkg::NoCF;
       end
       for (int unsigned i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
@@ -317,8 +313,10 @@ module instr_queue
             fetch_entry_o[0].ex.gva   = instr_data_out[i].ex_gva;
           end
           fetch_entry_o[0].branch_predict.cf = instr_data_out[i].cf;
-          fetch_entry_o[0].branch_predict.predict_address = address_out;
+          fetch_entry_o[0].branch_predict.predict_address =
+              (instr_data_out[i].cf != ariane_pkg::NoCF) ? addr_data_out[i] : '0;
           pop_instr[i] = fetch_entry_fire[0];
+          pop_addr[i]  = fetch_entry_fire[0] & (instr_data_out[i].cf != ariane_pkg::NoCF);
         end
         if (CVA6Cfg.SuperscalarEn) begin
           if (idx_ds[1][i]) begin
@@ -331,8 +329,10 @@ module instr_queue
             fetch_entry_o[NID].ex.valid = instr_data_out[i].ex != ariane_pkg::FE_NONE;
             fetch_entry_o[NID].ex.tval = {{64 - CVA6Cfg.VLEN{1'b0}}, instr_data_out[i].ex_vaddr};
             fetch_entry_o[NID].branch_predict.cf = instr_data_out[i].cf;
-            fetch_entry_o[NID].branch_predict.predict_address = address_out;
+            fetch_entry_o[NID].branch_predict.predict_address =
+                (instr_data_out[i].cf != ariane_pkg::NoCF) ? addr_data_out[i] : '0;
             pop_instr[i] = fetch_entry_fire[NID];
+            pop_addr[i]  = fetch_entry_fire[NID] & (instr_data_out[i].cf != ariane_pkg::NoCF);
           end
         end
       end
@@ -348,6 +348,7 @@ module instr_queue
     always_comb begin
       idx_ds_d = '0;
       idx_is_d = '0;
+      pop_addr = '0;
       fetch_entry_o[0].instruction = instr_data_out[0].instr;
       fetch_entry_o[0].address = pc_q;
       fetch_entry_o[0].ex.valid = instr_data_out[0].ex != ariane_pkg::FE_NONE;
@@ -368,9 +369,11 @@ module instr_queue
         fetch_entry_o[0].ex.tinst = '0;
         fetch_entry_o[0].ex.gva   = 1'b0;
       end
-      fetch_entry_o[0].branch_predict.predict_address = address_out;
+      fetch_entry_o[0].branch_predict.predict_address =
+          (instr_data_out[0].cf != ariane_pkg::NoCF) ? addr_data_out[0] : '0;
       fetch_entry_o[0].branch_predict.cf = instr_data_out[0].cf;
       pop_instr[0] = fetch_entry_valid_o[0] & fetch_entry_ready_i[0];
+      pop_addr[0]  = pop_instr[0] & (instr_data_out[0].cf != ariane_pkg::NoCF);
     end
   end
 
@@ -379,23 +382,16 @@ module instr_queue
     assign fetch_entry_fire[i]  = fetch_entry_valid_o[i] & fetch_entry_ready_i[i];
   end
 
-  // Per-slot address pop disabled (single address FIFO mode).
-  always_comb begin
-    for (int i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
-      pop_addr[i] = 1'b0;
-    end
-  end
-
-  // Keep original CVA6 semantics: pop one address whenever a consumed fetch
-  // entry is a control-flow instruction.
-  assign pop_address_single = |(fetch_entry_is_cf & fetch_entry_fire);
+  // Keep one branch-flags snapshot FIFO: current frontend policy still admits
+  // at most one taken control-flow that can redirect per dequeued packet.
+  assign pop_branch_flags_single = |(fetch_entry_is_cf & fetch_entry_fire);
 
   // ----------------------
   // Calculate (Next) PC
   // ----------------------
   assign pc_j[0] = pc_q;
   for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
-    assign pc_j[i+1] = fetch_entry_is_cf[i] ? address_out : (
+    assign pc_j[i+1] = fetch_entry_is_cf[i] ? fetch_entry_o[i].branch_predict.predict_address : (
       pc_j[i] + ((fetch_entry_o[i].instruction[1:0] != 2'b11) ? 'd2 : 'd4)
     );
   end
@@ -442,8 +438,7 @@ module instr_queue
   // Per-slot Address FIFOs (4 FIFOs, one per instruction slot)
   // ----------------------
   for (genvar i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin : gen_addr_fifo
-    // Disabled in single address FIFO mode.
-    assign push_addr[i] = 1'b0;
+    assign push_addr[i] = push_addr_attempt[i] & ~address_overflow;
 
     cva6_fifo_v3 #(
         .FPGA_ALTERA(CVA6Cfg.FpgaAlteraEn),
@@ -454,7 +449,7 @@ module instr_queue
         .clk_i, .rst_ni, .flush_i,
         .testmode_i(1'b0),
         .full_o (full_addr[i]),
-        .empty_o(),
+        .empty_o(empty_addr[i]),
         .usage_o(),
         /* verilator lint_off WIDTH */
         .data_i (CVA6Cfg.RVC ? pred_addr_dup[CVA6Cfg.INSTR_PER_FETCH+i-idx_is_q] : predict_address_i[0]),
@@ -465,40 +460,35 @@ module instr_queue
     );
   end
 
-  // Single address FIFO for normal (non-TC-replay) frontend behavior.
-  // Piggyback branch-flags snapshot with predict address so it can be
-  // restored when the corresponding branch later resolves/mispredicts.
-  assign addr_fifo_din = {branch_flags_i, predict_address_i[0]};
-
+  // Keep a single FIFO only for branch-flags snapshots.
   cva6_fifo_v3 #(
       .FPGA_ALTERA(CVA6Cfg.FpgaAlteraEn),
       .DEPTH      (ariane_pkg::FETCH_ADDR_FIFO_DEPTH),
-      .DATA_WIDTH (ADDR_FIFO_W),
+      .DATA_WIDTH (BRANCH_FLAGS_W),
       .FPGA_EN    (CVA6Cfg.FpgaEn)
-  ) i_fifo_address_single (
+  ) i_fifo_branch_flags_single (
       .clk_i, .rst_ni, .flush_i,
       .testmode_i(1'b0),
-      .full_o (full_address_single),
-      .empty_o(empty_address_single),
+      .full_o (full_branch_flags_single),
+      .empty_o(empty_branch_flags_single),
       .usage_o(),
-      .data_i (addr_fifo_din),
-      .push_i (push_address & ~full_address_single),
-      .data_o (addr_fifo_dout),
-      .pop_i  (pop_address_single & ~empty_address_single)
+      .data_i (branch_flags_i),
+      .push_i (push_address & ~full_branch_flags_single),
+      .data_o (branch_flags_out_single),
+      .pop_i  (pop_branch_flags_single & ~empty_branch_flags_single)
   );
 
-  assign addr_data_out_single = addr_fifo_dout[CVA6Cfg.VLEN-1:0];
-  assign branch_flags_o       = empty_address_single ? '0 : addr_fifo_dout[ADDR_FIFO_W-1:CVA6Cfg.VLEN];
+  assign branch_flags_o = empty_branch_flags_single ? '0 : branch_flags_out_single;
 
 `ifndef SYNTHESIS
   logic [7:0] iq_addr_underflow_guard_q;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni || flush_i) begin
       iq_addr_underflow_guard_q <= '0;
-    end else if (pop_address_single && empty_address_single &&
+    end else if (pop_branch_flags_single && empty_branch_flags_single &&
                  (iq_addr_underflow_guard_q < 8'h20)) begin
       iq_addr_underflow_guard_q <= iq_addr_underflow_guard_q + 1'b1;
-      $display("[IQ-ADDR-UNDERFLOW-GUARD] t=%0t pop_single while empty pc_q=0x%h idx_ds_q=%b tc_feeding=%0b",
+      $display("[IQ-BRANCHFLAGS-UNDERFLOW-GUARD] t=%0t pop_single while empty pc_q=0x%h idx_ds_q=%b tc_feeding=%0b",
                $time, pc_q, idx_ds_q, tc_feeding_i);
     end
   end

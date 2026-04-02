@@ -460,7 +460,7 @@ module frontend
 
     for (int s = 0; s < TRACE_LEN; s++) begin
       if (s < int'(tc_pending_len_q)) begin
-        cf_local = tc_pending_cf_q[s] ?
+        cf_local = tc_pending_taken_cf_q[s] ?
                    tc_replay_cf_type(tc_pending_instr_q[s]) : ariane_pkg::NoCF;
 
         replay_valid_iq[s]       = 1'b1;
@@ -690,7 +690,7 @@ module frontend
   end
 
   for (genvar gi = 0; gi < CVA6Cfg.INSTR_PER_FETCH; gi++) begin : gen_predict_addr_mux
-    assign predict_addr_to_iq[gi] = tc_pending_start ? replay_predict_addr_single_iq : predict_address;
+    assign predict_addr_to_iq[gi] = tc_pending_start ? replay_predict_addr_iq[gi] : predict_address;
   end
 
   always_comb begin
