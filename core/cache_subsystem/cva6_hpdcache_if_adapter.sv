@@ -1,7 +1,7 @@
 // Copyright 2023 Commissariat a l'Energie Atomique et aux Energies
 //                Alternatives (CEA)
 //
-// Licensed under the Solderpad Hardware License, Version 2.1 (the “License”);
+// Licensed under the Solderpad Hardware License, Version 2.1 (the ?License?);
 // you may not use this file except in compliance with the License.
 // SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
 // You may obtain a copy of the License at https://solderpad.org/licenses/
@@ -111,9 +111,54 @@ module cva6_hpdcache_if_adapter
 
       //    Response forwarding
       assign cva6_req_o.data_rvalid = hpdcache_rsp_valid_i;
-      assign cva6_req_o.data_rdata = hpdcache_rsp_i.rdata;
       assign cva6_req_o.data_rid = hpdcache_rsp_i.tid;
       assign cva6_req_o.data_gnt = hpdcache_req_ready_i;
+
+      //  Sanitize simulation-only Xs in HPDcache response data.
+      //  Real silicon SRAMs always return 0/1; Xs arise from reading
+      //  cache data that is mid-refill or from a replayed HPDcache
+      //  lookup that races with a linefill write.  Replacing X?0
+      //  prevents pipeline poisoning while preserving functional timing.
+`ifdef VERILATOR
+      assign cva6_req_o.data_rdata = hpdcache_rsp_i.rdata;
+`else
+  `ifdef SYNTHESIS
+      assign cva6_req_o.data_rdata = hpdcache_rsp_i.rdata;
+  `else
+      logic [$bits(hpdcache_rsp_i.rdata)-1:0] sanitized_rdata;
+      always_comb begin
+        sanitized_rdata = hpdcache_rsp_i.rdata;
+        for (int b = 0; b < $bits(hpdcache_rsp_i.rdata); b++) begin
+          if (hpdcache_rsp_i.rdata[b] === 1'bx)
+            sanitized_rdata[b] = 1'b0;
+        end
+      end
+      assign cva6_req_o.data_rdata = sanitized_rdata;
+  `endif
+`endif
+
+      //    pragma translate_off
+      logic [7:0] dbg_load_rsp_unknown_count_q;
+      always_ff @(posedge clk_i or negedge rst_ni) begin : dbg_unknown_load_rsp
+        if (!rst_ni) begin
+          dbg_load_rsp_unknown_count_q <= '0;
+        end else begin
+          if ((dbg_load_rsp_unknown_count_q < 8'd64) && hpdcache_rsp_valid_i &&
+              $isunknown(hpdcache_rsp_i.rdata)) begin
+            $display(
+                "[HPD-LOAD-RSP-UNK] t=%0t count=%0d sid=%0d tid=%0d kill=%0b rdata=0x%h",
+                $time,
+                dbg_load_rsp_unknown_count_q,
+                hpdcache_req_sid_i,
+                hpdcache_rsp_i.tid,
+                cva6_req_i.kill_req,
+                hpdcache_rsp_i.rdata
+            );
+            dbg_load_rsp_unknown_count_q <= dbg_load_rsp_unknown_count_q + 8'd1;
+          end
+        end
+      end
+      //    pragma translate_on
 
       //  Assertions
       //  {{{

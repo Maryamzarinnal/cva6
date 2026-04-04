@@ -98,6 +98,7 @@ module trace_builder #(
   logic dbg_evt_start_single_taken;
   logic dbg_evt_start_multi_taken;
   logic dbg_evt_start_unaligned_taken;
+  logic dbg_evt_start_indirect_trigger;
   logic dbg_evt_accum_pc_gap;
   logic dbg_evt_finalize_any;
   logic dbg_evt_finalize_unaligned;
@@ -115,6 +116,7 @@ module trace_builder #(
   longint unsigned dbg_start_single_taken_q;
   longint unsigned dbg_start_multi_taken_q;
   longint unsigned dbg_start_unaligned_taken_q;
+  longint unsigned dbg_start_indirect_trigger_q;
   longint unsigned dbg_accum_pc_gap_q;
   longint unsigned dbg_finalize_any_q;
   longint unsigned dbg_finalize_unaligned_q;
@@ -189,6 +191,7 @@ module trace_builder #(
     logic [CHUNKS_PER_TRACE-1:0] candidate_flags;
     logic [TRACE_ADDRW-1:0] candidate_addr;
     logic is_duplicate;
+    logic trigger_indirect;
     logic stop_suffix_now;
     logic finalize_now;
     logic finalize_len_limit;
@@ -218,6 +221,7 @@ module trace_builder #(
     candidate_flags       = '0;
     candidate_addr        = '0;
     is_duplicate          = 1'b0;
+    trigger_indirect      = 1'b0;
     stop_suffix_now       = 1'b0;
     finalize_now          = 1'b0;
     finalize_len_limit    = 1'b0;
@@ -230,6 +234,7 @@ module trace_builder #(
     dbg_evt_start_single_taken      = 1'b0;
     dbg_evt_start_multi_taken       = 1'b0;
     dbg_evt_start_unaligned_taken   = 1'b0;
+    dbg_evt_start_indirect_trigger  = 1'b0;
     dbg_evt_accum_pc_gap            = 1'b0;
     dbg_evt_finalize_any            = 1'b0;
     dbg_evt_finalize_unaligned      = 1'b0;
@@ -271,8 +276,15 @@ module trace_builder #(
 
               if (instr_i.is_branch[i] && instr_i.taken[i]) begin
                 trigger_taken_cnt++;
-                if (trigger_taken_cnt == 1)
+                if (trigger_taken_cnt == 1) begin
                   trigger_target_pc = instr_i.target[i];
+                  // Track if trigger's taken branch is indirect (jalr, c.jr, return).
+                  // Indirect branches alias in the tag (target not stored), so we must
+                  // reject these to prevent suffix mismatch across different targets.
+                  // Direct calls (JAL rd,imm) are safe ? their target is PC-relative
+                  // and deterministic, so they don't alias.
+                  trigger_indirect = is_rejected_trace_cf(instr_i.inst[i]);
+                end
               end
             end
           end
@@ -289,8 +301,10 @@ module trace_builder #(
               dbg_evt_start_single_taken = 1'b1;
             else
               dbg_evt_start_multi_taken = 1'b1;
+            if (trigger_taken_cnt == 1 && trigger_indirect)
+              dbg_evt_start_indirect_trigger = 1'b1;
 `endif
-            if (trigger_taken_cnt == 1 && trigger_base_pc_valid) begin
+            if (trigger_taken_cnt == 1 && trigger_base_pc_valid && !trigger_indirect) begin
               active_payload_d                 = '0;
               active_payload_d.base_pc         = trigger_target_pc;
               active_payload_d.target_addr     = trigger_target_pc;
@@ -526,6 +540,7 @@ module trace_builder #(
       dbg_start_single_taken_q      <= 0;
       dbg_start_multi_taken_q       <= 0;
       dbg_start_unaligned_taken_q   <= 0;
+      dbg_start_indirect_trigger_q  <= 0;
       dbg_accum_pc_gap_q            <= 0;
       dbg_finalize_any_q            <= 0;
       dbg_finalize_unaligned_q      <= 0;
@@ -552,6 +567,8 @@ module trace_builder #(
         dbg_start_multi_taken_q <= dbg_start_multi_taken_q + 1;
       if (dbg_evt_start_unaligned_taken)
         dbg_start_unaligned_taken_q <= dbg_start_unaligned_taken_q + 1;
+      if (dbg_evt_start_indirect_trigger)
+        dbg_start_indirect_trigger_q <= dbg_start_indirect_trigger_q + 1;
       if (dbg_evt_accum_pc_gap)
         dbg_accum_pc_gap_q <= dbg_accum_pc_gap_q + 1;
       if (dbg_evt_finalize_any)
@@ -590,9 +607,9 @@ module trace_builder #(
   end
 
   final begin
-    $display("[TC-BUILDER-DBG] starts: any=%0d single_taken=%0d multi_taken=%0d unaligned_taken=%0d",
+    $display("[TC-BUILDER-DBG] starts: any=%0d single_taken=%0d multi_taken=%0d unaligned_taken=%0d indirect_trigger=%0d",
              dbg_start_any_q, dbg_start_single_taken_q, dbg_start_multi_taken_q,
-             dbg_start_unaligned_taken_q);
+             dbg_start_unaligned_taken_q, dbg_start_indirect_trigger_q);
     $display("[TC-BUILDER-DBG] accum: pc_gap_windows=%0d finalizations=%0d stop_unaligned=%0d stop_cf=%0d cause_trace_full=%0d cause_len_limit=%0d cause_taken_limit=%0d",
              dbg_accum_pc_gap_q, dbg_finalize_any_q, dbg_finalize_unaligned_q,
              dbg_finalize_stop_cf_q, dbg_finalize_trace_full_q,

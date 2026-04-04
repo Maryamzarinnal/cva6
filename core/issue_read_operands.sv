@@ -232,6 +232,15 @@ module issue_read_operands
   logic x_transaction_rejected, x_transaction_rejected_n;
   logic [OPERANDS_PER_INSTR-1:0] rs_valid;
   logic [OPERANDS_PER_INSTR-1:0][CVA6Cfg.XLEN-1:0] rs;
+  //pragma translate_off
+  int unsigned dbg_unknown_operand_count_q;
+  logic [CVA6Cfg.NrIssuePorts-1:0] dbg_issue_fire_q;
+  logic [CVA6Cfg.NrIssuePorts-1:0][CVA6Cfg.VLEN-1:0] dbg_issue_pc_q;
+  logic [CVA6Cfg.NrIssuePorts-1:0][31:0] dbg_orig_instr_q;
+  logic [CVA6Cfg.NrIssuePorts-1:0][CVA6Cfg.TRANS_ID_BITS-1:0] dbg_issue_trans_q;
+  logic [CVA6Cfg.NrIssuePorts-1:0][4:0] dbg_issue_rs1_q, dbg_issue_rs2_q, dbg_issue_rd_q;
+  branchpredict_sbe_t [CVA6Cfg.NrIssuePorts-1:0] dbg_issue_bp_q;
+  //pragma translate_on
 
   cvxif_issue_register_commit_if_driver #(
       .CVA6Cfg       (CVA6Cfg),
@@ -1076,9 +1085,27 @@ module issue_read_operands
       branch_predict_o         <= {cf_t'(0), {CVA6Cfg.VLEN{1'b0}}};
       x_transaction_rejected_o <= 1'b0;
       alu_bypass_q             <= '0;
+      dbg_issue_fire_q         <= '0;
+      dbg_issue_pc_q           <= '0;
+      dbg_orig_instr_q         <= '0;
+      dbg_issue_trans_q        <= '0;
+      dbg_issue_rs1_q          <= '0;
+      dbg_issue_rs2_q          <= '0;
+      dbg_issue_rd_q           <= '0;
+      dbg_issue_bp_q           <= '0;
     end else begin
       fu_data_q <= fu_data_n;
       alu_bypass_q <= alu_bypass_n;
+      for (int unsigned i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
+        dbg_issue_fire_q[i]  <= !issue_instr_i[i].ex.valid && issue_instr_valid_i[i] && issue_ack_o[i];
+        dbg_issue_pc_q[i]    <= issue_instr_i[i].pc;
+        dbg_orig_instr_q[i]  <= orig_instr_i[i];
+        dbg_issue_trans_q[i] <= issue_instr_i[i].trans_id;
+        dbg_issue_rs1_q[i]   <= issue_instr_i[i].rs1;
+        dbg_issue_rs2_q[i]   <= issue_instr_i[i].rs2;
+        dbg_issue_rd_q[i]    <= issue_instr_i[i].rd;
+        dbg_issue_bp_q[i]    <= issue_instr_i[i].bp;
+      end
       if (CVA6Cfg.ZKN) begin
         orig_instr_aes_bits <= {orig_instr_i[0][31:30], orig_instr_i[0][23:20]};
       end
@@ -1117,12 +1144,48 @@ module issue_read_operands
   end
 
   for (genvar i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
-    assert property (@(posedge clk_i) (branch_valid_q) |-> (!$isunknown(
+    assert property (@(posedge clk_i) (branch_valid_q[i]) |-> (!$isunknown(
         fu_data_q[i].operand_a
     ) && !$isunknown(
         fu_data_q[i].operand_b
     )))
     else $warning("Got unknown value in one of the operands");
+  end
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      dbg_unknown_operand_count_q <= '0;
+    end else begin
+      if (flush_i) begin
+        dbg_unknown_operand_count_q <= '0;
+      end
+      for (int unsigned i = 0; i < CVA6Cfg.NrIssuePorts; i++) begin
+        if (branch_valid_q[i] && ($isunknown(fu_data_q[i].operand_a) || $isunknown(
+            fu_data_q[i].operand_b
+        ))) begin
+          if (dbg_unknown_operand_count_q < 64) begin
+            $display(
+                "[IRO-UNK] t=%0t count=%0d port=%0d fire=%0b pc=0x%h instr=0x%08h trans=%0d bp_cf=%0d bp_pred=0x%h rs1=%0d rs2=%0d rd=%0d opa=0x%h opb=0x%h",
+                $time,
+                dbg_unknown_operand_count_q,
+                i,
+                dbg_issue_fire_q[i],
+                dbg_issue_pc_q[i],
+                dbg_orig_instr_q[i],
+                dbg_issue_trans_q[i],
+                dbg_issue_bp_q[i].cf,
+                dbg_issue_bp_q[i].predict_address,
+                dbg_issue_rs1_q[i],
+                dbg_issue_rs2_q[i],
+                dbg_issue_rd_q[i],
+                fu_data_q[i].operand_a,
+                fu_data_q[i].operand_b
+            );
+          end
+          dbg_unknown_operand_count_q <= dbg_unknown_operand_count_q + 1;
+        end
+      end
+    end
   end
   //pragma translate_on
 

@@ -125,6 +125,9 @@ module frontend
   logic [TRACE_LEN-1:0]                    tc_pending_cf_q, tc_pending_cf_d;
   logic [BR_CNT_WIDTH-1:0]                 tc_pending_num_branches_q, tc_pending_num_branches_d;
   logic [TAKEN_CNT_WIDTH-1:0]              tc_pending_num_taken_q, tc_pending_num_taken_d;
+  logic [TRACE_LEN_WIDTH-1:0]              tc_replay_rem_q;
+  logic [1:0]                              tc_replay_deq_count;
+  logic                                    tc_suppress_port1;
   logic                                    tc_pending_capture;
   logic                                    tc_pending_start;
   logic                                    tc_rehit_block_q, tc_rehit_block_d;
@@ -916,6 +919,7 @@ module frontend
       .fetch_entry_valid_o(fetch_entry_valid_o),
       .fetch_entry_ready_i(fetch_entry_ready_i),
       .tc_feeding_i       (tc_pending_start),
+      .tc_suppress_port1_i(tc_suppress_port1),
       .reseed_pc_i        (tc_pending_start)
   );
 
@@ -1094,9 +1098,13 @@ module frontend
   // - allow direct branches/jumps inside the payload
   // - still reject indirect CFs and calls, because the current replay path
   //   still does not preserve those side effects cleanly
+  // - require at least one taken branch in the suffix (multi-block):
+  //   single-block suffixes are the same as what icache would deliver,
+  //   and the pending stall makes them a net loss
   assign tc_trace_policy_ok = tc_trace_starts_ok &&
                               tc_trace_branch_map_ok &&
                               (tc_trace_num_taken <= TAKEN_CNT_WIDTH'(1)) &&
+                              (tc_trace_num_taken >= TAKEN_CNT_WIDTH'(1)) &&
                               !tc_trace_has_call &&
                               !tc_trace_has_indirect &&
                               !tc_disable_replay_q;
@@ -1117,7 +1125,31 @@ module frontend
                             !eret_i &&
                             !ex_valid_i;
 
+  always_comb begin
+    tc_replay_deq_count = '0;
+    for (int p = 0; p < CVA6Cfg.NrIssuePorts; p++) begin
+      if (fetch_entry_valid_o[p] && fetch_entry_ready_i[p])
+        tc_replay_deq_count = tc_replay_deq_count + 2'(1);
+    end
+  end
+  assign tc_suppress_port1 = (tc_replay_rem_q == TRACE_LEN_WIDTH'(1));
+
   assign tc_active_use = 1'b0;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      tc_replay_rem_q <= '0;
+    end else if (flush_i || is_mispredict || set_pc_commit_i || eret_i || ex_valid_i) begin
+      tc_replay_rem_q <= '0;
+    end else if (tc_pending_start) begin
+      tc_replay_rem_q <= tc_pending_len_q;
+    end else if (tc_replay_rem_q != '0 && tc_replay_deq_count != '0) begin
+      if (tc_replay_deq_count >= tc_replay_rem_q)
+        tc_replay_rem_q <= '0;
+      else
+        tc_replay_rem_q <= tc_replay_rem_q - TRACE_LEN_WIDTH'(tc_replay_deq_count);
+    end
+  end
 
 // pragma translate_off
   longint unsigned tc_total_cycles_q;
@@ -1127,6 +1159,7 @@ module frontend
   int unsigned tc_dbg_reject_not_ready_q;
   int unsigned tc_dbg_reject_used_q;
   int unsigned tc_dbg_reject_indirect_q;
+  int unsigned tc_dbg_reject_singleblock_q;
   int unsigned tc_dbg_reject_policy_q;
   int unsigned tc_dbg_feed_done_q;
   int unsigned tc_dbg_feed_cycles_q;
@@ -1182,8 +1215,9 @@ module frontend
       tc_dbg_accept_count_q     <= 0;
       tc_dbg_reject_not_ready_q <= 0;
       tc_dbg_reject_used_q      <= 0;
-      tc_dbg_reject_indirect_q  <= 0;
-      tc_dbg_reject_policy_q    <= 0;
+      tc_dbg_reject_indirect_q    <= 0;
+      tc_dbg_reject_singleblock_q <= 0;
+      tc_dbg_reject_policy_q      <= 0;
       tc_dbg_feed_done_q        <= 0;
       tc_dbg_feed_cycles_q      <= 0;
       tc_dbg_hold_count_q       <= 0;
@@ -1268,6 +1302,8 @@ module frontend
           end else begin
             if (tc_trace_has_indirect || tc_trace_has_call)
               tc_dbg_reject_indirect_q <= tc_dbg_reject_indirect_q + 1;
+            if (tc_trace_num_taken == '0)
+              tc_dbg_reject_singleblock_q <= tc_dbg_reject_singleblock_q + 1;
             tc_dbg_reject_policy_q <= tc_dbg_reject_policy_q + 1;
           end
         end else begin
@@ -1554,8 +1590,8 @@ module frontend
     $display("[TC-FINAL] accepted=%0d held=%0d pending_use=%0d rejected_not_ready=%0d rejected_used=%0d rejected_policy=%0d accept_per_hit=%0d%%",
              tc_dbg_accept_count_q, tc_dbg_hold_count_q, tc_dbg_pending_use_count_q,
              tc_dbg_reject_not_ready_q, tc_dbg_reject_used_q, tc_dbg_reject_policy_q, tc_dbg_accept_rate_q);
-    $display("[TC-FINAL] multiblock: accepted=%0d rejected_indirect=%0d",
-             tc_dbg_accept_multiblock_q, tc_dbg_reject_indirect_q);
+    $display("[TC-FINAL] multiblock: accepted=%0d rejected_indirect=%0d rejected_singleblock=%0d",
+             tc_dbg_accept_multiblock_q, tc_dbg_reject_indirect_q, tc_dbg_reject_singleblock_q);
     $display("[TC-FINAL] immediate_use=%0d pending_enabled=%0b",
              tc_dbg_immediate_use_count_q, 1'b1);
     $display("[TC-FINAL] replay_done=%0d replay_cycles=%0d replay_cycle_share=%0d%%",

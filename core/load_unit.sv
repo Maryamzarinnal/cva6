@@ -541,6 +541,36 @@ module load_unit
   end
   // end result mux fast
 
+  //pragma translate_off
+  logic [7:0] dbg_ld_unknown_count_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin : dbg_unknown_load_data
+    if (!rst_ni) begin
+      dbg_ld_unknown_count_q <= '0;
+    end else begin
+      if ((dbg_ld_unknown_count_q < 8'd64) && req_port_i.data_rvalid &&
+          ($isunknown(req_port_i.data_rdata) || $isunknown(result_o))) begin
+        $display(
+            "[LD-RDATA-UNK] t=%0t count=%0d rid=%0d trans=%0d op=%0d rvalid=%0b flushed=%0b kill=%0b ex_v=%0b rdata=0x%h shifted=0x%h result=0x%h",
+            $time,
+            dbg_ld_unknown_count_q,
+            ldbuf_rindex,
+            ldbuf_rdata.trans_id,
+            ldbuf_rdata.operation,
+            req_port_i.data_rvalid,
+            ldbuf_flushed_q[ldbuf_rindex],
+            req_port_o.kill_req,
+            ex_o.valid,
+            req_port_i.data_rdata,
+            shifted_data,
+            result_o
+        );
+        dbg_ld_unknown_count_q <= dbg_ld_unknown_count_q + 8'd1;
+      end
+    end
+  end
+  //pragma translate_on
+
   ///////////////////////////////////////////////////////
   // assertions
   ///////////////////////////////////////////////////////
@@ -549,7 +579,7 @@ module load_unit
   initial
     assert (CVA6Cfg.DcacheIdWidth >= REQ_ID_BITS)
     else $fatal(1, "DcacheIdWidth parameter is not wide enough to encode pending loads");
-  // check invalid offsets, but only issue a warning as these conditions actually trigger a load address misaligned exception
+  // check invalid offsets
   addr_offset0 :
   assert property (@(posedge clk_i) disable iff (~rst_ni)
         ldbuf_w |->  (ldbuf_wdata.operation inside {ariane_pkg::LW, ariane_pkg::LWU}) |-> ldbuf_wdata.address_offset < 5)

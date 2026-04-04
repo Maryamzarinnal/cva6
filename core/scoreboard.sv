@@ -300,6 +300,38 @@ module scoreboard #(
     assign fwd_o.sbe[i] = mem_q[i].sbe;
   end
 
+  //pragma translate_off
+  logic [7:0] dbg_wb_unknown_count_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin : dbg_unknown_wb
+    if (!rst_ni) begin
+      dbg_wb_unknown_count_q <= '0;
+    end else begin
+      for (int unsigned i = 0; i < CVA6Cfg.NrWbPorts; i++) begin
+        if ((dbg_wb_unknown_count_q < 8'd64) && wt_valid_i[i] && $isunknown(wbdata_i[i])) begin
+          $display(
+              "[SB-WB-UNK] t=%0t count=%0d wb_port=%0d trans=%0d ex_v=%0b wb=0x%h pc=0x%h fu=%0d op=%0d rd=%0d old_res=0x%h issued=%0b valid=%0b",
+              $time,
+              dbg_wb_unknown_count_q,
+              i,
+              trans_id_i[i],
+              ex_i[i].valid,
+              wbdata_i[i],
+              mem_q[trans_id_i[i]].sbe.pc,
+              mem_q[trans_id_i[i]].sbe.fu,
+              mem_q[trans_id_i[i]].sbe.op,
+              mem_q[trans_id_i[i]].sbe.rd,
+              mem_q[trans_id_i[i]].sbe.result,
+              mem_q[trans_id_i[i]].issued,
+              mem_q[trans_id_i[i]].sbe.valid
+          );
+          dbg_wb_unknown_count_q <= dbg_wb_unknown_count_q + 8'd1;
+        end
+      end
+    end
+  end
+  //pragma translate_on
+
   // sequential process
   always_ff @(posedge clk_i or negedge rst_ni) begin : regs
     if (!rst_ni) begin

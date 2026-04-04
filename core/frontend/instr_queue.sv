@@ -45,6 +45,7 @@ module instr_queue
     input ariane_pkg::cf_t [CVA6Cfg.INSTR_PER_FETCH-1:0] cf_type_i,
     // Trace cache: bypass branch_mask so multiple CFs pass through
     input logic tc_feeding_i,
+    input logic tc_suppress_port1_i,
     input logic reseed_pc_i,
     output logic replay_o,
     output logic [CVA6Cfg.VLEN-1:0] replay_addr_o,
@@ -261,6 +262,9 @@ module instr_queue
   assign fetch_entry_valid_o[0] = ~(&instr_queue_empty) & ~reset_address_q;
   if (CVA6Cfg.SuperscalarEn) begin : gen_fetch_entry_valid_1
     assign fetch_entry_valid_o[NID] = ~|(instr_queue_empty & idx_ds[1]) & ~(&fetch_entry_is_cf) &
+                                      ~fetch_entry_is_cf[0] &
+                                      ~tc_feeding_i &
+                                      ~tc_suppress_port1_i &
                                       ~reset_address_q;
   end
 
