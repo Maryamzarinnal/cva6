@@ -4,33 +4,32 @@ package trace_cache_pkg;
 
   // Match frontend: one fetch window = up to 4 slots per cycle.
   localparam int unsigned SLOTS_PER_CYCLE = 4;
-  // TRACE_LEN is the storage/output capacity of each trace entry.
-  // We keep it larger than one fetch window so the structs/interfaces stay stable
-  // while we experiment with a smaller recording policy below.
-  localparam int unsigned TRACE_LEN = 8;
-  // Current functional bring-up policy: record at most one fetch window per trace.
-  localparam int unsigned MAX_TRACE_INSTR = SLOTS_PER_CYCLE;
+
+  // V70: 1-fetch-window traces.  TRACE_LEN = INSTR_PER_FETCH = 4.
+  // The entire trace fits in a single IQ push cycle ? no multi-cycle
+  // feeding FSM, no phase-2 injection, no post-feed drain wait.
+  // One taken branch per trace (MAX_TAKEN = 1).
+  localparam int unsigned TRACE_LEN = 4;
+  localparam int unsigned MAX_TRACE_INSTR = TRACE_LEN;
   localparam int unsigned INSTR_WIDTH = 32;
   localparam int unsigned TRACE_LEN_WIDTH = $clog2(TRACE_LEN + 1);
 
   localparam int unsigned NUM_WAYS = 2;
-  localparam int unsigned TRACE_ADDRW = 8;  // 2 ways x 256 sets
+  localparam int unsigned TRACE_ADDRW = 7;  // 2 ways x 128 sets
   localparam int unsigned GHR_WIDTH = 8;
 
   localparam int unsigned PC_WIDTH = 64;  // CVA6 is 64-bit
   localparam int unsigned TRIGGER_BRANCH_BITS = SLOTS_PER_CYCLE;
   localparam int unsigned TRIGGER_BRANCH_CNT_WIDTH = $clog2(TRIGGER_BRANCH_BITS + 1);
 
-  // Instructions stored as 16-bit chunks so we can mix 32-bit and RVC (1 or 2 chunks per instr).
-  // valid_chunks[i]=1 means start of an instruction; next chunk may be high half of 32-bit.
-  localparam int unsigned CHUNKS_PER_TRACE = TRACE_LEN * 2;
+  // Instructions stored as 16-bit chunks (RVC = 1 chunk, RV32 = 2 chunks).
+  localparam int unsigned CHUNKS_PER_TRACE = TRACE_LEN * 2;  // 8
   localparam int unsigned BR_CNT_WIDTH = $clog2(CHUNKS_PER_TRACE + 1);
   localparam int unsigned SUFFIX_CHUNKS = MAX_TRACE_INSTR * 2;
   localparam int unsigned SUFFIX_LEN_WIDTH = $clog2(MAX_TRACE_INSTR + 1);
 
-  // New: keep every taken target in trace order.
-  // For now, max taken CFs per trace = TRACE_LEN.
-  localparam int unsigned MAX_TAKEN = TRACE_LEN;
+  // V70: one taken branch per trace.
+  localparam int unsigned MAX_TAKEN = 1;
   localparam int unsigned TAKEN_CNT_WIDTH = $clog2(MAX_TAKEN + 1);
 
   // PCs are not stored per instruction; on hit we derive them from base_pc + instr + branch_flags.
@@ -46,9 +45,11 @@ package trace_cache_pkg;
   localparam int unsigned BE_WIDTH = (TRACE_WIDTH + 7) / 8;
 
   // -----------------------------------------------------------------------
-  // New split tag/data representation for the suffix-only redesign.
-  // The tag describes the trigger fetch window. The payload stores only the
-  // straight-line suffix after the taken branch target.
+  // TC V68 window-format tag/data representation.
+  // Tag: identifies the trigger fetch window (base PC + branch outcomes up to
+  //      and including the first taken branch, canonicalized).
+  // Data: instructions from base_pc through the taken branch (inclusive),
+  //       plus the taken branch target address for NPC redirect.
   // -----------------------------------------------------------------------
 
   typedef struct packed {
@@ -89,8 +90,6 @@ package trace_cache_pkg;
     logic [CHUNKS_PER_TRACE-1:0]        valid_chunks;
   } trace_data_t;
 
-  localparam int unsigned TC_INDEX_FLAG_BITS = 2;
-
   function automatic trace_tag_t make_trace_tag(
     input logic [PC_WIDTH-1:0]                 base_pc_i,
     input logic [TRIGGER_BRANCH_CNT_WIDTH-1:0] num_branches_i,
@@ -130,14 +129,16 @@ package trace_cache_pkg;
     pc_align_16 = pc & {{(PC_WIDTH-4){1'b1}}, 4'b0};
   endfunction
 
+  // V71: PC-only set index.  Branch flags removed from the index so the
+  // SRAM can be read in parallel with the I$ request (before branch
+  // predictions are available).  The 2-way associativity handles the
+  // slightly higher set pressure from collapsing branch variants.
   function automatic logic [TRACE_ADDRW-1:0] tc_index(
-    input logic [PC_WIDTH-1:0]         pc,
-    input logic [CHUNKS_PER_TRACE-1:0] flags
+    input logic [PC_WIDTH-1:0] pc
   );
     tc_index = pc[TRACE_ADDRW+3:4]
              ^ pc[2*TRACE_ADDRW+3:TRACE_ADDRW+4]
-             ^ pc[3*TRACE_ADDRW+3:2*TRACE_ADDRW+4]
-             ^ TRACE_ADDRW'(flags[TC_INDEX_FLAG_BITS-1:0]);
+             ^ pc[3*TRACE_ADDRW+3:2*TRACE_ADDRW+4];
   endfunction
 
 endpackage : trace_cache_pkg
