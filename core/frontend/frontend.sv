@@ -46,7 +46,7 @@ module frontend
 );
 
 `ifndef SYNTHESIS
-  initial $display("[TC-RUN-MARKER] TC_V71_PARALLEL_MUX");
+  initial $display("[TC-RUN-MARKER] TC_V72b_PENDING_FIX");
 `endif
 
   localparam type bht_update_t = struct packed {
@@ -119,6 +119,28 @@ module frontend
   logic                                    tc_hit_this_cycle;
   logic                                    tc_suppress_port1;  // tied to 0
   logic [SLOTS_PER_CYCLE-1:0]              tc_valid_mask;  // valid up to first taken
+
+  // V72: 1-entry pending trace buffer ? captures TC hit when IQ not ready.
+  logic                                    tc_pending_valid_q;
+  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   tc_pending_instructions_q;
+  logic [TRACE_LEN_WIDTH-1:0]              tc_pending_length_q;
+  logic [PC_WIDTH-1:0]                     tc_pending_next_pc_q;
+  logic [TRACE_LEN-1:0][PC_WIDTH-1:0]      tc_pending_pcs_q;
+  logic [CHUNKS_PER_TRACE-1:0]             tc_pending_branch_flags_q;
+  logic [BR_CNT_WIDTH-1:0]                 tc_pending_num_branches_q;
+  logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]      tc_pending_taken_targets_q;
+  logic [TAKEN_CNT_WIDTH-1:0]              tc_pending_num_taken_q;
+  logic [PC_WIDTH-1:0]                     tc_pending_base_pc_q;  // for PC safety check
+  // Pending buffer control signals
+  logic                                    tc_pending_capture;  // TC hit + IQ not ready
+  logic                                    tc_pending_use;      // pending valid + IQ ready + safe
+  logic                                    tc_pending_invalidate; // any path-breaking event
+  // V72-fix: Suppress I$ data into IQ while pending buffer owns the trace.
+  // Active during the capture cycle AND all subsequent cycles until the
+  // pending buffer is consumed (tc_pending_use) or invalidated.  This
+  // prevents the I$ scan from partially inserting instructions into
+  // non-full IQ lanes that overlap with the captured trace.
+  logic                                    tc_suppress_icache;
 
   // Per-slot TC feeding signals (combinational from trace outputs).
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]                    tc_feed_valid;
@@ -345,7 +367,9 @@ module frontend
   // V71: I$ runs continuously ? no TC gating.  TC competes same-cycle.
   assign icache_dreq_o.req     = instr_queue_ready & ~halt_frontend_i;
   assign if_ready              = icache_dreq_i.ready & instr_queue_ready & ~halt_frontend_i;
-  assign icache_dreq_o.kill_s1 = is_mispredict | flush_i | replay_eff | tc_hit_this_cycle;
+  // V72-fix: kill I$ stage-1 during pending capture to prevent stale
+  // pipeline-drain responses from reaching icache_valid_q next cycle.
+  assign icache_dreq_o.kill_s1 = is_mispredict | flush_i | replay_eff | tc_hit_this_cycle | tc_pending_capture;
   assign icache_dreq_o.kill_s2 = icache_dreq_o.kill_s1 | bp_valid;
 
   bht_update_t bht_update;
@@ -430,6 +454,39 @@ module frontend
   // -----------------------------------------------------------------------
 
   // Combinational feed signals: format trace output for IQ push.
+  // V72: When tc_pending_use fires, feed from the buffered registers.
+  //      When tc_direct_hit fires, feed from live SRAM trace outputs.
+  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   tc_feed_src_instructions;
+  logic [TRACE_LEN_WIDTH-1:0]              tc_feed_src_length;
+  logic [TRACE_LEN-1:0][PC_WIDTH-1:0]      tc_feed_src_pcs;
+  logic [CHUNKS_PER_TRACE-1:0]             tc_feed_src_branch_flags;
+  logic [BR_CNT_WIDTH-1:0]                 tc_feed_src_num_branches;
+  logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]      tc_feed_src_taken_targets;
+  logic [TAKEN_CNT_WIDTH-1:0]              tc_feed_src_num_taken;
+  logic [PC_WIDTH-1:0]                     tc_feed_src_next_pc;
+
+  always_comb begin
+    if (tc_pending_use) begin
+      tc_feed_src_instructions = tc_pending_instructions_q;
+      tc_feed_src_length       = tc_pending_length_q;
+      tc_feed_src_pcs          = tc_pending_pcs_q;
+      tc_feed_src_branch_flags = tc_pending_branch_flags_q;
+      tc_feed_src_num_branches = tc_pending_num_branches_q;
+      tc_feed_src_taken_targets = tc_pending_taken_targets_q;
+      tc_feed_src_num_taken    = tc_pending_num_taken_q;
+      tc_feed_src_next_pc      = tc_pending_next_pc_q;
+    end else begin
+      tc_feed_src_instructions = tc_trace_instructions;
+      tc_feed_src_length       = tc_trace_length;
+      tc_feed_src_pcs          = tc_trace_pcs;
+      tc_feed_src_branch_flags = tc_trace_branch_flags;
+      tc_feed_src_num_branches = tc_trace_num_branches;
+      tc_feed_src_taken_targets = tc_trace_taken_targets;
+      tc_feed_src_num_taken    = tc_trace_num_taken;
+      tc_feed_src_next_pc      = tc_trace_next_pc;
+    end
+  end
+
   always_comb begin
     automatic cf_t feed_cf;
     automatic int  br_idx;
@@ -445,17 +502,17 @@ module frontend
     taken_idx = 0;
 
     for (int p = 0; p < CVA6Cfg.INSTR_PER_FETCH; p++) begin
-      if (p < int'(tc_trace_length)) begin
+      if (p < int'(tc_feed_src_length)) begin
         tc_feed_valid[p] = 1'b1;
-        tc_feed_instr[p] = tc_trace_instructions[p];
-        tc_feed_addr[p]  = tc_trace_pcs[p][CVA6Cfg.VLEN-1:0];
+        tc_feed_instr[p] = tc_feed_src_instructions[p];
+        tc_feed_addr[p]  = tc_feed_src_pcs[p][CVA6Cfg.VLEN-1:0];
 
         // Determine cf_type from trace instruction + branch_flags.
         feed_cf = ariane_pkg::NoCF;
-        if (tc_replay_cf_type(tc_trace_instructions[p]) != ariane_pkg::NoCF) begin
-          if ((br_idx < int'(tc_trace_num_branches)) &&
-              tc_trace_branch_flags[br_idx]) begin
-            feed_cf = tc_replay_cf_type(tc_trace_instructions[p]);
+        if (tc_replay_cf_type(tc_feed_src_instructions[p]) != ariane_pkg::NoCF) begin
+          if ((br_idx < int'(tc_feed_src_num_branches)) &&
+              tc_feed_src_branch_flags[br_idx]) begin
+            feed_cf = tc_replay_cf_type(tc_feed_src_instructions[p]);
           end
           br_idx++;
         end
@@ -464,10 +521,10 @@ module frontend
         // Predict address: next instruction PC, or trace exit for the last.
         if (feed_cf != ariane_pkg::NoCF) begin
           // Taken CF: predict_addr is next PC in trace or trace exit.
-          if (p + 1 < int'(tc_trace_length))
-            tc_feed_predict_addr[p] = tc_trace_pcs[p + 1][CVA6Cfg.VLEN-1:0];
+          if (p + 1 < int'(tc_feed_src_length))
+            tc_feed_predict_addr[p] = tc_feed_src_pcs[p + 1][CVA6Cfg.VLEN-1:0];
           else
-            tc_feed_predict_addr[p] = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
+            tc_feed_predict_addr[p] = tc_feed_src_next_pc[CVA6Cfg.VLEN-1:0];
         end
       end
     end
@@ -479,7 +536,13 @@ module frontend
   // -----------------------------------------------------------------------
   assign instr_to_iq            = tc_hit_this_cycle ? tc_feed_instr : instr;
   assign addr_to_iq             = tc_hit_this_cycle ? tc_feed_addr  : addr;
-  assign valid_to_iq            = tc_hit_this_cycle ? tc_feed_valid : instruction_valid;
+  // V72-fix: When the pending buffer is active (capture or holding),
+  // suppress I$ data to the IQ.  This prevents the I$ scan from
+  // partially inserting instructions into non-full IQ lanes that
+  // would duplicate the captured trace when tc_pending_use fires.
+  assign valid_to_iq            = tc_hit_this_cycle    ? tc_feed_valid :
+                                  tc_suppress_icache   ? '0 :
+                                                         instruction_valid;
   assign cf_type_to_iq          = tc_hit_this_cycle ? tc_feed_cf : cf_type;
   assign exception_to_iq        = tc_hit_this_cycle ? ariane_pkg::FE_NONE : icache_ex_valid_q;
   assign exception_addr_to_iq   = tc_hit_this_cycle ? '0 : icache_vaddr_q;
@@ -493,13 +556,13 @@ module frontend
 
   // During TC hit, supply the trace's own branch outcomes as branch_flags.
   assign branch_flags_to_iq = tc_hit_this_cycle ?
-      tc_trace_branch_flags[CHUNKS_PER_TRACE-1:0] : tc_branch_predictions;
+      tc_feed_src_branch_flags[CHUNKS_PER_TRACE-1:0] : tc_branch_predictions;
 
   // V71: tc_active_branch_flags for restore on mispredict.
   always_comb begin
     tc_active_branch_flags = '0;
     if (tc_hit_this_cycle) begin
-      tc_active_branch_flags = tc_trace_branch_flags[CHUNKS_PER_TRACE-1:0];
+      tc_active_branch_flags = tc_feed_src_branch_flags[CHUNKS_PER_TRACE-1:0];
     end
   end
 
@@ -530,9 +593,9 @@ module frontend
 
     // [V68: BHT scan cancel NPC redirect removed ? tc_scan_cancel is always 0]
 
-    // V71: Steer NPC to trace exit on same-cycle TC hit.
+    // V72: Steer NPC to trace exit on same-cycle TC hit (direct or pending).
     if (tc_hit_this_cycle)
-      npc_d = tc_trace_next_pc[CVA6Cfg.VLEN-1:0];
+      npc_d = tc_feed_src_next_pc[CVA6Cfg.VLEN-1:0];
 
     if (replay_eff)      npc_d = replay_addr;
     if (is_mispredict)   npc_d = resolved_branch_i.target_address;
@@ -567,7 +630,13 @@ module frontend
       npc_rst_load_q <= 1'b0;
       npc_q          <= npc_d;
       speculative_q  <= speculative_d;
-      icache_valid_q <= icache_dreq_i.valid;
+      // V72-fix: Suppress stale I$ response registration while the
+      // pending buffer owns a trace.  Without this, a pipeline-drain
+      // response could arrive, be registered, run through instr_realign
+      // next cycle, and partially leak into the IQ via non-full lanes
+      // (since valid_to_iq is gated, AND bp_valid from the stale scan
+      // would spuriously steer NPC).
+      icache_valid_q <= icache_dreq_i.valid & ~tc_suppress_icache;
 
       if (icache_dreq_i.valid) begin
         icache_data_q  <= icache_data;
@@ -595,6 +664,41 @@ module frontend
         btb_q <= btb_prediction[CVA6Cfg.INSTR_PER_FETCH-1];
         bht_q <= bht_prediction[CVA6Cfg.INSTR_PER_FETCH-1];
       end
+    end
+  end
+
+  // -----------------------------------------------------------------------
+  // V72: Pending trace buffer ? 1-entry register
+  // Captures a TC hit when IQ is not ready.  Used next cycle if IQ becomes
+  // ready and the path context is still valid (no redirect, no flush).
+  // -----------------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      tc_pending_valid_q          <= 1'b0;
+      tc_pending_instructions_q   <= '0;
+      tc_pending_length_q         <= '0;
+      tc_pending_next_pc_q        <= '0;
+      tc_pending_pcs_q            <= '0;
+      tc_pending_branch_flags_q   <= '0;
+      tc_pending_num_branches_q   <= '0;
+      tc_pending_taken_targets_q  <= '0;
+      tc_pending_num_taken_q      <= '0;
+      tc_pending_base_pc_q        <= '0;
+    end else if (tc_pending_invalidate || tc_pending_use) begin
+      // Invalidate on any path-breaking event, or after successful use.
+      tc_pending_valid_q <= 1'b0;
+    end else if (tc_pending_capture) begin
+      // Capture the current TC hit into the pending buffer.
+      tc_pending_valid_q          <= 1'b1;
+      tc_pending_instructions_q   <= tc_trace_instructions;
+      tc_pending_length_q         <= tc_trace_length;
+      tc_pending_next_pc_q        <= tc_trace_next_pc;
+      tc_pending_pcs_q            <= tc_trace_pcs;
+      tc_pending_branch_flags_q   <= tc_trace_branch_flags;
+      tc_pending_num_branches_q   <= tc_trace_num_branches;
+      tc_pending_taken_targets_q  <= tc_trace_taken_targets;
+      tc_pending_num_taken_q      <= tc_trace_num_taken;
+      tc_pending_base_pc_q        <= tc_trace_pcs[0];
     end
   end
 
@@ -922,7 +1026,7 @@ module frontend
   end
 
   initial begin
-    $display("[TC-RUN-MARKER] TC_V71_PARALLEL_MUX");
+    $display("[TC-RUN-MARKER] TC_V72b_PENDING_FIX");
     if (tc_disable_replay_q)
       $display("[TC-RUN-MARKER] TC_SWITCH_DISABLE_REPLAY_ACTIVE");
   end
@@ -940,13 +1044,45 @@ module frontend
                               !tc_trace_has_call &&
                               !tc_disable_replay_q;
 
-  // V71: tc_hit_this_cycle ? the single "TC wins" signal.
-  // Fires in the same cycle as the instruction scan, replacing I$ data
-  // in the IQ MUX and steering NPC to trace exit.
-  assign tc_hit_this_cycle = tc_active_hit &&
-                             tc_trace_policy_ok &&
-                             !tc_trace_used &&
-                             instr_queue_ready;
+  // V72: Pending trace buffer invalidation ? any path-breaking event.
+  assign tc_pending_invalidate = flush_i || is_mispredict || ex_valid_i ||
+                                 eret_i || set_pc_commit_i || replay_eff ||
+                                 (CVA6Cfg.DebugEn && set_debug_pc_i);
+
+  // V72: Capture a TC hit into the pending buffer when IQ is not ready.
+  // Do not overwrite an existing valid pending trace (it takes priority).
+  assign tc_pending_capture = tc_active_hit && tc_trace_policy_ok &&
+                              !tc_trace_used && !instr_queue_ready &&
+                              !tc_pending_invalidate &&
+                              !tc_pending_valid_q;
+
+  // V72-fix: Suppress I$ data into IQ for the duration of pending buffer
+  // ownership.  tc_pending_capture covers the capture cycle itself;
+  // tc_pending_valid_q covers all subsequent cycles until use/invalidation.
+  // No combinational loop: instr_queue_ready (= IQ ready_o) is based
+  // solely on registered FIFO state, so tc_pending_capture does not
+  // depend on valid_to_iq ? push ? FIFO full ? ready.
+  assign tc_suppress_icache = tc_pending_capture || tc_pending_valid_q;
+
+  // V72: Use the pending buffer when it is valid, IQ is ready, and no
+  // invalidation event has occurred.  All path-breaking events (mispredict,
+  // flush, eret, exception, commit redirect, debug, replay) clear the
+  // buffer via tc_pending_invalidate, so if the buffer survives it is
+  // guaranteed to be on the correct path.
+  assign tc_pending_use = tc_pending_valid_q && instr_queue_ready &&
+                          !tc_pending_invalidate;
+
+  // V72: tc_hit_this_cycle ? fires on direct same-cycle hit OR pending use.
+  // When pending_use fires, the feed MUX uses the buffered trace data.
+  // Pending use takes priority over a concurrent direct hit.
+  logic tc_direct_hit;
+  assign tc_direct_hit = tc_active_hit &&
+                         tc_trace_policy_ok &&
+                         !tc_trace_used &&
+                         instr_queue_ready &&
+                         !tc_pending_use;
+
+  assign tc_hit_this_cycle = tc_direct_hit || tc_pending_use;
 
   assign tc_suppress_port1 = 1'b0;
   assign tc_active_use = 1'b0;
@@ -1012,6 +1148,43 @@ module frontend
   int unsigned tc_dbg_bht_scan_cancel_q;
   int unsigned tc_dbg_poison_block_q;
   int unsigned tc_dbg_poison_set_q;
+  int unsigned tc_dbg_pending_capture_q;
+  int unsigned tc_dbg_pending_use_q;
+  int unsigned tc_dbg_pending_invalidate_q;
+
+  // -----------------------------------------------------------------------
+  // V72: ROI (Region of Interest) measurement
+  // The ROI is activated by the first committed instruction in the
+  // Coremark code region (PC >= 0x80000000) and deactivated when PC
+  // leaves that region (e.g., WFI spin at 0x0200018a).  All TC stats
+  // within the ROI are counted separately so boot/tail overhead is
+  // excluded.  Override with +ROI_START_PC=<hex> and +ROI_END_PC=<hex>.
+  // -----------------------------------------------------------------------
+  logic        roi_active_q;
+  logic [63:0] roi_start_pc;
+  logic [63:0] roi_end_pc;
+  longint unsigned roi_cycle_count_q;
+  int unsigned roi_instr_count_q;
+  int unsigned roi_tc_accept_q;
+  int unsigned roi_tc_instr_q;
+  int unsigned roi_tc_pending_use_q;
+  int unsigned roi_tc_lookup_q;
+  int unsigned roi_tc_hit_q;
+  int unsigned roi_tc_miss_empty_q;
+  int unsigned roi_tc_miss_pc_q;
+  int unsigned roi_tc_miss_path_q;
+  int unsigned roi_icache_instr_q;
+
+  // V72: ROI plusarg configuration
+  initial begin
+    roi_start_pc = 64'h80000000;  // default: Coremark code region start
+    roi_end_pc   = 64'h80010000;  // default: Coremark code region end (64KB)
+    if ($value$plusargs("ROI_START_PC=%h", roi_start_pc))
+      $display("[TC-ROI] Start PC overridden to 0x%h", roi_start_pc);
+    if ($value$plusargs("ROI_END_PC=%h", roi_end_pc))
+      $display("[TC-ROI] End PC overridden to 0x%h", roi_end_pc);
+    $display("[TC-ROI] Region: [0x%h, 0x%h)", roi_start_pc, roi_end_pc);
+  end
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -1075,6 +1248,21 @@ module frontend
       tc_dbg_bht_scan_cancel_q <= 0;
       tc_dbg_poison_block_q <= 0;
       tc_dbg_poison_set_q <= 0;
+      tc_dbg_pending_capture_q <= 0;
+      tc_dbg_pending_use_q <= 0;
+      tc_dbg_pending_invalidate_q <= 0;
+      roi_active_q <= 1'b0;
+      roi_cycle_count_q <= 0;
+      roi_instr_count_q <= 0;
+      roi_tc_accept_q <= 0;
+      roi_tc_instr_q <= 0;
+      roi_tc_pending_use_q <= 0;
+      roi_tc_lookup_q <= 0;
+      roi_tc_hit_q <= 0;
+      roi_tc_miss_empty_q <= 0;
+      roi_tc_miss_pc_q <= 0;
+      roi_tc_miss_path_q <= 0;
+      roi_icache_instr_q <= 0;
     end else begin
       int unsigned src_cnt;
       int unsigned cf_cnt;
@@ -1109,7 +1297,7 @@ module frontend
           if (tc_trace_policy_ok) begin
             if (tc_trace_used)
               tc_dbg_reject_used_q <= tc_dbg_reject_used_q + 1;
-            else if (!tc_hit_this_cycle)
+            else if (!tc_direct_hit && !tc_pending_capture)
               tc_dbg_reject_not_ready_q <= tc_dbg_reject_not_ready_q + 1;
           end else begin
             if (tc_trace_has_indirect || tc_trace_has_call)
@@ -1302,6 +1490,71 @@ module frontend
 
       // V70: scan_cancel, poison counters removed.
 
+      // V72: pending buffer tracking
+      if (tc_pending_capture)
+        tc_dbg_pending_capture_q <= tc_dbg_pending_capture_q + 1;
+      if (tc_pending_use)
+        tc_dbg_pending_use_q <= tc_dbg_pending_use_q + 1;
+      if (tc_pending_valid_q && tc_pending_invalidate)
+        tc_dbg_pending_invalidate_q <= tc_dbg_pending_invalidate_q + 1;
+
+      // V72: ROI tracking
+      // ROI activates when a committed instruction is in [roi_start_pc, roi_end_pc).
+      // ROI deactivates when a committed instruction is outside that range
+      // (after having been active), capturing exactly the benchmark region.
+      if (fetch_entry_valid_o[0] && fetch_entry_ready_i[0]) begin
+        logic [63:0] commit_pc_64;
+        commit_pc_64 = {32'b0, fetch_entry_o[0].address};
+        if (!roi_active_q) begin
+          if (commit_pc_64 >= roi_start_pc && commit_pc_64 < roi_end_pc)
+            roi_active_q <= 1'b1;
+        end else begin
+          if (commit_pc_64 < roi_start_pc || commit_pc_64 >= roi_end_pc)
+            roi_active_q <= 1'b0;
+        end
+      end
+
+      if (roi_active_q) begin
+        int unsigned roi_src_cnt;
+        roi_cycle_count_q <= roi_cycle_count_q + 1;
+
+        // Count committed instructions (from IQ dequeue ports)
+        for (int p = 0; p < CVA6Cfg.NrIssuePorts; p++)
+          if (fetch_entry_valid_o[p] && fetch_entry_ready_i[p])
+            roi_instr_count_q <= roi_instr_count_q + 1;
+
+        // TC stats within ROI
+        if (tc_hit_this_cycle) begin
+          roi_tc_accept_q <= roi_tc_accept_q + 1;
+          roi_src_cnt = 0;
+          for (int k = 0; k < CVA6Cfg.INSTR_PER_FETCH; k++)
+            if (tc_feed_valid[k]) roi_src_cnt++;
+          roi_tc_instr_q <= roi_tc_instr_q + roi_src_cnt;
+        end
+
+        if (tc_pending_use)
+          roi_tc_pending_use_q <= roi_tc_pending_use_q + 1;
+
+        if (tc_lookup_result_valid) begin
+          roi_tc_lookup_q <= roi_tc_lookup_q + 1;
+          if (tc_trace_hit)
+            roi_tc_hit_q <= roi_tc_hit_q + 1;
+          else begin
+            if (tc_miss_reason_empty) roi_tc_miss_empty_q <= roi_tc_miss_empty_q + 1;
+            if (tc_miss_reason_pc)    roi_tc_miss_pc_q    <= roi_tc_miss_pc_q + 1;
+            if (tc_miss_reason_path)  roi_tc_miss_path_q  <= roi_tc_miss_path_q + 1;
+          end
+        end
+
+        // I$ instruction count within ROI
+        if (tc_icache_sidefx_en && (|instruction_valid) && !tc_hit_this_cycle) begin
+          roi_src_cnt = 0;
+          for (int k = 0; k < CVA6Cfg.INSTR_PER_FETCH; k++)
+            if (instruction_valid[k]) roi_src_cnt++;
+          roi_icache_instr_q <= roi_icache_instr_q + roi_src_cnt;
+        end
+      end
+
       if (tc_hit_this_cycle) begin
         tc_dbg_pending_use_count_q <= tc_dbg_pending_use_count_q + 1;
         tc_dbg_accept_count_q <= tc_dbg_accept_count_q + 1;
@@ -1384,7 +1637,7 @@ module frontend
     else
       tc_dbg_instr_tc_share_q = 0;
 
-    $display("[TC-FINAL] ========== Trace Cache V71 summary ==========");
+    $display("[TC-FINAL] ========== Trace Cache V72 summary ==========");
     $display("[TC-FINAL] lookups=%0d hits=%0d misses=%0d hit_rate=%0d%%",
              tc_dbg_lookup_count_q, tc_dbg_hit_count_q, tc_dbg_miss_count_q, tc_dbg_hit_rate_q);
     $display("[TC-FINAL] accepted=%0d rejected_not_ready=%0d rejected_used=%0d rejected_policy=%0d accept_per_hit=%0d%%",
@@ -1417,7 +1670,45 @@ module frontend
              tc_dbg_iq_flush_on_capture_q);
     $display("[TC-FINAL] miss_breakdown: empty=%0d pc=%0d path=%0d",
              tc_dbg_miss_empty_q, tc_dbg_miss_pc_q, tc_dbg_miss_path_q);
+    $display("[TC-FINAL] pending_buf: captured=%0d used=%0d invalidated=%0d",
+             tc_dbg_pending_capture_q, tc_dbg_pending_use_q, tc_dbg_pending_invalidate_q);
     $display("[TC-FINAL] ========================================");
+
+    // V72: ROI stats
+    begin
+      int unsigned roi_tc_hit_rate;
+      int unsigned roi_tc_accept_rate;
+      int unsigned roi_tc_instr_share;
+      int unsigned roi_total_instr;
+      if (roi_tc_lookup_q > 0)
+        roi_tc_hit_rate = (roi_tc_hit_q * 100) / roi_tc_lookup_q;
+      else
+        roi_tc_hit_rate = 0;
+      if (roi_tc_hit_q > 0)
+        roi_tc_accept_rate = (roi_tc_accept_q * 100) / roi_tc_hit_q;
+      else
+        roi_tc_accept_rate = 0;
+      roi_total_instr = roi_tc_instr_q + roi_icache_instr_q;
+      if (roi_total_instr > 0)
+        roi_tc_instr_share = (roi_tc_instr_q * 100) / roi_total_instr;
+      else
+        roi_tc_instr_share = 0;
+
+      $display("[TC-ROI] ========== ROI Summary ==========");
+      $display("[TC-ROI] region=[0x%h, 0x%h) active_cycles=%0d",
+               roi_start_pc, roi_end_pc, roi_cycle_count_q);
+      $display("[TC-ROI] committed_instr=%0d (from IQ dequeue within ROI)",
+               roi_instr_count_q);
+      $display("[TC-ROI] tc_lookups=%0d tc_hits=%0d hit_rate=%0d%%",
+               roi_tc_lookup_q, roi_tc_hit_q, roi_tc_hit_rate);
+      $display("[TC-ROI] tc_accepted=%0d accept_rate=%0d%% (of hits) pending_use=%0d",
+               roi_tc_accept_q, roi_tc_accept_rate, roi_tc_pending_use_q);
+      $display("[TC-ROI] tc_instr=%0d icache_instr=%0d tc_instr_share=%0d%%",
+               roi_tc_instr_q, roi_icache_instr_q, roi_tc_instr_share);
+      $display("[TC-ROI] miss_breakdown: empty=%0d pc=%0d path=%0d",
+               roi_tc_miss_empty_q, roi_tc_miss_pc_q, roi_tc_miss_path_q);
+      $display("[TC-ROI] ====================================");
+    end
   end
 // pragma translate_on
 

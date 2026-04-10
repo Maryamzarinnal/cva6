@@ -15,7 +15,7 @@ package trace_cache_pkg;
   localparam int unsigned TRACE_LEN_WIDTH = $clog2(TRACE_LEN + 1);
 
   localparam int unsigned NUM_WAYS = 2;
-  localparam int unsigned TRACE_ADDRW = 7;  // 2 ways x 128 sets
+  localparam int unsigned TRACE_ADDRW = 8;  // 2 ways x 256 sets
   localparam int unsigned GHR_WIDTH = 8;
 
   localparam int unsigned PC_WIDTH = 64;  // CVA6 is 64-bit
