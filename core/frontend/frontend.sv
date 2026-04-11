@@ -46,7 +46,7 @@ module frontend
 );
 
 `ifndef SYNTHESIS
-  initial $display("[TC-RUN-MARKER] TC_V72b_PENDING_FIX");
+  initial $display("[TC-RUN-MARKER] TC_V74_DEDUP_GUARD");
 `endif
 
   localparam type bht_update_t = struct packed {
@@ -1019,6 +1019,14 @@ module frontend
   );
 
   logic tc_trace_policy_ok;
+  // V73: Minimum trace length to accept.  A TC hit fires kill_s1 which
+  // kills one extra I$ pipeline stage vs normal branch prediction (which
+  // only fires kill_s2).  This costs 1 bubble cycle.  A trace of length
+  // N delivers (N - pre_branch_count) extra instructions over what the
+  // I$ would have provided.  For length-2 traces (1 pre + 1 post branch),
+  // the 1 extra instruction equals the 1 bubble cost ? net zero benefit.
+  // Length ? 3 always provides net positive benefit.  Default: 3.
+  localparam int unsigned TC_MIN_ACCEPT_LEN = 3;
 
 `ifndef SYNTHESIS
   initial begin
@@ -1026,7 +1034,8 @@ module frontend
   end
 
   initial begin
-    $display("[TC-RUN-MARKER] TC_V72b_PENDING_FIX");
+    $display("[TC-RUN-MARKER] TC_V74_DEDUP_GUARD");
+    $display("[TC-POLICY] min_accept_len=%0d", TC_MIN_ACCEPT_LEN);
     if (tc_disable_replay_q)
       $display("[TC-RUN-MARKER] TC_SWITCH_DISABLE_REPLAY_ACTIVE");
   end
@@ -1037,10 +1046,13 @@ module frontend
   assign tc_active_hit = tc_lookup_result_valid && tc_trace_hit &&
                          (tc_trace_length != '0) && !flush_i && !is_mispredict;
 
-  // V71: Same-cycle hit policy ? require ?1 taken branch, no calls.
+  // V73: Same-cycle hit policy ? require ?1 taken branch, no calls,
+  // and trace length ? TC_MIN_ACCEPT_LEN (default 3) so the extra
+  // instructions overcome the kill_s1 steer bubble cost.
   assign tc_trace_policy_ok = tc_trace_starts_ok &&
                               tc_trace_branch_map_ok &&
                               (tc_trace_num_taken >= TAKEN_CNT_WIDTH'(1)) &&
+                              (tc_trace_length >= TRACE_LEN_WIDTH'(TC_MIN_ACCEPT_LEN)) &&
                               !tc_trace_has_call &&
                               !tc_disable_replay_q;
 
@@ -1096,6 +1108,7 @@ module frontend
   int unsigned tc_dbg_reject_used_q;
   int unsigned tc_dbg_reject_indirect_q;
   int unsigned tc_dbg_reject_singleblock_q;
+  int unsigned tc_dbg_reject_short_q;
   int unsigned tc_dbg_reject_policy_q;
   int unsigned tc_dbg_feed_done_q;
   int unsigned tc_dbg_feed_cycles_q;
@@ -1196,6 +1209,7 @@ module frontend
       tc_dbg_reject_used_q      <= 0;
       tc_dbg_reject_indirect_q    <= 0;
       tc_dbg_reject_singleblock_q <= 0;
+      tc_dbg_reject_short_q       <= 0;
       tc_dbg_reject_policy_q      <= 0;
       tc_dbg_feed_done_q        <= 0;
       tc_dbg_feed_cycles_q      <= 0;
@@ -1304,6 +1318,8 @@ module frontend
               tc_dbg_reject_indirect_q <= tc_dbg_reject_indirect_q + 1;
             if (tc_trace_num_taken == '0)
               tc_dbg_reject_singleblock_q <= tc_dbg_reject_singleblock_q + 1;
+            if (tc_trace_length < TRACE_LEN_WIDTH'(TC_MIN_ACCEPT_LEN))
+              tc_dbg_reject_short_q <= tc_dbg_reject_short_q + 1;
             tc_dbg_reject_policy_q <= tc_dbg_reject_policy_q + 1;
           end
         end else begin
@@ -1637,14 +1653,15 @@ module frontend
     else
       tc_dbg_instr_tc_share_q = 0;
 
-    $display("[TC-FINAL] ========== Trace Cache V72 summary ==========");
+    $display("[TC-FINAL] ========== Trace Cache V77 summary ==========");
     $display("[TC-FINAL] lookups=%0d hits=%0d misses=%0d hit_rate=%0d%%",
              tc_dbg_lookup_count_q, tc_dbg_hit_count_q, tc_dbg_miss_count_q, tc_dbg_hit_rate_q);
     $display("[TC-FINAL] accepted=%0d rejected_not_ready=%0d rejected_used=%0d rejected_policy=%0d accept_per_hit=%0d%%",
              tc_dbg_accept_count_q,
              tc_dbg_reject_not_ready_q, tc_dbg_reject_used_q, tc_dbg_reject_policy_q, tc_dbg_accept_rate_q);
-    $display("[TC-FINAL] multiblock: accepted=%0d rejected_indirect=%0d rejected_singleblock=%0d",
-             tc_dbg_accept_multiblock_q, tc_dbg_reject_indirect_q, tc_dbg_reject_singleblock_q);
+    $display("[TC-FINAL] multiblock: accepted=%0d rejected_indirect=%0d rejected_singleblock=%0d rejected_short=%0d",
+             tc_dbg_accept_multiblock_q, tc_dbg_reject_indirect_q, tc_dbg_reject_singleblock_q, tc_dbg_reject_short_q);
+    $display("[TC-FINAL] min_accept_len=%0d", TC_MIN_ACCEPT_LEN);
     $display("[TC-FINAL] tc_hit_cycles=%0d tc_hit_total=%0d tc_pkt_cycles=%0d icache_pkt_cycles=%0d tc_pkt_share=%0d%%",
              tc_dbg_feed_cycles_q, tc_dbg_feed_start_total_q, tc_dbg_tc_pkt_cycles_q, tc_dbg_icache_pkt_cycles_q, tc_dbg_pkt_tc_share_q);
     $display("[TC-FINAL] frontend_instr_mix: tc_instr=%0d icache_instr=%0d tc_instr_share=%0d%%",

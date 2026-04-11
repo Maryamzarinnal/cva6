@@ -2,9 +2,9 @@
 import trace_cache_pkg::*;
 import riscv::*;
 
-// V70 set-associative trace cache.  Each way has its own SRAM; lookup reads
-// all ways in parallel.  LRU picks the way to replace on write.  SRAM has one
-// cycle latency.  Builder write blocks lookup that cycle.
+// V77 skewed-associative trace cache.  Each way uses a different hash
+// function (H0 / H1) so that PCs colliding in one way's set likely map
+// to different sets in the other way.  This breaks hot-set concentration.
 // Traces are 1 fetch window (4 instructions, 1 taken branch max).
 
 module trace_cache_top #(
@@ -160,7 +160,49 @@ module trace_cache_top #(
   logic [PC_WIDTH-1:0]         lookup_pc_q;
   logic [TRACE_ADDRW-1:0]      lookup_set_q;
 
-  assign lookup_fire           = lookup_valid_i && !mem_req_builder;
+  // -----------------------------------------------------------------------
+  // V74 DEDUP GUARD: 2-phase commit pipeline.
+  //
+  // Phase 1 (dedup_check_fire): Builder requests commit ? capture commit
+  //   data in pipeline registers, issue tag reads for all ways at the
+  //   target set.  Lookups are blocked this cycle (tag ports busy).
+  //
+  // Phase 2 (dedup_pending_q high): Compare read-back tags against pending
+  //   commit.  If any way already holds a matching tag ? suppress write
+  //   (dedup_hit).  Otherwise ? proceed with SRAM write (dedup_write_fire).
+  //   Suppressed commits free the SRAM ports immediately for lookups.
+  //
+  // Tag match criterion: valid && base_pc && num_branches && branch_flags
+  // (same fields as the lookup tag comparison).  Two traces with the same
+  // tag traverse the same instruction sequence ? their data payloads are
+  // deterministically identical ? so a tag-only check is sufficient.
+  // -----------------------------------------------------------------------
+
+  // Pipeline registers (hold commit data across the tag-read cycle)
+  logic                    dedup_pending_q;
+  logic [TRACE_ADDRW-1:0]  dedup_addr_q;       // way-0 (H0) set index
+  logic [TRACE_ADDRW-1:0]  dedup_addr_w1_q;    // way-1 (H1) set index (V77)
+  trace_tag_t              dedup_tag_q;
+  logic [TRACE_WIDTH-1:0]  dedup_data_q;
+  logic [BE_WIDTH-1:0]     dedup_be_q;
+  logic                    dedup_wr_way_q;
+
+  // Dedup comparison result (combinational ? see always_comb after gen_ways)
+  logic [NUM_WAYS-1:0]     dedup_way_match;
+  logic                    dedup_hit;
+
+  // Phase control signals (active for exactly one cycle each)
+  logic                    dedup_check_fire;     // Phase 1: builder commit ? tag read
+  logic                    dedup_write_fire;     // Phase 2: no match ? SRAM write
+  logic                    dedup_suppress_fire;  // Phase 2: match ? skip write
+  logic                    actual_write;         // = dedup_write_fire
+
+  assign dedup_check_fire    = mem_req_builder;
+  assign dedup_write_fire    = dedup_pending_q && !dedup_hit;
+  assign dedup_suppress_fire = dedup_pending_q &&  dedup_hit;
+  assign actual_write        = dedup_write_fire;
+
+  assign lookup_fire           = lookup_valid_i && !dedup_check_fire && !dedup_write_fire;
   assign lookup_result_valid_o = lookup_valid_q;
 
   // IMPORTANT: exact trace-start PC, not a 16-byte aligned block base.
@@ -183,10 +225,66 @@ module trace_cache_top #(
     end
   end
 
+  // V77: per-way builder indices (combinational, from builder's base_pc)
+  logic [TRACE_ADDRW-1:0] builder_idx_w0;
+  logic [TRACE_ADDRW-1:0] builder_idx_w1;
+  assign builder_idx_w0 = tc_index(mem_tag_builder.base_pc);
+  assign builder_idx_w1 = tc_index_w1(mem_tag_builder.base_pc);
+
   logic lru [(1 << TRACE_ADDRW)];
   logic wr_way;
-  assign wr_way = ~lru[mem_addr_builder];
+  assign wr_way = ~lru[builder_idx_w0];  // LRU keyed on H0 index
 
+  // Dedup pipeline register update
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      dedup_pending_q <= 1'b0;
+      dedup_addr_q    <= '0;
+      dedup_addr_w1_q <= '0;
+      dedup_tag_q     <= '0;
+      dedup_data_q    <= '0;
+      dedup_be_q      <= '0;
+      dedup_wr_way_q  <= 1'b0;
+    end else if (flush_i) begin
+      dedup_pending_q <= 1'b0;
+    end else begin
+      if (dedup_check_fire) begin
+        dedup_pending_q <= 1'b1;
+        dedup_addr_q    <= builder_idx_w0;
+        dedup_addr_w1_q <= builder_idx_w1;
+        dedup_tag_q     <= mem_tag_final;
+        dedup_data_q    <= mem_wdata_final;
+        dedup_be_q      <= mem_be_builder;
+        dedup_wr_way_q  <= wr_way;
+      end else begin
+        dedup_pending_q <= 1'b0;
+      end
+    end
+  end
+
+  // -----------------------------------------------------------------------
+  // V77 SKEWED REPLACEMENT: prefer-invalid-way + LRU approximation.
+  //
+  // With skewed indexing each way reads/writes at its own hash index.
+  // LRU is keyed on H0 (way-0) index ? an approximation, but the main
+  // benefit comes from conflict reduction, not replacement precision.
+  // -----------------------------------------------------------------------
+  logic final_wr_way;
+  // V77: per-way write address (selected after final_wr_way is known)
+  logic [TRACE_ADDRW-1:0] dedup_wr_addr;
+  logic [TRACE_ADDRW-1:0] dedup_other_addr;
+  always_comb begin
+    final_wr_way = dedup_wr_way_q;  // default: LRU choice
+    if (dedup_pending_q && !dedup_hit) begin
+      // tag_rdata holds Phase-1 readback (SRAM latency=1)
+      if (tag_rdata[dedup_wr_way_q].valid && !tag_rdata[~dedup_wr_way_q].valid)
+        final_wr_way = ~dedup_wr_way_q;  // prefer empty slot
+    end
+    dedup_wr_addr    = final_wr_way ? dedup_addr_w1_q : dedup_addr_q;
+    dedup_other_addr = final_wr_way ? dedup_addr_q    : dedup_addr_w1_q;
+  end
+
+  // SRAM port arbiter: dedup write > dedup check (tag read) > lookup
   always_comb begin
     for (int w = 0; w < NUM_WAYS; w++) begin
       mem_req[w]   = 1'b0;
@@ -200,25 +298,39 @@ module trace_cache_top #(
       tag_wdata[w] = '0;
     end
 
-    if (mem_req_builder) begin
-      mem_req[wr_way]   = 1'b1;
-      mem_we[wr_way]    = 1'b1;
-      mem_addr[wr_way]  = mem_addr_builder;
-      mem_wdata[wr_way] = mem_wdata_final;
-      mem_be[wr_way]    = mem_be_builder;
-      tag_req[wr_way]   = 1'b1;
-      tag_we[wr_way]    = 1'b1;
-      tag_addr[wr_way]  = mem_addr_builder;
-      tag_wdata[wr_way] = mem_tag_final;
+    if (dedup_write_fire) begin
+      // Phase 2: dedup miss ? actual write to chosen way at its skewed index
+      mem_req[final_wr_way]   = 1'b1;
+      mem_we[final_wr_way]    = 1'b1;
+      mem_addr[final_wr_way]  = dedup_wr_addr;
+      mem_wdata[final_wr_way] = dedup_data_q;
+      mem_be[final_wr_way]    = dedup_be_q;
+      tag_req[final_wr_way]   = 1'b1;
+      tag_we[final_wr_way]    = 1'b1;
+      tag_addr[final_wr_way]  = dedup_wr_addr;
+      tag_wdata[final_wr_way] = dedup_tag_q;
+    end else if (dedup_check_fire) begin
+      // Phase 1: read tags ? each way at its own skewed index (V77)
+      tag_req[0]  = 1'b1;
+      tag_we[0]   = 1'b0;
+      tag_addr[0] = builder_idx_w0;
+      tag_req[1]  = 1'b1;
+      tag_we[1]   = 1'b0;
+      tag_addr[1] = builder_idx_w1;
     end else if (lookup_fire) begin
-      for (int w = 0; w < NUM_WAYS; w++) begin
-        mem_req[w]  = 1'b1;
-        mem_we[w]   = 1'b0;
-        mem_addr[w] = tc_index(lookup_base);
-        tag_req[w]  = 1'b1;
-        tag_we[w]   = 1'b0;
-        tag_addr[w] = tc_index(lookup_base);
-      end
+      // V77: each way reads at its own skewed hash index
+      mem_req[0]  = 1'b1;
+      mem_we[0]   = 1'b0;
+      mem_addr[0] = tc_index(lookup_base);
+      tag_req[0]  = 1'b1;
+      tag_we[0]   = 1'b0;
+      tag_addr[0] = tc_index(lookup_base);
+      mem_req[1]  = 1'b1;
+      mem_we[1]   = 1'b0;
+      mem_addr[1] = tc_index_w1(lookup_base);
+      tag_req[1]  = 1'b1;
+      tag_we[1]   = 1'b0;
+      tag_addr[1] = tc_index_w1(lookup_base);
     end
   end
 
@@ -248,6 +360,27 @@ module trace_cache_top #(
       .be_i    ({mem_be[w]}),
       .rdata_o ({mem_rdata[w]})
     );
+  end
+
+  // -----------------------------------------------------------------------
+  // V74 Dedup comparison: tag read-back from Phase 1 vs pending commit tag.
+  // Runs combinationally every cycle; gated by dedup_pending_q.
+  // -----------------------------------------------------------------------
+  always_comb begin
+    for (int w = 0; w < NUM_WAYS; w++) begin
+      logic dd_flags_ok;
+      dd_flags_ok = 1'b1;
+      for (int b = 0; b < TRIGGER_BRANCH_BITS; b++) begin
+        if (b < int'(dedup_tag_q.num_branches))
+          dd_flags_ok &= (tag_rdata[w].branch_flags[b] == dedup_tag_q.branch_flags[b]);
+      end
+      dedup_way_match[w] = dedup_pending_q
+                         && tag_rdata[w].valid
+                         && (tag_rdata[w].base_pc      == dedup_tag_q.base_pc)
+                         && (tag_rdata[w].num_branches  == dedup_tag_q.num_branches)
+                         && dd_flags_ok;
+    end
+    dedup_hit = |dedup_way_match;
   end
 
   trace_data_t trace_read [NUM_WAYS];
@@ -459,16 +592,17 @@ module trace_cache_top #(
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
+      // V77: alternating init ? even sets?0, odd sets?1
       for (int s = 0; s < (1 << TRACE_ADDRW); s++)
-        lru[s] <= 1'b0;
+        lru[s] <= s[0];
     end else if (flush_i) begin
       for (int s = 0; s < (1 << TRACE_ADDRW); s++)
-        lru[s] <= 1'b0;
+        lru[s] <= s[0];
     end else begin
       if (trace_hit)
         lru[lookup_set_q] <= hit_way_idx[0];
-      if (mem_req_builder)
-        lru[mem_addr_builder] <= wr_way;
+      if (actual_write)
+        lru[dedup_addr_q] <= final_wr_way;  // H0-keyed LRU
     end
   end
 
@@ -513,6 +647,118 @@ module trace_cache_top #(
 `endif
 
 `ifndef SYNTHESIS
+  // -----------------------------------------------------------------------
+  // V76 PC-MISMATCH DEBUG INSTRUMENTATION
+  //
+  // Goal: distinguish genuine set aliasing (different PCs hashing to same
+  //       set) from potential bugs in lookup-PC or stored base_pc.
+  // -----------------------------------------------------------------------
+  localparam int PC_MISS_VERBOSE_LIMIT = 200;   // first N events printed
+  localparam int PC_MISS_TOP_N        = 16;     // top-N tracking depth
+
+  int unsigned pcm_event_count;                  // total pc_mismatch events
+  int unsigned pcm_1valid;                       // mismatch with exactly 1 valid way
+  int unsigned pcm_2valid;                       // mismatch with 2 valid ways
+
+  // Top-N tracking via associative arrays (simulation only)
+  int unsigned pcm_set_hist [int unsigned];       // set_index ? count
+  int unsigned pcm_lookup_pc_hist [int unsigned];  // lookup PC[31:0] ? count
+  int unsigned pcm_stored_pc_hist [int unsigned];  // stored base_pc[31:0] ? count
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      pcm_event_count <= 0;
+      pcm_1valid      <= 0;
+      pcm_2valid      <= 0;
+    end else if (lookup_valid_q && !trace_hit && any_valid_in_set && !any_pc_match_in_set) begin
+      // This is a pc_mismatch event
+      pcm_event_count <= pcm_event_count + 1;
+
+      // Count 1-valid vs 2-valid
+      begin
+        int nv;
+        nv = 0;
+        for (int w = 0; w < NUM_WAYS; w++)
+          if (way_valid[w]) nv++;
+        if (nv == 1)
+          pcm_1valid <= pcm_1valid + 1;
+        else
+          pcm_2valid <= pcm_2valid + 1;
+      end
+
+      // Accumulate histograms
+      if (pcm_set_hist.exists(32'(lookup_set_q)))
+        pcm_set_hist[32'(lookup_set_q)] += 1;
+      else
+        pcm_set_hist[32'(lookup_set_q)] = 1;
+
+      if (pcm_lookup_pc_hist.exists(32'(lookup_pc_q)))
+        pcm_lookup_pc_hist[32'(lookup_pc_q)] += 1;
+      else
+        pcm_lookup_pc_hist[32'(lookup_pc_q)] = 1;
+
+      for (int w = 0; w < NUM_WAYS; w++) begin
+        if (way_valid[w]) begin
+          if (pcm_stored_pc_hist.exists(32'(trace_tag_read[w].base_pc)))
+            pcm_stored_pc_hist[32'(trace_tag_read[w].base_pc)] += 1;
+          else
+            pcm_stored_pc_hist[32'(trace_tag_read[w].base_pc)] = 1;
+        end
+      end
+
+      // Verbose per-event print for first N events
+      if (pcm_event_count < PC_MISS_VERBOSE_LIMIT) begin
+        $display("[TC-PCMISS] #%0d t=%0t lookup_pc=0x%h set=%0d nvalid=%0d",
+                 pcm_event_count, $time, lookup_pc_q, lookup_set_q,
+                 (way_valid[0] ? 1 : 0) + (way_valid[1] ? 1 : 0));
+        for (int w = 0; w < NUM_WAYS; w++) begin
+          if (way_valid[w])
+            $display("[TC-PCMISS]   way%0d: stored_base_pc=0x%h nbr=%0d bflags=%b",
+                     w, trace_tag_read[w].base_pc, trace_tag_read[w].num_branches,
+                     trace_tag_read[w].branch_flags);
+          else
+            $display("[TC-PCMISS]   way%0d: INVALID", w);
+        end
+        // NOTE: shadow tag arrays are declared later; use tag_rdata (live SRAM readback) instead
+      end
+    end
+  end
+
+  // Final summary display for PC-mismatch analysis
+  function automatic void pcm_print_top_n(
+    input string label,
+    input int unsigned hist [int unsigned],
+    input int n
+  );
+    // Simple top-N extraction via repeated max-find
+    int unsigned keys [$];
+    int unsigned vals [$];
+    int unsigned best_k, best_v;
+
+    foreach (hist[k]) begin
+      keys.push_back(k);
+      vals.push_back(hist[k]);
+    end
+
+    for (int i = 0; i < n && i < keys.size(); i++) begin
+      best_v = 0;
+      best_k = 0;
+      for (int j = i; j < keys.size(); j++) begin
+        if (vals[j] > best_v) begin
+          best_v = vals[j];
+          best_k = keys[j];
+          // swap to position i
+          keys[j] = keys[i]; keys[i] = best_k;
+          vals[j] = vals[i]; vals[i] = best_v;
+        end
+      end
+      $display("[TC-PCMISS] %s #%0d: key=0x%h count=%0d",
+               label, i, keys[i], vals[i]);
+    end
+  endfunction
+
+  // pcm_print_top_n_pc removed ? all histograms now use int unsigned keys
+
   `ifdef TRACE_CACHE_DEBUG_VERBOSE
   always_ff @(posedge clk_i) begin
     if (lookup_valid_q) begin
@@ -547,6 +793,262 @@ module trace_cache_top #(
   int unsigned tc_lookup_blocked_by_builder;
   int unsigned tc_tag_payload_mismatch;
 
+  // -----------------------------------------------------------------------
+  // V73 COMMIT DEBUG: Shadow tag/data arrays + churn analysis counters.
+  //
+  // "Trace signature" definition:
+  //   sig = {base_pc, num_branches, branch_flags[0:num_branches-1], target_addr}
+  // Two traces with the same signature traverse the same instruction path
+  // from the same start PC through the same branch outcomes to the same
+  // exit PC.  Identical signatures ? functionally identical traces.
+  //
+  // Counter semantics (how they distinguish real diversity from churn):
+  //   commit_into_invalid   ? cold-fill into an empty/reset slot.
+  //                           High early, drops once SRAM is warm.
+  //   commit_replace_valid  ? eviction of a live entry.
+  //                           ? total churn pressure.
+  //   commit_replace_same_sig ? exact re-recording of the same trace.
+  //                           Pure waste / duplicate recording bug.
+  //   commit_replace_same_pc_diff_path ? same base_pc, different branch
+  //                           path.  Real path diversity IF distinct paths
+  //                           are both useful; churn if they keep evicting
+  //                           each other.
+  //   commit_replace_diff_pc ? different base_pc.  Capacity/aliasing miss
+  //                           eviction; unrelated traces compete for the
+  //                           same set.
+  //   commit_other_way_same_sig ? the OTHER way already holds an entry
+  //                           with the exact same signature.  This is a
+  //                           duplicate-recording bug: two ways store the
+  //                           same trace.
+  //   commit_other_way_same_pc ? the OTHER way has the same base_pc but a
+  //                           different path.  This means both branch
+  //                           variants of a PC coexist ? real path
+  //                           diversity utilising both ways.
+  // -----------------------------------------------------------------------
+
+  // Shadow tag array ? mirrors the tag SRAMs, updated on every builder
+  // write, so we can read the "about-to-be-replaced" tag combinationally
+  // in the same cycle the write fires.
+  trace_tag_t  shadow_tag [NUM_WAYS][0:(1 << TRACE_ADDRW)-1];
+  // Shadow validity + base_pc + target_addr from trace data (for signature).
+  logic        shadow_data_valid [NUM_WAYS][0:(1 << TRACE_ADDRW)-1];
+  logic [PC_WIDTH-1:0] shadow_data_target [NUM_WAYS][0:(1 << TRACE_ADDRW)-1];
+
+  // Commit classification counters.
+  int unsigned cmt_into_invalid;
+  int unsigned cmt_replace_valid;
+  int unsigned cmt_replace_same_sig;
+  int unsigned cmt_replace_same_pc_diff_path;
+  int unsigned cmt_replace_diff_pc;
+  int unsigned cmt_other_way_same_sig;
+  int unsigned cmt_other_way_same_pc;
+  // Trace length histogram for committed traces.
+  int unsigned cmt_len_hist [2:TRACE_LEN];
+
+  // Combinational classification signals (computed every cycle, consumed
+  // by always_ff on actual_write).
+  logic        cmt_old_valid;
+  logic        cmt_same_sig;
+  logic        cmt_same_pc;
+  logic        cmt_oth_valid;
+  logic        cmt_oth_same_sig;
+  logic        cmt_oth_same_pc;
+  int          cmt_new_instr_cnt;
+  logic [PC_WIDTH-1:0] cmt_new_target_addr;
+  logic [PC_WIDTH-1:0] cmt_new_taken_tgt0;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      for (int w = 0; w < NUM_WAYS; w++)
+        for (int s = 0; s < (1 << TRACE_ADDRW); s++) begin
+          shadow_tag[w][s]         <= '0;
+          shadow_data_valid[w][s]  <= 1'b0;
+          shadow_data_target[w][s] <= '0;
+        end
+    end else if (actual_write) begin
+      shadow_tag[final_wr_way][dedup_wr_addr]         <= dedup_tag_q;
+      shadow_data_valid[final_wr_way][dedup_wr_addr]  <= 1'b1;
+      shadow_data_target[final_wr_way][dedup_wr_addr] <= cmt_new_target_addr;
+    end
+  end
+
+  always_comb begin
+    // --- Replaced entry classification ---
+    trace_tag_t  c_old_tag;
+    logic [PC_WIDTH-1:0] c_old_target;
+    trace_tag_t  c_new_tag;
+    trace_data_t c_new_data;
+    logic c_same_nbr, c_same_flags, c_same_target;
+
+    c_old_tag    = shadow_tag[final_wr_way][dedup_wr_addr];
+    c_old_target = shadow_data_target[final_wr_way][dedup_wr_addr];
+    c_new_tag    = dedup_tag_q;
+    c_new_data   = dedup_data_q;
+
+    cmt_new_target_addr = c_new_data.target_addr;
+    cmt_new_taken_tgt0  = c_new_data.taken_targets[0];
+
+    cmt_old_valid = c_old_tag.valid && shadow_data_valid[final_wr_way][dedup_wr_addr];
+    cmt_same_pc   = (c_old_tag.base_pc == c_new_tag.base_pc);
+    c_same_nbr    = (c_old_tag.num_branches == c_new_tag.num_branches);
+    c_same_flags  = 1'b1;
+    for (int b = 0; b < TRIGGER_BRANCH_BITS; b++) begin
+      if (b < int'(c_old_tag.num_branches))
+        c_same_flags &= (c_old_tag.branch_flags[b] == c_new_tag.branch_flags[b]);
+    end
+    c_same_target = (c_old_target == c_new_data.target_addr);
+    cmt_same_sig  = cmt_same_pc && c_same_nbr && c_same_flags && c_same_target;
+
+    // --- Other way classification ---
+    begin
+      int c_other_way;
+      trace_tag_t  c_oth_tag;
+      logic [PC_WIDTH-1:0] c_oth_target;
+      logic c_oth_same_nbr, c_oth_same_flags, c_oth_same_target;
+
+      c_other_way  = final_wr_way ? 0 : 1;
+      c_oth_tag    = shadow_tag[c_other_way][dedup_other_addr];
+      c_oth_target = shadow_data_target[c_other_way][dedup_other_addr];
+
+      cmt_oth_valid   = c_oth_tag.valid && shadow_data_valid[c_other_way][dedup_other_addr];
+      cmt_oth_same_pc = (c_oth_tag.base_pc == c_new_tag.base_pc);
+      c_oth_same_nbr  = (c_oth_tag.num_branches == c_new_tag.num_branches);
+      c_oth_same_flags = 1'b1;
+      for (int b = 0; b < TRIGGER_BRANCH_BITS; b++) begin
+        if (b < int'(c_oth_tag.num_branches))
+          c_oth_same_flags &= (c_oth_tag.branch_flags[b] == c_new_tag.branch_flags[b]);
+      end
+      c_oth_same_target = (c_oth_target == c_new_data.target_addr);
+      cmt_oth_same_sig  = cmt_oth_same_pc && c_oth_same_nbr && c_oth_same_flags && c_oth_same_target;
+    end
+
+    // --- Instruction count from chunks ---
+    begin
+      int c_cidx;
+      cmt_new_instr_cnt = 0;
+      c_cidx = 0;
+      while (c_cidx < CHUNKS_PER_TRACE) begin
+        if (c_new_data.valid_chunks[c_cidx]) begin
+          if ((c_new_data.chunks[c_cidx][1:0] == 2'b11) && (c_cidx + 1 < CHUNKS_PER_TRACE))
+            c_cidx += 2;
+          else
+            c_cidx += 1;
+          cmt_new_instr_cnt++;
+        end else
+          c_cidx++;
+      end
+    end
+  end
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      cmt_into_invalid            <= 0;
+      cmt_replace_valid           <= 0;
+      cmt_replace_same_sig        <= 0;
+      cmt_replace_same_pc_diff_path <= 0;
+      cmt_replace_diff_pc         <= 0;
+      cmt_other_way_same_sig      <= 0;
+      cmt_other_way_same_pc       <= 0;
+      for (int l = 2; l <= TRACE_LEN; l++)
+        cmt_len_hist[l] <= 0;
+    end else if (actual_write) begin
+      if (!cmt_old_valid) begin
+        cmt_into_invalid <= cmt_into_invalid + 1;
+      end else begin
+        cmt_replace_valid <= cmt_replace_valid + 1;
+        if (cmt_same_sig)
+          cmt_replace_same_sig <= cmt_replace_same_sig + 1;
+        else if (cmt_same_pc)
+          cmt_replace_same_pc_diff_path <= cmt_replace_same_pc_diff_path + 1;
+        else
+          cmt_replace_diff_pc <= cmt_replace_diff_pc + 1;
+      end
+
+      if (cmt_oth_valid) begin
+        if (cmt_oth_same_sig)
+          cmt_other_way_same_sig <= cmt_other_way_same_sig + 1;
+        else if (cmt_oth_same_pc)
+          cmt_other_way_same_pc <= cmt_other_way_same_pc + 1;
+      end
+
+      if (cmt_new_instr_cnt >= 2 && cmt_new_instr_cnt <= TRACE_LEN)
+        cmt_len_hist[cmt_new_instr_cnt] <= cmt_len_hist[cmt_new_instr_cnt] + 1;
+    end
+  end
+
+  // --- Per-commit verbose $display (first 512 + every 50000th) ---
+  int unsigned cmt_display_count;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni)
+      cmt_display_count <= 0;
+    else if (actual_write) begin
+      cmt_display_count <= cmt_display_count + 1;
+
+      if (cmt_display_count < 512 || (cmt_display_count % 50000 == 0)) begin
+        $display("[TC-COMMIT] #%0d t=%0t set_h0=%0d set_h1=%0d way=%0d | new: base_pc=0x%h nbr=%0d bflags=%b tgt=0x%h len=%0d taken_tgt[0]=0x%h",
+                 cmt_display_count, $time,
+                 dedup_addr_q, dedup_addr_w1_q, final_wr_way,
+                 dedup_tag_q.base_pc[31:0],
+                 dedup_tag_q.num_branches,
+                 dedup_tag_q.branch_flags,
+                 cmt_new_target_addr[31:0],
+                 cmt_new_instr_cnt,
+                 cmt_new_taken_tgt0[31:0]);
+
+        if (cmt_old_valid)
+          $display("[TC-COMMIT]   replaced: base_pc=0x%h nbr=%0d bflags=%b tgt=0x%h %s",
+                   shadow_tag[final_wr_way][dedup_wr_addr].base_pc[31:0],
+                   shadow_tag[final_wr_way][dedup_wr_addr].num_branches,
+                   shadow_tag[final_wr_way][dedup_wr_addr].branch_flags,
+                   shadow_data_target[final_wr_way][dedup_wr_addr][31:0],
+                   cmt_same_pc ? "SAME_PC" : "DIFF_PC");
+        else
+          $display("[TC-COMMIT]   replaced: INVALID (cold fill)");
+      end
+    end
+  end
+
+  // -----------------------------------------------------------------------
+  // V74 Dedup counters + V75 LRU override counter
+  // -----------------------------------------------------------------------
+  int unsigned tc_dedup_attempts;       // total builder commit requests
+  int unsigned tc_dedup_skipped;        // suppressed by dedup guard
+  int unsigned tc_dedup_match_chosen;   // match was in LRU-chosen (victim) way
+  int unsigned tc_dedup_match_other;    // match was in the other way
+  int unsigned tc_lru_invalid_override; // V75: times we overrode LRU to use empty slot
+  int unsigned tc_wr_way0;             // V75: writes to way 0
+  int unsigned tc_wr_way1;             // V75: writes to way 1
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      tc_dedup_attempts      <= 0;
+      tc_dedup_skipped       <= 0;
+      tc_dedup_match_chosen  <= 0;
+      tc_dedup_match_other   <= 0;
+      tc_lru_invalid_override <= 0;
+      tc_wr_way0             <= 0;
+      tc_wr_way1             <= 0;
+    end else begin
+      if (dedup_check_fire)
+        tc_dedup_attempts <= tc_dedup_attempts + 1;
+      if (dedup_suppress_fire) begin
+        tc_dedup_skipped <= tc_dedup_skipped + 1;
+        if (dedup_way_match[dedup_wr_way_q])
+          tc_dedup_match_chosen <= tc_dedup_match_chosen + 1;
+        if (dedup_way_match[~dedup_wr_way_q])
+          tc_dedup_match_other <= tc_dedup_match_other + 1;
+      end
+      if (actual_write) begin
+        if (final_wr_way != dedup_wr_way_q)
+          tc_lru_invalid_override <= tc_lru_invalid_override + 1;
+        if (final_wr_way == 1'b0)
+          tc_wr_way0 <= tc_wr_way0 + 1;
+        else
+          tc_wr_way1 <= tc_wr_way1 + 1;
+      end
+    end
+  end
+
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       tc_valid_lookups <= 0;
@@ -556,12 +1058,12 @@ module trace_cache_top #(
       tc_lookup_blocked_by_builder <= 0;
       tc_tag_payload_mismatch <= 0;
     end else begin
-      if (mem_req_builder && mem_we_builder)
+      if (actual_write)
         tc_recorded_traces <= tc_recorded_traces + 1;
 
       if (lookup_valid_i)
         tc_lookup_requests <= tc_lookup_requests + 1;
-      if (lookup_valid_i && mem_req_builder)
+      if (lookup_valid_i && (dedup_check_fire || dedup_write_fire))
         tc_lookup_blocked_by_builder <= tc_lookup_blocked_by_builder + 1;
 
       if (lookup_valid_q) begin
@@ -590,6 +1092,14 @@ module trace_cache_top #(
 
     $display("[TC-BUILDER] recorded_traces=%0d lookup_requests=%0d blocked_by_builder=%0d",
              tc_recorded_traces, tc_lookup_requests, tc_lookup_blocked_by_builder);
+    $display("[TC-DEDUP] attempts=%0d skipped=%0d written=%0d skip_rate=%0d%%",
+             tc_dedup_attempts, tc_dedup_skipped,
+             tc_dedup_attempts - tc_dedup_skipped,
+             tc_dedup_attempts > 0 ? (tc_dedup_skipped * 100) / tc_dedup_attempts : 0);
+    $display("[TC-DEDUP] match_chosen_way=%0d match_other_way=%0d",
+             tc_dedup_match_chosen, tc_dedup_match_other);
+    $display("[TC-LRU] invalid_override=%0d wr_way0=%0d wr_way1=%0d (V77 skewed-index + prefer-invalid)",
+             tc_lru_invalid_override, tc_wr_way0, tc_wr_way1);
     $display("[TC-USEFUL] valid_lookups=%0d hits=%0d rate=%0d%%",
              tc_valid_lookups, tc_useful_hits, tc_useful_rate);
     $display("[TC-SPLIT-TAG] payload_mismatch=%0d (tag hit but payload slot was invalid)",
@@ -598,6 +1108,38 @@ module trace_cache_top #(
     $display("[TC-MISS-BREAKDOWN] total_misses=%0d empty=%0d pc_mismatch=%0d path_mismatch=%0d (why lookups missed)",
              tc_miss_total, tc_miss_empty, tc_miss_pc, tc_miss_path);
     `endif
+
+    // V73 commit churn analysis
+    $display("[TC-CHURN] ========== Commit Churn Analysis ==========");
+    $display("[TC-CHURN] total_commits=%0d into_invalid=%0d replace_valid=%0d",
+             tc_recorded_traces, cmt_into_invalid, cmt_replace_valid);
+    $display("[TC-CHURN] replace_same_sig=%0d (exact re-recording / waste)",
+             cmt_replace_same_sig);
+    $display("[TC-CHURN] replace_same_pc_diff_path=%0d (path diversity or ping-pong)",
+             cmt_replace_same_pc_diff_path);
+    $display("[TC-CHURN] replace_diff_pc=%0d (capacity/alias eviction)",
+             cmt_replace_diff_pc);
+    $display("[TC-CHURN] other_way_dup_sig=%0d (both ways hold same trace = BUG)",
+             cmt_other_way_same_sig);
+    $display("[TC-CHURN] other_way_same_pc=%0d (both ways hold same PC diff path = diversity)",
+             cmt_other_way_same_pc);
+    $display("[TC-CHURN] len_hist: len2=%0d len3=%0d len4=%0d",
+             cmt_len_hist[2], cmt_len_hist[3], cmt_len_hist[4]);
+    $display("[TC-CHURN] ==========================================");
+
+    // V76 PC-mismatch analysis summary
+    $display("[TC-PCMISS] ========== PC Mismatch Analysis ==========");
+    $display("[TC-PCMISS] total=%0d  1_valid_way=%0d  2_valid_ways=%0d",
+             pcm_event_count, pcm_1valid, pcm_2valid);
+    $display("[TC-PCMISS] unique_sets=%0d unique_lookup_pcs=%0d unique_stored_pcs=%0d",
+             pcm_set_hist.num(), pcm_lookup_pc_hist.num(), pcm_stored_pc_hist.num());
+    $display("[TC-PCMISS] --- Top hot sets ---");
+    pcm_print_top_n("hot_set", pcm_set_hist, PC_MISS_TOP_N);
+    $display("[TC-PCMISS] --- Top lookup PCs ---");
+    pcm_print_top_n("lookup_pc", pcm_lookup_pc_hist, PC_MISS_TOP_N);
+    $display("[TC-PCMISS] --- Top stored base_PCs ---");
+    pcm_print_top_n("stored_pc", pcm_stored_pc_hist, PC_MISS_TOP_N);
+    $display("[TC-PCMISS] ==========================================");
   end
 `endif
 

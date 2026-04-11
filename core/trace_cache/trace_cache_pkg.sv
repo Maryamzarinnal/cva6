@@ -133,12 +133,25 @@ package trace_cache_pkg;
   // SRAM can be read in parallel with the I$ request (before branch
   // predictions are available).  The 2-way associativity handles the
   // slightly higher set pressure from collapsing branch variants.
+  // V77: Way-0 hash (H0) ? original XOR-fold of pc[11:4]^pc[19:12]^pc[27:20].
   function automatic logic [TRACE_ADDRW-1:0] tc_index(
     input logic [PC_WIDTH-1:0] pc
   );
     tc_index = pc[TRACE_ADDRW+3:4]
              ^ pc[2*TRACE_ADDRW+3:TRACE_ADDRW+4]
              ^ pc[3*TRACE_ADDRW+3:2*TRACE_ADDRW+4];
+  endfunction
+
+  // V77: Way-1 hash (H1) ? shifted 3 bits down: pc[8:1]^pc[16:9]^pc[24:17].
+  // Includes bits[3:1] (ignored by H0) so PCs within the same 16B block
+  // that collide in H0 map to different H1 sets.  Different high-byte
+  // alignment also breaks cross-region collisions.
+  function automatic logic [TRACE_ADDRW-1:0] tc_index_w1(
+    input logic [PC_WIDTH-1:0] pc
+  );
+    tc_index_w1 = pc[TRACE_ADDRW:1]
+                ^ pc[2*TRACE_ADDRW:TRACE_ADDRW+1]
+                ^ pc[3*TRACE_ADDRW:2*TRACE_ADDRW+1];
   endfunction
 
 endpackage : trace_cache_pkg
