@@ -921,6 +921,7 @@ module frontend
   // V71: Branch predictions for TC tag matching ? computed from the live
   // instruction scan (tc_valid_mask), NOT from instr_queue_consumed.
   // -----------------------------------------------------------------------
+  logic tc_window_has_taken_pred; // V79: true when ?1 branch is predicted-taken
   always_comb begin
     integer br_idx;
     automatic logic seen_taken;
@@ -954,6 +955,7 @@ module frontend
         br_idx++;
       end
     end
+    tc_window_has_taken_pred = seen_taken;  // V79
   end
 
   // -----------------------------------------------------------------------
@@ -972,6 +974,13 @@ module frontend
   assign tc_lookup_valid = icache_dreq_i.valid && !flush_i && tc_window_eligible;
   assign tc_lookup_pc    = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, icache_dreq_i.vaddr};
 
+  // V77: 1-cycle delayed lookup PC (aligned with tc_lookup_result_valid)
+  logic [CVA6Cfg.VLEN-1:0] tc_lookup_pc_q;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) tc_lookup_pc_q <= '0;
+    else         tc_lookup_pc_q <= icache_dreq_i.vaddr;
+  end
+
   trace_cache_top #(
       .MaxTraceInstr(MAX_TRACE_INSTR)
   ) i_trace_cache_top (
@@ -989,6 +998,7 @@ module frontend
       .instr_queue_consumed_i         (tc_builder_enable ? instr_queue_consumed : '0),
       .branch_predictions_i           (tc_branch_predictions),
       .lookup_num_branches_i          (tc_lookup_num_branches),
+      .window_has_taken_pred_i        (tc_window_has_taken_pred),
       .resolved_branch_valid_i        (resolved_branch_i.valid),
       .resolved_branch_pc_i           (resolved_branch_i.pc),
       .resolved_branch_is_taken_i     (resolved_branch_i.is_taken),
@@ -1165,6 +1175,19 @@ module frontend
   int unsigned tc_dbg_pending_use_q;
   int unsigned tc_dbg_pending_invalidate_q;
 
+  // V77 Hot-PC frontend tracker: hit/miss/policy for top mismatch PCs
+  localparam logic [CVA6Cfg.VLEN-1:0] FE_HP0 = CVA6Cfg.VLEN'(64'h80002880);
+  localparam logic [CVA6Cfg.VLEN-1:0] FE_HP1 = CVA6Cfg.VLEN'(64'h8000287a);
+  localparam logic [CVA6Cfg.VLEN-1:0] FE_HP2 = CVA6Cfg.VLEN'(64'h80002888);
+  localparam logic [CVA6Cfg.VLEN-1:0] FE_HP3 = CVA6Cfg.VLEN'(64'h8000287e);
+  int unsigned fe_hp_lookup [4];    // lookup fired for this PC
+  int unsigned fe_hp_hit    [4];    // trace hit for this PC
+  int unsigned fe_hp_accept [4];    // hit + policy_ok + accepted
+  int unsigned fe_hp_reject_policy [4]; // hit but policy rejected
+  int unsigned fe_hp_miss_pc [4];   // miss: pc mismatch
+  int unsigned fe_hp_miss_empty [4]; // miss: set empty
+  int unsigned fe_hp_miss_path [4]; // miss: path mismatch
+
   // -----------------------------------------------------------------------
   // V72: ROI (Region of Interest) measurement
   // The ROI is activated by the first committed instruction in the
@@ -1265,6 +1288,11 @@ module frontend
       tc_dbg_pending_capture_q <= 0;
       tc_dbg_pending_use_q <= 0;
       tc_dbg_pending_invalidate_q <= 0;
+      for (int i = 0; i < 4; i++) begin
+        fe_hp_lookup[i] <= 0; fe_hp_hit[i] <= 0; fe_hp_accept[i] <= 0;
+        fe_hp_reject_policy[i] <= 0; fe_hp_miss_pc[i] <= 0;
+        fe_hp_miss_empty[i] <= 0; fe_hp_miss_path[i] <= 0;
+      end
       roi_active_q <= 1'b0;
       roi_cycle_count_q <= 0;
       roi_instr_count_q <= 0;
@@ -1329,6 +1357,31 @@ module frontend
             if (tc_miss_reason_empty) tc_dbg_miss_empty_q <= tc_dbg_miss_empty_q + 1;
             if (tc_miss_reason_pc)    tc_dbg_miss_pc_q    <= tc_dbg_miss_pc_q + 1;
             if (tc_miss_reason_path)  tc_dbg_miss_path_q  <= tc_dbg_miss_path_q + 1;
+          end
+        end
+
+        // V77 Hot-PC per-lookup classification
+        for (int i = 0; i < 4; i++) begin
+          logic [CVA6Cfg.VLEN-1:0] hp;
+          case (i)
+            0: hp = FE_HP0;
+            1: hp = FE_HP1;
+            2: hp = FE_HP2;
+            3: hp = FE_HP3;
+          endcase
+          if (tc_lookup_pc_q == hp) begin
+            fe_hp_lookup[i] <= fe_hp_lookup[i] + 1;
+            if (tc_trace_hit) begin
+              fe_hp_hit[i] <= fe_hp_hit[i] + 1;
+              if (tc_trace_policy_ok && !tc_trace_used)
+                fe_hp_accept[i] <= fe_hp_accept[i] + 1;
+              if (!tc_trace_policy_ok)
+                fe_hp_reject_policy[i] <= fe_hp_reject_policy[i] + 1;
+            end else begin
+              if (tc_miss_reason_empty) fe_hp_miss_empty[i] <= fe_hp_miss_empty[i] + 1;
+              if (tc_miss_reason_pc)    fe_hp_miss_pc[i]    <= fe_hp_miss_pc[i] + 1;
+              if (tc_miss_reason_path)  fe_hp_miss_path[i]  <= fe_hp_miss_path[i] + 1;
+            end
           end
         end
       end
@@ -1726,6 +1779,22 @@ module frontend
                roi_tc_miss_empty_q, roi_tc_miss_pc_q, roi_tc_miss_path_q);
       $display("[TC-ROI] ====================================");
     end
+
+    // V77 Hot-PC frontend summary
+    $display("[TC-HOTPC-FE] ========== Hot PC Frontend Lifecycle ==========");
+    $display("[TC-HOTPC-FE] HP0(0x80002880): lookup=%0d hit=%0d accept=%0d rej_policy=%0d miss_empty=%0d miss_pc=%0d miss_path=%0d",
+             fe_hp_lookup[0], fe_hp_hit[0], fe_hp_accept[0], fe_hp_reject_policy[0],
+             fe_hp_miss_empty[0], fe_hp_miss_pc[0], fe_hp_miss_path[0]);
+    $display("[TC-HOTPC-FE] HP1(0x8000287a): lookup=%0d hit=%0d accept=%0d rej_policy=%0d miss_empty=%0d miss_pc=%0d miss_path=%0d",
+             fe_hp_lookup[1], fe_hp_hit[1], fe_hp_accept[1], fe_hp_reject_policy[1],
+             fe_hp_miss_empty[1], fe_hp_miss_pc[1], fe_hp_miss_path[1]);
+    $display("[TC-HOTPC-FE] HP2(0x80002888): lookup=%0d hit=%0d accept=%0d rej_policy=%0d miss_empty=%0d miss_pc=%0d miss_path=%0d",
+             fe_hp_lookup[2], fe_hp_hit[2], fe_hp_accept[2], fe_hp_reject_policy[2],
+             fe_hp_miss_empty[2], fe_hp_miss_pc[2], fe_hp_miss_path[2]);
+    $display("[TC-HOTPC-FE] HP3(0x8000287e): lookup=%0d hit=%0d accept=%0d rej_policy=%0d miss_empty=%0d miss_pc=%0d miss_path=%0d",
+             fe_hp_lookup[3], fe_hp_hit[3], fe_hp_accept[3], fe_hp_reject_policy[3],
+             fe_hp_miss_empty[3], fe_hp_miss_pc[3], fe_hp_miss_path[3]);
+    $display("[TC-HOTPC-FE] ================================================");
   end
 // pragma translate_on
 

@@ -28,6 +28,7 @@ module trace_cache_top #(
 
   input  logic [CHUNKS_PER_TRACE-1:0] branch_predictions_i,
   input  logic [BR_CNT_WIDTH-1:0]     lookup_num_branches_i,
+  input  logic                        window_has_taken_pred_i, // V79: >=1 predicted-taken CF in this window
 
   // Resolved branch (from backend): correct-path outcomes to store as path tag, matching Rotenberg fill-at-retire semantics
   input  logic                         resolved_branch_valid_i,
@@ -160,6 +161,15 @@ module trace_cache_top #(
   logic [PC_WIDTH-1:0]         lookup_pc_q;
   logic [TRACE_ADDRW-1:0]      lookup_set_q;
 
+  // V79: combined eligibility ? lookup result is only meaningful when:
+  //  (a) not serving an unaligned straddling instruction (V78), AND
+  //  (b) the window has at least one predicted-taken CF (V79).
+  // Without (b) no stored trace can match: every stored trace has ?1
+  // taken branch, so a tk0-window always produces path_mismatch or
+  // pc_mismatch.  Suppressing these avoids SRAM-bandwidth waste in
+  // the counters and eliminates ~55% of spurious miss events.
+  logic lookup_eligible;
+
   // -----------------------------------------------------------------------
   // V74 DEDUP GUARD: 2-phase commit pipeline.
   //
@@ -204,6 +214,7 @@ module trace_cache_top #(
 
   assign lookup_fire           = lookup_valid_i && !dedup_check_fire && !dedup_write_fire;
   assign lookup_result_valid_o = lookup_valid_q;
+  assign lookup_eligible       = lookup_valid_q && !serving_unaligned_i && window_has_taken_pred_i;
 
   // IMPORTANT: exact trace-start PC, not a 16-byte aligned block base.
   logic [PC_WIDTH-1:0] lookup_base;
@@ -430,7 +441,16 @@ module trace_cache_top #(
   logic [NUM_WAYS-1:0] raw_way_hit;
   always_comb begin
     for (int w = 0; w < NUM_WAYS; w++) begin
-      raw_way_hit[w] = tag_hit_raw[w] & lookup_valid_q;
+      // V78: suppress lookup result when serving an unaligned instruction
+      // that straddles two 16B fetch blocks.  In the straddle cycle the I$
+      // returns the aligned block-base address (e.g. 0x80002880), so
+      // tc_lookup_pc / lookup_pc_q = that block base.  But instr_realign
+      // sets addr[0] = the unaligned instruction PC (e.g. 0x8000287e) ?
+      // which is what the builder uses for accum_base_pc.  The SRAM was
+      // indexed with H0/H1 of the block base, which is a different set than
+      // what a stored trace at addr[0] occupies.  The result is always wrong;
+      // suppress it (miss) rather than signalling a false pc_mismatch.
+      raw_way_hit[w] = tag_hit_raw[w] & lookup_eligible;
       way_hit[w]     = raw_way_hit[w];  // V68: no used_q filter; frontend rehit-block handles replay guards
     end
   end
@@ -452,9 +472,9 @@ module trace_cache_top #(
     end
   end
 
-  assign miss_reason_empty_o = lookup_valid_q && !trace_hit && !any_valid_in_set;
-  assign miss_reason_pc_o    = lookup_valid_q && !trace_hit &&  any_valid_in_set && !any_pc_match_in_set;
-  assign miss_reason_path_o  = lookup_valid_q && !trace_hit &&  any_valid_in_set &&  any_pc_match_in_set;
+  assign miss_reason_empty_o = lookup_eligible && !trace_hit && !any_valid_in_set;
+  assign miss_reason_pc_o    = lookup_eligible && !trace_hit &&  any_valid_in_set && !any_pc_match_in_set;
+  assign miss_reason_path_o  = lookup_eligible && !trace_hit &&  any_valid_in_set &&  any_pc_match_in_set;
 
   logic [$clog2(NUM_WAYS)-1:0] raw_hit_way_idx;
   logic [$clog2(NUM_WAYS)-1:0] hit_way_idx;
@@ -623,7 +643,7 @@ module trace_cache_top #(
       tc_miss_pc    <= 0;
       tc_miss_path  <= 0;
       tc_miss_total <= 0;
-    end else if (lookup_valid_q && !trace_hit) begin
+    end else if (lookup_eligible && !trace_hit) begin
       tc_miss_total <= tc_miss_total + 1;
       if (!any_valid_in_set)
         tc_miss_empty <= tc_miss_empty + 1;
@@ -670,7 +690,7 @@ module trace_cache_top #(
       pcm_event_count <= 0;
       pcm_1valid      <= 0;
       pcm_2valid      <= 0;
-    end else if (lookup_valid_q && !trace_hit && any_valid_in_set && !any_pc_match_in_set) begin
+    end else if (lookup_eligible && !trace_hit && any_valid_in_set && !any_pc_match_in_set) begin
       // This is a pc_mismatch event
       pcm_event_count <= pcm_event_count + 1;
 
@@ -792,6 +812,8 @@ module trace_cache_top #(
   int unsigned tc_lookup_requests;
   int unsigned tc_lookup_blocked_by_builder;
   int unsigned tc_tag_payload_mismatch;
+  int unsigned tc_unaligned_suppressed; // V78: lookups suppressed due to serving_unaligned
+  int unsigned tc_no_taken_suppressed;  // V79: lookups suppressed due to no predicted-taken CF
 
   // -----------------------------------------------------------------------
   // V73 COMMIT DEBUG: Shadow tag/data arrays + churn analysis counters.
@@ -1049,6 +1071,51 @@ module trace_cache_top #(
     end
   end
 
+  // -----------------------------------------------------------------------
+  // V77 Hot-PC dedup/write tracker: monitors the lifecycle of the top
+  // mismatch PCs through the dedup pipeline.
+  // -----------------------------------------------------------------------
+  localparam logic [PC_WIDTH-1:0] HP0 = 64'h80002880;
+  localparam logic [PC_WIDTH-1:0] HP1 = 64'h8000287a;
+  localparam logic [PC_WIDTH-1:0] HP2 = 64'h80002888;
+  localparam logic [PC_WIDTH-1:0] HP3 = 64'h8000287e;
+
+  int unsigned hp_dedup_attempt [4];   // entered dedup pipeline
+  int unsigned hp_dedup_skip    [4];   // suppressed by dedup guard
+  int unsigned hp_dedup_write   [4];   // actually written to SRAM
+  logic [PC_WIDTH-1:0] hp_list [4];
+
+  initial begin
+    hp_list[0] = HP0; hp_list[1] = HP1; hp_list[2] = HP2; hp_list[3] = HP3;
+  end
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      for (int i = 0; i < 4; i++) begin
+        hp_dedup_attempt[i] <= 0;
+        hp_dedup_skip[i]    <= 0;
+        hp_dedup_write[i]   <= 0;
+      end
+    end else begin
+      for (int i = 0; i < 4; i++) begin
+        if (dedup_check_fire && mem_tag_final.base_pc == hp_list[i])
+          hp_dedup_attempt[i] <= hp_dedup_attempt[i] + 1;
+        if (dedup_suppress_fire && dedup_tag_q.base_pc == hp_list[i]) begin
+          hp_dedup_skip[i] <= hp_dedup_skip[i] + 1;
+          if (hp_dedup_skip[i] < 5)
+            $display("[TC-HOTPC] t=%0t DEDUP_SKIP base_pc=0x%h way_match=%b (HP%0d)",
+                     $time, dedup_tag_q.base_pc[31:0], dedup_way_match, i);
+        end
+        if (actual_write && dedup_tag_q.base_pc == hp_list[i]) begin
+          hp_dedup_write[i] <= hp_dedup_write[i] + 1;
+          $display("[TC-HOTPC] t=%0t DEDUP_WRITE base_pc=0x%h way=%0d set_h0=%0d set_h1=%0d (HP%0d)",
+                   $time, dedup_tag_q.base_pc[31:0], final_wr_way,
+                   dedup_addr_q, dedup_addr_w1_q, i);
+        end
+      end
+    end
+  end
+
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       tc_valid_lookups <= 0;
@@ -1057,6 +1124,8 @@ module trace_cache_top #(
       tc_lookup_requests <= 0;
       tc_lookup_blocked_by_builder <= 0;
       tc_tag_payload_mismatch <= 0;
+      tc_unaligned_suppressed <= 0;
+      tc_no_taken_suppressed <= 0;
     end else begin
       if (actual_write)
         tc_recorded_traces <= tc_recorded_traces + 1;
@@ -1066,7 +1135,14 @@ module trace_cache_top #(
       if (lookup_valid_i && (dedup_check_fire || dedup_write_fire))
         tc_lookup_blocked_by_builder <= tc_lookup_blocked_by_builder + 1;
 
-      if (lookup_valid_q) begin
+      // V78: count suppressed unaligned-window lookups separately
+      // V79: also count suppressed no-taken-pred lookups
+      if (lookup_valid_q && serving_unaligned_i)
+        tc_unaligned_suppressed <= tc_unaligned_suppressed + 1;
+      else if (lookup_valid_q && !window_has_taken_pred_i)
+        tc_no_taken_suppressed <= tc_no_taken_suppressed + 1;
+
+      if (lookup_eligible) begin
         logic any_valid;
         any_valid = 1'b0;
         for (int w = 0; w < NUM_WAYS; w++)
@@ -1098,10 +1174,19 @@ module trace_cache_top #(
              tc_dedup_attempts > 0 ? (tc_dedup_skipped * 100) / tc_dedup_attempts : 0);
     $display("[TC-DEDUP] match_chosen_way=%0d match_other_way=%0d",
              tc_dedup_match_chosen, tc_dedup_match_other);
+
+    // V77 Hot-PC lifecycle summary
+    $display("[TC-HOTPC-DEDUP] ========== Hot PC Dedup Lifecycle ==========");
+    for (int i = 0; i < 4; i++)
+      $display("[TC-HOTPC-DEDUP] HP%0d (0x%h): attempt=%0d skip=%0d write=%0d",
+               i, hp_list[i][31:0], hp_dedup_attempt[i], hp_dedup_skip[i], hp_dedup_write[i]);
+    $display("[TC-HOTPC-DEDUP] ===========================================");
     $display("[TC-LRU] invalid_override=%0d wr_way0=%0d wr_way1=%0d (V77 skewed-index + prefer-invalid)",
              tc_lru_invalid_override, tc_wr_way0, tc_wr_way1);
     $display("[TC-USEFUL] valid_lookups=%0d hits=%0d rate=%0d%%",
              tc_valid_lookups, tc_useful_hits, tc_useful_rate);
+    $display("[TC-USEFUL] unaligned_suppressed=%0d no_taken_suppressed=%0d (V78+V79)",
+             tc_unaligned_suppressed, tc_no_taken_suppressed);
     $display("[TC-SPLIT-TAG] payload_mismatch=%0d (tag hit but payload slot was invalid)",
              tc_tag_payload_mismatch);
     `ifdef MODEL_TECH
