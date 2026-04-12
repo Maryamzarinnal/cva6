@@ -57,6 +57,7 @@ package trace_cache_pkg;
     logic [PC_WIDTH-1:0]                        base_pc;
     logic [TRIGGER_BRANCH_CNT_WIDTH-1:0]        num_branches;
     logic [TRIGGER_BRANCH_BITS-1:0]             branch_flags;
+    logic [GHR_WIDTH-1:0]                       ghr;  // V82: path history for misprediction recovery
   } trace_tag_t;
 
   typedef struct packed {
@@ -93,7 +94,8 @@ package trace_cache_pkg;
   function automatic trace_tag_t make_trace_tag(
     input logic [PC_WIDTH-1:0]                 base_pc_i,
     input logic [TRIGGER_BRANCH_CNT_WIDTH-1:0] num_branches_i,
-    input logic [TRIGGER_BRANCH_BITS-1:0]      branch_flags_i
+    input logic [TRIGGER_BRANCH_BITS-1:0]      branch_flags_i,
+    input logic [GHR_WIDTH-1:0]                ghr_i  // V82: path history
   );
     trace_tag_t tag;
     begin
@@ -101,6 +103,7 @@ package trace_cache_pkg;
       tag.base_pc      = base_pc_i;
       tag.num_branches = num_branches_i;
       tag.branch_flags = branch_flags_i;
+      tag.ghr          = ghr_i;  // V82
       make_trace_tag   = tag;
     end
   endfunction
@@ -121,6 +124,7 @@ package trace_cache_pkg;
                         stored_tag_i.valid &&
                         (lookup_tag_i.base_pc      == stored_tag_i.base_pc) &&
                         (lookup_tag_i.num_branches == stored_tag_i.num_branches) &&
+                        (lookup_tag_i.ghr          == stored_tag_i.ghr) &&  // V82
                         flags_match;
     end
   endfunction
@@ -133,25 +137,28 @@ package trace_cache_pkg;
   // SRAM can be read in parallel with the I$ request (before branch
   // predictions are available).  The 2-way associativity handles the
   // slightly higher set pressure from collapsing branch variants.
-  // V77: Way-0 hash (H0) ? original XOR-fold of pc[11:4]^pc[19:12]^pc[27:20].
+  // V77: Way-0 hash (H0) ? XOR-fold of pc[11:4]^pc[19:12]^pc[27:20].
+  // V82: XOR with GHR for path-sensitive indexing.
   function automatic logic [TRACE_ADDRW-1:0] tc_index(
-    input logic [PC_WIDTH-1:0] pc
+    input logic [PC_WIDTH-1:0]  pc,
+    input logic [GHR_WIDTH-1:0] ghr  // V82
   );
     tc_index = pc[TRACE_ADDRW+3:4]
              ^ pc[2*TRACE_ADDRW+3:TRACE_ADDRW+4]
-             ^ pc[3*TRACE_ADDRW+3:2*TRACE_ADDRW+4];
+             ^ pc[3*TRACE_ADDRW+3:2*TRACE_ADDRW+4]
+             ^ ghr;  // V82: path-sensitive set mapping
   endfunction
 
   // V77: Way-1 hash (H1) ? shifted 3 bits down: pc[8:1]^pc[16:9]^pc[24:17].
-  // Includes bits[3:1] (ignored by H0) so PCs within the same 16B block
-  // that collide in H0 map to different H1 sets.  Different high-byte
-  // alignment also breaks cross-region collisions.
+  // V82: XOR with GHR for path-sensitive indexing.
   function automatic logic [TRACE_ADDRW-1:0] tc_index_w1(
-    input logic [PC_WIDTH-1:0] pc
+    input logic [PC_WIDTH-1:0]  pc,
+    input logic [GHR_WIDTH-1:0] ghr  // V82
   );
     tc_index_w1 = pc[TRACE_ADDRW:1]
                 ^ pc[2*TRACE_ADDRW:TRACE_ADDRW+1]
-                ^ pc[3*TRACE_ADDRW:2*TRACE_ADDRW+1];
+                ^ pc[3*TRACE_ADDRW:2*TRACE_ADDRW+1]
+                ^ ghr;  // V82: path-sensitive set mapping
   endfunction
 
 endpackage : trace_cache_pkg

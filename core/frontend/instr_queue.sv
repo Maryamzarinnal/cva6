@@ -43,6 +43,7 @@ module instr_queue
     input logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] predict_address_i,
     input logic [BRANCH_FLAGS_W-1:0] branch_flags_i,
     input ariane_pkg::cf_t [CVA6Cfg.INSTR_PER_FETCH-1:0] cf_type_i,
+    input logic [7:0] tc_ghr_i,  // V81: GHR snapshot for pipeline propagation
     // Trace cache: bypass branch_mask so multiple CFs pass through
     input logic tc_feeding_i,
     input logic tc_suppress_port1_i,
@@ -57,7 +58,8 @@ module instr_queue
 
   localparam NID = CVA6Cfg.SuperscalarEn ? 1 : 0;
   localparam int unsigned ADDR_FIFO_FLAGS_W = BRANCH_FLAGS_W;
-  localparam int unsigned ADDR_FIFO_W = CVA6Cfg.VLEN + ADDR_FIFO_FLAGS_W;
+  localparam int unsigned GHR_W = 8;  // V81: GHR width in addr FIFO
+  localparam int unsigned ADDR_FIFO_W = CVA6Cfg.VLEN + ADDR_FIFO_FLAGS_W + GHR_W;
 
   typedef struct packed {
     logic [CVA6Cfg.VLEN-1:0]         pc;    // instruction's own PC (stored, not computed)
@@ -83,6 +85,7 @@ module instr_queue
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] addr_data_out;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][ADDR_FIFO_W-1:0]  addr_fifo_raw_out;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][BRANCH_FLAGS_W-1:0] addr_fifo_flags_out;
+  logic [CVA6Cfg.INSTR_PER_FETCH-1:0][GHR_W-1:0]          addr_fifo_ghr_out;  // V81
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] empty_addr;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] push_addr, pop_addr;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] full_addr;
@@ -302,6 +305,7 @@ module instr_queue
         fetch_entry_o[i].ex.tinst = '0;
         fetch_entry_o[i].branch_predict.predict_address = '0;
         fetch_entry_o[i].branch_predict.cf = ariane_pkg::NoCF;
+        fetch_entry_o[i].branch_predict.tc_ghr = '0;  // V81
       end
       for (int unsigned i = 0; i < CVA6Cfg.INSTR_PER_FETCH; i++) begin
         if (idx_ds[0][i]) begin
@@ -327,6 +331,8 @@ module instr_queue
           fetch_entry_o[0].branch_predict.cf = instr_data_out[i].cf;
           fetch_entry_o[0].branch_predict.predict_address =
               (instr_data_out[i].cf != ariane_pkg::NoCF) ? addr_data_out[i] : '0;
+          fetch_entry_o[0].branch_predict.tc_ghr =
+              (instr_data_out[i].cf != ariane_pkg::NoCF) ? addr_fifo_ghr_out[i] : '0;  // V81
           pop_instr[i] = fetch_entry_fire[0];
           pop_addr[i]  = fetch_entry_fire[0] & (instr_data_out[i].cf != ariane_pkg::NoCF);
         end
@@ -344,6 +350,8 @@ module instr_queue
             fetch_entry_o[NID].branch_predict.cf = instr_data_out[i].cf;
             fetch_entry_o[NID].branch_predict.predict_address =
                 (instr_data_out[i].cf != ariane_pkg::NoCF) ? addr_data_out[i] : '0;
+            fetch_entry_o[NID].branch_predict.tc_ghr =
+                (instr_data_out[i].cf != ariane_pkg::NoCF) ? addr_fifo_ghr_out[i] : '0;  // V81
             pop_instr[i] = fetch_entry_fire[NID];
             pop_addr[i]  = fetch_entry_fire[NID] & (instr_data_out[i].cf != ariane_pkg::NoCF);
           end
@@ -384,6 +392,8 @@ module instr_queue
       end
       fetch_entry_o[0].branch_predict.predict_address =
           (instr_data_out[0].cf != ariane_pkg::NoCF) ? addr_data_out[0] : '0;
+      fetch_entry_o[0].branch_predict.tc_ghr =
+          (instr_data_out[0].cf != ariane_pkg::NoCF) ? addr_fifo_ghr_out[0] : '0;  // V81
       fetch_entry_o[0].branch_predict.cf = instr_data_out[0].cf;
       pop_instr[0] = fetch_entry_valid_o[0] & fetch_entry_ready_i[0];
       pop_addr[0]  = pop_instr[0] & (instr_data_out[0].cf != ariane_pkg::NoCF);
@@ -466,7 +476,8 @@ module instr_queue
         .empty_o(empty_addr[i]),
         .usage_o(),
         /* verilator lint_off WIDTH */
-        .data_i ({branch_flags_i,
+        .data_i ({tc_ghr_i,
+                  branch_flags_i,
                   CVA6Cfg.RVC ? pred_addr_dup[CVA6Cfg.INSTR_PER_FETCH+i-idx_is_q]
                               : predict_address_i[0]}),
         /* verilator lint_on WIDTH */
@@ -475,9 +486,10 @@ module instr_queue
         .pop_i  (pop_addr[i])
     );
 
-    // Split the wide FIFO output back into address + flags
-    assign addr_data_out[i]      = addr_fifo_raw_out[i][CVA6Cfg.VLEN-1:0];
-    assign addr_fifo_flags_out[i] = addr_fifo_raw_out[i][ADDR_FIFO_W-1:CVA6Cfg.VLEN];
+    // Split the wide FIFO output back into address + flags + GHR
+    assign addr_data_out[i]       = addr_fifo_raw_out[i][CVA6Cfg.VLEN-1:0];
+    assign addr_fifo_flags_out[i] = addr_fifo_raw_out[i][CVA6Cfg.VLEN+ADDR_FIFO_FLAGS_W-1:CVA6Cfg.VLEN];
+    assign addr_fifo_ghr_out[i]   = addr_fifo_raw_out[i][ADDR_FIFO_W-1:CVA6Cfg.VLEN+ADDR_FIFO_FLAGS_W];  // V81
   end
 
   // V69: branch_flags_o is extracted from the per-slot flags of the first CF

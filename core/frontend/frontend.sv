@@ -157,6 +157,8 @@ module frontend
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]                   valid_to_iq;
   cf_t  [CVA6Cfg.INSTR_PER_FETCH-1:0]                   cf_type_to_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] predict_addr_to_iq;
+  logic [7:0]                                           tc_ghr_from_tc;        // V81: current GHR from trace cache
+  logic [7:0]                                           tc_ghr_to_iq;          // V81: GHR snapshot for pipeline propagation
   ariane_pkg::frontend_exception_t                      exception_to_iq;
   logic [CVA6Cfg.VLEN-1:0]                              exception_addr_to_iq;
   logic [CVA6Cfg.GPLEN-1:0]                             exception_gpaddr_to_iq;
@@ -554,6 +556,9 @@ module frontend
     assign predict_addr_to_iq[gi] = tc_hit_this_cycle ? tc_feed_predict_addr[gi] : predict_address;
   end
 
+  // V81: GHR snapshot ? same for all slots in the window
+  assign tc_ghr_to_iq = tc_ghr_from_tc;
+
   // During TC hit, supply the trace's own branch outcomes as branch_flags.
   assign branch_flags_to_iq = tc_hit_this_cycle ?
       tc_feed_src_branch_flags[CHUNKS_PER_TRACE-1:0] : tc_branch_predictions;
@@ -825,6 +830,7 @@ module frontend
       .predict_address_i  (predict_addr_to_iq),
       .branch_flags_i     (branch_flags_to_iq),
       .cf_type_i          (cf_type_to_iq),
+      .tc_ghr_i           (tc_ghr_to_iq),
       .valid_i            (valid_to_iq),
       .consumed_o         (instr_queue_consumed),
       .ready_o            (instr_queue_ready),
@@ -1003,6 +1009,8 @@ module frontend
       .resolved_branch_pc_i           (resolved_branch_i.pc),
       .resolved_branch_is_taken_i     (resolved_branch_i.is_taken),
       .resolved_branch_is_mispredict_i(resolved_branch_i.is_mispredict),
+      .resolved_branch_ghr_i          (resolved_branch_i.tc_ghr),
+      .ghr_o                          (tc_ghr_from_tc),
       .lookup_valid_i                 (tc_lookup_valid),
       .lookup_pc_i                    (tc_lookup_pc),
       .trace_hit_o                    (tc_trace_hit),

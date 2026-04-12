@@ -89,6 +89,7 @@ module trace_builder #(
   logic [PC_WIDTH-1:0]                     accum_taken_target_q;
   logic [CHUNK_PTR_W-1:0]                  accum_chunk_ptr_q;
   logic [INSTR_CNT_W-1:0]                  accum_instr_cnt_q;
+  logic [GHR_WIDTH-1:0]                    accum_ghr_q;  // V82: GHR snapshot at trace start
 
   // Next-state wires (set by always_comb, consumed by always_ff).
   logic [PC_WIDTH-1:0]                     accum_base_pc_nxt;
@@ -154,6 +155,7 @@ module trace_builder #(
       accum_taken_target_q <= '0;
       accum_chunk_ptr_q    <= '0;
       accum_instr_cnt_q    <= '0;
+      accum_ghr_q          <= '0;  // V82
     end else if (flush_i || (state_d == TB_IDLE && state_q != TB_IDLE)) begin
       accum_base_pc_q      <= '0;
       accum_trig_flags_q   <= '0;
@@ -165,6 +167,7 @@ module trace_builder #(
       accum_taken_target_q <= '0;
       accum_chunk_ptr_q    <= '0;
       accum_instr_cnt_q    <= '0;
+      accum_ghr_q          <= '0;  // V82
     end else if (state_d == TB_FILL && state_q == TB_IDLE) begin
       accum_base_pc_q      <= accum_base_pc_nxt;
       accum_trig_flags_q   <= accum_trig_flags_nxt;
@@ -176,6 +179,7 @@ module trace_builder #(
       accum_taken_target_q <= accum_taken_target_nxt;
       accum_chunk_ptr_q    <= accum_chunk_ptr_nxt;
       accum_instr_cnt_q    <= accum_instr_cnt_nxt;
+      accum_ghr_q          <= ghr_i;  // V82: capture GHR at trace start
     end
   end
 
@@ -392,12 +396,13 @@ module trace_builder #(
               payload.lookup_branch_flags = w_br_flags;
               payload.lookup_num_branches = w_num_br;
 
-              cand_addr = tc_index(accum_base_pc_q);
+              cand_addr = tc_index(accum_base_pc_q, accum_ghr_q);  // V82: GHR in index
 
               commit_addr_d  = cand_addr;
               commit_tag_d   = make_trace_tag(accum_base_pc_q,
                                               accum_trig_cnt_q,
-                                              accum_trig_flags_q);
+                                              accum_trig_flags_q,
+                                              accum_ghr_q);  // V82: GHR in tag
               commit_valid_d = 1'b1;
               commit_data_d  = payload;
             end
@@ -415,19 +420,56 @@ module trace_builder #(
   longint unsigned dbg_commit_q;
   longint unsigned dbg_fill_start_q;
 
+  // V77 hot-PC tracker: monitor builder activity for the top mismatch PCs
+  localparam logic [PC_WIDTH-1:0] HOT_PC_0 = 64'h80002880;
+  localparam logic [PC_WIDTH-1:0] HOT_PC_1 = 64'h8000287a;
+  localparam logic [PC_WIDTH-1:0] HOT_PC_2 = 64'h80002888;  // stored neighbour
+  localparam logic [PC_WIDTH-1:0] HOT_PC_3 = 64'h8000287e;  // stored neighbour
+
+  int unsigned dbg_fill_hot0, dbg_fill_hot1, dbg_fill_hot2, dbg_fill_hot3;
+  int unsigned dbg_commit_hot0, dbg_commit_hot1, dbg_commit_hot2, dbg_commit_hot3;
+
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       dbg_commit_q     <= 0;
       dbg_fill_start_q <= 0;
+      dbg_fill_hot0 <= 0; dbg_fill_hot1 <= 0; dbg_fill_hot2 <= 0; dbg_fill_hot3 <= 0;
+      dbg_commit_hot0 <= 0; dbg_commit_hot1 <= 0; dbg_commit_hot2 <= 0; dbg_commit_hot3 <= 0;
     end else begin
       if (commit_valid_d)                              dbg_commit_q     <= dbg_commit_q + 1;
-      if (state_d == TB_FILL && state_q == TB_IDLE)    dbg_fill_start_q <= dbg_fill_start_q + 1;
+      if (state_d == TB_FILL && state_q == TB_IDLE) begin
+        dbg_fill_start_q <= dbg_fill_start_q + 1;
+        if (accum_base_pc_nxt == HOT_PC_0) begin dbg_fill_hot0 <= dbg_fill_hot0 + 1;
+          $display("[TC-HOTPC] t=%0t FILL_START base_pc=0x%h (HOT0)", $time, accum_base_pc_nxt[31:0]); end
+        if (accum_base_pc_nxt == HOT_PC_1) begin dbg_fill_hot1 <= dbg_fill_hot1 + 1;
+          $display("[TC-HOTPC] t=%0t FILL_START base_pc=0x%h (HOT1)", $time, accum_base_pc_nxt[31:0]); end
+        if (accum_base_pc_nxt == HOT_PC_2) begin dbg_fill_hot2 <= dbg_fill_hot2 + 1;
+          $display("[TC-HOTPC] t=%0t FILL_START base_pc=0x%h (HOT2)", $time, accum_base_pc_nxt[31:0]); end
+        if (accum_base_pc_nxt == HOT_PC_3) begin dbg_fill_hot3 <= dbg_fill_hot3 + 1;
+          $display("[TC-HOTPC] t=%0t FILL_START base_pc=0x%h (HOT3)", $time, accum_base_pc_nxt[31:0]); end
+      end
+      if (commit_valid_d) begin
+        if (accum_base_pc_q == HOT_PC_0) begin dbg_commit_hot0 <= dbg_commit_hot0 + 1;
+          $display("[TC-HOTPC] t=%0t COMMIT base_pc=0x%h nbr=%0d bflags=%b (HOT0)", $time, accum_base_pc_q[31:0], accum_trig_cnt_q, accum_trig_flags_q); end
+        if (accum_base_pc_q == HOT_PC_1) begin dbg_commit_hot1 <= dbg_commit_hot1 + 1;
+          $display("[TC-HOTPC] t=%0t COMMIT base_pc=0x%h nbr=%0d bflags=%b (HOT1)", $time, accum_base_pc_q[31:0], accum_trig_cnt_q, accum_trig_flags_q); end
+        if (accum_base_pc_q == HOT_PC_2) begin dbg_commit_hot2 <= dbg_commit_hot2 + 1;
+          $display("[TC-HOTPC] t=%0t COMMIT base_pc=0x%h nbr=%0d bflags=%b (HOT2)", $time, accum_base_pc_q[31:0], accum_trig_cnt_q, accum_trig_flags_q); end
+        if (accum_base_pc_q == HOT_PC_3) begin dbg_commit_hot3 <= dbg_commit_hot3 + 1;
+          $display("[TC-HOTPC] t=%0t COMMIT base_pc=0x%h nbr=%0d bflags=%b (HOT3)", $time, accum_base_pc_q[31:0], accum_trig_cnt_q, accum_trig_flags_q); end
+      end
     end
   end
 
   final begin
     $display("[TC-BUILDER] V70 1-window: commits=%0d fill_starts=%0d",
              dbg_commit_q, dbg_fill_start_q);
+    $display("[TC-HOTPC-BUILDER] fill_starts: 0x%h=%0d  0x%h=%0d  0x%h=%0d  0x%h=%0d",
+             HOT_PC_0[31:0], dbg_fill_hot0, HOT_PC_1[31:0], dbg_fill_hot1,
+             HOT_PC_2[31:0], dbg_fill_hot2, HOT_PC_3[31:0], dbg_fill_hot3);
+    $display("[TC-HOTPC-BUILDER] commits:     0x%h=%0d  0x%h=%0d  0x%h=%0d  0x%h=%0d",
+             HOT_PC_0[31:0], dbg_commit_hot0, HOT_PC_1[31:0], dbg_commit_hot1,
+             HOT_PC_2[31:0], dbg_commit_hot2, HOT_PC_3[31:0], dbg_commit_hot3);
   end
 `endif
 

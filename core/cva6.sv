@@ -37,6 +37,7 @@ module cva6
     localparam type branchpredict_sbe_t = struct packed {
       cf_t                     cf;               // type of control flow prediction
       logic [CVA6Cfg.VLEN-1:0] predict_address;  // target address at which to jump, or not
+      logic [7:0]              tc_ghr;            // V81: GHR snapshot for misprediction recovery
     },
 
     parameter type exception_t = struct packed {
@@ -138,6 +139,7 @@ module cva6
       logic                    is_mispredict;   // set if this was a mis-predict
       logic                    is_taken;        // branch is taken
       cf_t                     cf_type;         // Type of control flow change
+      logic [7:0]              tc_ghr;          // V81: GHR snapshot for misprediction recovery
     },
 
     // All information needed to determine whether we need to associate an interrupt

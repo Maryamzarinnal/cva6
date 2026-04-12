@@ -1052,7 +1052,7 @@ module issue_read_operands
   always_comb begin
     pc_n = '0;
     is_compressed_instr_n = 1'b0;
-    branch_predict_n = {cf_t'(0), {CVA6Cfg.VLEN{1'b0}}};
+    branch_predict_n = {cf_t'(0), {CVA6Cfg.VLEN{1'b0}}, 8'b0};  // V81: +tc_ghr
     if (CVA6Cfg.SuperscalarEn) begin
       if (issue_instr_i[1].fu == CTRL_FLOW) begin
         pc_n                  = issue_instr_i[1].pc;
@@ -1082,7 +1082,7 @@ module issue_read_operands
       pc_o                     <= '0;
       is_zcmt_o                <= '0;
       is_compressed_instr_o    <= 1'b0;
-      branch_predict_o         <= {cf_t'(0), {CVA6Cfg.VLEN{1'b0}}};
+      branch_predict_o         <= {cf_t'(0), {CVA6Cfg.VLEN{1'b0}}, 8'b0};  // V81: +tc_ghr
       x_transaction_rejected_o <= 1'b0;
       alu_bypass_q             <= '0;
       dbg_issue_fire_q         <= '0;
