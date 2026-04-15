@@ -131,6 +131,7 @@ module frontend
   logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]      tc_pending_taken_targets_q;
   logic [TAKEN_CNT_WIDTH-1:0]              tc_pending_num_taken_q;
   logic [PC_WIDTH-1:0]                     tc_pending_base_pc_q;  // for PC safety check
+  logic [7:0]                              tc_pending_ghr_q;      // V86-fix: GHR snapshot at capture time
   // Pending buffer control signals
   logic                                    tc_pending_capture;  // TC hit + IQ not ready
   logic                                    tc_pending_use;      // pending valid + IQ ready + safe
@@ -432,6 +433,8 @@ module frontend
     end
   end
 
+  // V90: With MAX_TAKEN=3, TAKEN_CNT_WIDTH=2 bits ? wide enough for
+  // correct comparisons.  Check both branches and taken counts.
   assign tc_trace_branch_map_ok = (tc_trace_mapped_num_branches == tc_trace_num_branches) &&
                                   (tc_trace_mapped_num_taken == tc_trace_num_taken);
 
@@ -533,6 +536,39 @@ module frontend
   end
 
   // -----------------------------------------------------------------------
+  // V85: TC-driven RAS synchronization.
+  // When a trace containing a return/call is replayed, the RAS must be
+  // updated to stay consistent.  The normal I$-path RAS push/pop are
+  // suppressed on tc_hit_this_cycle ? these signals provide the TC path.
+  // -----------------------------------------------------------------------
+  logic                          tc_ras_pop;
+  logic                          tc_ras_push;
+  logic [CVA6Cfg.VLEN-1:0]      tc_ras_update;
+
+  always_comb begin
+    tc_ras_pop    = 1'b0;
+    tc_ras_push   = 1'b0;
+    tc_ras_update = '0;
+
+    if (tc_hit_this_cycle) begin
+      for (int p = 0; p < CVA6Cfg.INSTR_PER_FETCH; p++) begin
+        if (p < int'(tc_feed_src_length)) begin
+          // Return in trace ? pop RAS (keep stack in sync)
+          if (tc_replay_cf_type(tc_feed_src_instructions[p]) == ariane_pkg::Return)
+            tc_ras_pop = 1'b1;
+
+          // Call in trace ? push return address onto RAS
+          if (tc_replay_is_call(tc_feed_src_instructions[p])) begin
+            tc_ras_push   = 1'b1;
+            tc_ras_update = tc_feed_src_pcs[p][CVA6Cfg.VLEN-1:0]
+                          + ((tc_feed_src_instructions[p][1:0] != 2'b11) ? CVA6Cfg.VLEN'(2) : CVA6Cfg.VLEN'(4));
+          end
+        end
+      end
+    end
+  end
+
+  // -----------------------------------------------------------------------
   // MUX: TC hit vs normal I-cache.  On tc_hit_this_cycle, TC trace data
   // replaces the I$ scan output going into the IQ.
   // -----------------------------------------------------------------------
@@ -557,7 +593,8 @@ module frontend
   end
 
   // V81: GHR snapshot ? same for all slots in the window
-  assign tc_ghr_to_iq = tc_ghr_from_tc;
+  // V86-fix: use captured GHR when replaying from pending buffer
+  assign tc_ghr_to_iq = tc_pending_use ? tc_pending_ghr_q : tc_ghr_from_tc;
 
   // During TC hit, supply the trace's own branch outcomes as branch_flags.
   assign branch_flags_to_iq = tc_hit_this_cycle ?
@@ -689,6 +726,7 @@ module frontend
       tc_pending_taken_targets_q  <= '0;
       tc_pending_num_taken_q      <= '0;
       tc_pending_base_pc_q        <= '0;
+      tc_pending_ghr_q            <= '0;
     end else if (tc_pending_invalidate || tc_pending_use) begin
       // Invalidate on any path-breaking event, or after successful use.
       tc_pending_valid_q <= 1'b0;
@@ -704,6 +742,7 @@ module frontend
       tc_pending_taken_targets_q  <= tc_trace_taken_targets;
       tc_pending_num_taken_q      <= tc_trace_num_taken;
       tc_pending_base_pc_q        <= tc_trace_pcs[0];
+      tc_pending_ghr_q            <= tc_ghr_from_tc;  // V86-fix: snapshot GHR at capture
     end
   end
 
@@ -718,9 +757,9 @@ module frontend
         .clk_i,
         .rst_ni,
         .flush_bp_i(flush_bp_i),
-        .push_i(ras_push),
-        .pop_i(ras_pop),
-        .data_i(ras_update),
+        .push_i(ras_push | tc_ras_push),         // V85: include TC-driven push
+        .pop_i(ras_pop | tc_ras_pop),             // V85: include TC-driven pop
+        .data_i(tc_ras_push ? tc_ras_update : ras_update),  // V85: TC call return addr
         .data_o(ras_predict)
     );
   end
@@ -1043,7 +1082,8 @@ module frontend
   // N delivers (N - pre_branch_count) extra instructions over what the
   // I$ would have provided.  For length-2 traces (1 pre + 1 post branch),
   // the 1 extra instruction equals the 1 bubble cost ? net zero benefit.
-  // Length ? 3 always provides net positive benefit.  Default: 3.
+  // V92 experiment: raised to 4, but run 62 showed no improvement (L3
+  // replays were marginally helpful).  Reverted to 3.
   localparam int unsigned TC_MIN_ACCEPT_LEN = 3;
 
 `ifndef SYNTHESIS
@@ -1064,14 +1104,12 @@ module frontend
   assign tc_active_hit = tc_lookup_result_valid && tc_trace_hit &&
                          (tc_trace_length != '0) && !flush_i && !is_mispredict;
 
-  // V73: Same-cycle hit policy ? require ?1 taken branch, no calls,
-  // and trace length ? TC_MIN_ACCEPT_LEN (default 3) so the extra
-  // instructions overcome the kill_s1 steer bubble cost.
+  // V90: Accept any trace that passes consistency checks and meets minimum
+  // length.  The multi-taken builder (V90) now produces traces spanning
+  // multiple taken branches, so all committed traces are worth replaying.
   assign tc_trace_policy_ok = tc_trace_starts_ok &&
                               tc_trace_branch_map_ok &&
-                              (tc_trace_num_taken >= TAKEN_CNT_WIDTH'(1)) &&
                               (tc_trace_length >= TRACE_LEN_WIDTH'(TC_MIN_ACCEPT_LEN)) &&
-                              !tc_trace_has_call &&
                               !tc_disable_replay_q;
 
   // V72: Pending trace buffer invalidation ? any path-breaking event.
@@ -1081,8 +1119,11 @@ module frontend
 
   // V72: Capture a TC hit into the pending buffer when IQ is not ready.
   // Do not overwrite an existing valid pending trace (it takes priority).
+  // V91: Also gate on IQ-empty ? no point capturing a trace for later
+  // replay if the IQ is already non-empty (backend has work).
   assign tc_pending_capture = tc_active_hit && tc_trace_policy_ok &&
                               !tc_trace_used && !instr_queue_ready &&
+                              instr_queue_empty &&
                               !tc_pending_invalidate &&
                               !tc_pending_valid_q;
 
@@ -1099,17 +1140,31 @@ module frontend
   // flush, eret, exception, commit redirect, debug, replay) clear the
   // buffer via tc_pending_invalidate, so if the buffer survives it is
   // guaranteed to be on the correct path.
+  // V91: Also gate on IQ-empty for consistency with replay gate.
   assign tc_pending_use = tc_pending_valid_q && instr_queue_ready &&
+                          instr_queue_empty &&
                           !tc_pending_invalidate;
 
   // V72: tc_hit_this_cycle ? fires on direct same-cycle hit OR pending use.
   // When pending_use fires, the feed MUX uses the buffered trace data.
   // Pending use takes priority over a concurrent direct hit.
+  //
+  // V91: IQ-empty replay gate ? only allow TC replay when the IQ is empty
+  // (frontend starvation).  Evidence from run 60:
+  //   tc_hit_nonempty_iq = 131,407 out of 132,762 (99%)
+  //   Each replay costs 1 kill_s1 bubble cycle.
+  //   When IQ is non-empty, the backend already has enough work;
+  //   replaying just wastes a bubble and adds I-cache pressure.
+  //   Only starvation replays (IQ empty) can provide net benefit.
+  logic tc_replay_iq_gate;
+  assign tc_replay_iq_gate = instr_queue_empty;
+
   logic tc_direct_hit;
   assign tc_direct_hit = tc_active_hit &&
                          tc_trace_policy_ok &&
                          !tc_trace_used &&
                          instr_queue_ready &&
+                         tc_replay_iq_gate &&
                          !tc_pending_use;
 
   assign tc_hit_this_cycle = tc_direct_hit || tc_pending_use;
@@ -1182,6 +1237,16 @@ module frontend
   int unsigned tc_dbg_pending_capture_q;
   int unsigned tc_dbg_pending_use_q;
   int unsigned tc_dbg_pending_invalidate_q;
+  // V88: Backend stall / frontend bubble counters
+  int unsigned tc_dbg_backend_stall_q;        // cycles backend not ready (fetch_entry_valid & !fetch_entry_ready)
+  int unsigned tc_dbg_iq_empty_cycles_q;      // cycles IQ was empty (frontend starvation)
+  int unsigned tc_dbg_iq_not_ready_cycles_q;  // cycles IQ was full (backpressure)
+  int unsigned tc_dbg_icache_miss_cycles_q;   // cycles I$ not valid (cache miss stall)
+  int unsigned tc_dbg_replay_profit_2tk_q;    // accepted replays with exactly 2 taken
+  int unsigned tc_dbg_replay_profit_3tk_q;    // accepted replays with ?3 taken
+  int unsigned tc_dbg_replay_len_hist_q [8];  // accepted trace length histogram [3..7+]
+  // V91: IQ-gate suppression counter
+  int unsigned tc_dbg_iq_gate_suppress_q;     // hits suppressed because IQ was non-empty
 
   // V77 Hot-PC frontend tracker: hit/miss/policy for top mismatch PCs
   localparam logic [CVA6Cfg.VLEN-1:0] FE_HP0 = CVA6Cfg.VLEN'(64'h80002880);
@@ -1296,6 +1361,14 @@ module frontend
       tc_dbg_pending_capture_q <= 0;
       tc_dbg_pending_use_q <= 0;
       tc_dbg_pending_invalidate_q <= 0;
+      tc_dbg_backend_stall_q <= 0;
+      tc_dbg_iq_empty_cycles_q <= 0;
+      tc_dbg_iq_not_ready_cycles_q <= 0;
+      tc_dbg_icache_miss_cycles_q <= 0;
+      tc_dbg_replay_profit_2tk_q <= 0;
+      tc_dbg_replay_profit_3tk_q <= 0;
+      tc_dbg_iq_gate_suppress_q <= 0;
+      for (int i = 0; i < 8; i++) tc_dbg_replay_len_hist_q[i] <= 0;
       for (int i = 0; i < 4; i++) begin
         fe_hp_lookup[i] <= 0; fe_hp_hit[i] <= 0; fe_hp_accept[i] <= 0;
         fe_hp_reject_policy[i] <= 0; fe_hp_miss_pc[i] <= 0;
@@ -1347,8 +1420,12 @@ module frontend
           if (tc_trace_policy_ok) begin
             if (tc_trace_used)
               tc_dbg_reject_used_q <= tc_dbg_reject_used_q + 1;
-            else if (!tc_direct_hit && !tc_pending_capture)
+            else if (!tc_direct_hit && !tc_pending_capture) begin
               tc_dbg_reject_not_ready_q <= tc_dbg_reject_not_ready_q + 1;
+              // V91: Count how many of these were specifically blocked by IQ gate
+              if (instr_queue_ready && !instr_queue_empty)
+                tc_dbg_iq_gate_suppress_q <= tc_dbg_iq_gate_suppress_q + 1;
+            end
           end else begin
             if (tc_trace_has_indirect || tc_trace_has_call)
               tc_dbg_reject_indirect_q <= tc_dbg_reject_indirect_q + 1;
@@ -1565,6 +1642,32 @@ module frontend
       if (tc_hit_this_cycle && !instr_queue_empty)
         tc_dbg_iq_flush_on_capture_q <= tc_dbg_iq_flush_on_capture_q + 1;
 
+      // V88: Backend stall and frontend bubble counters
+      if (|fetch_entry_valid_o && !(|fetch_entry_ready_i))
+        tc_dbg_backend_stall_q <= tc_dbg_backend_stall_q + 1;
+      if (instr_queue_empty)
+        tc_dbg_iq_empty_cycles_q <= tc_dbg_iq_empty_cycles_q + 1;
+      if (!instr_queue_ready)
+        tc_dbg_iq_not_ready_cycles_q <= tc_dbg_iq_not_ready_cycles_q + 1;
+      if (!icache_dreq_i.valid && !flush_i && !is_mispredict)
+        tc_dbg_icache_miss_cycles_q <= tc_dbg_icache_miss_cycles_q + 1;
+
+      // V90: Replay profitability tracking.
+      if (tc_hit_this_cycle) begin
+        if (tc_feed_src_num_taken == TAKEN_CNT_WIDTH'(2))
+          tc_dbg_replay_profit_2tk_q <= tc_dbg_replay_profit_2tk_q + 1;
+        if (tc_feed_src_num_taken >= TAKEN_CNT_WIDTH'(3))
+          tc_dbg_replay_profit_3tk_q <= tc_dbg_replay_profit_3tk_q + 1;
+        // Length histogram: index 0=len3, 1=len4, ..., 4=len7, 5+=overflow
+        begin
+          int len_idx;
+          len_idx = int'(tc_feed_src_length) - 3;
+          if (len_idx < 0) len_idx = 0;
+          if (len_idx > 7) len_idx = 7;
+          tc_dbg_replay_len_hist_q[len_idx] <= tc_dbg_replay_len_hist_q[len_idx] + 1;
+        end
+      end
+
       // V70: scan_cancel, poison counters removed.
 
       // V72: pending buffer tracking
@@ -1750,6 +1853,15 @@ module frontend
              tc_dbg_miss_empty_q, tc_dbg_miss_pc_q, tc_dbg_miss_path_q);
     $display("[TC-FINAL] pending_buf: captured=%0d used=%0d invalidated=%0d",
              tc_dbg_pending_capture_q, tc_dbg_pending_use_q, tc_dbg_pending_invalidate_q);
+    $display("[TC-FINAL] backend_stall_cycles=%0d iq_empty_cycles=%0d iq_full_cycles=%0d icache_miss_cycles=%0d",
+             tc_dbg_backend_stall_q, tc_dbg_iq_empty_cycles_q, tc_dbg_iq_not_ready_cycles_q, tc_dbg_icache_miss_cycles_q);
+    $display("[TC-FINAL] replay_profit: 2taken=%0d 3p_taken=%0d",
+             tc_dbg_replay_profit_2tk_q, tc_dbg_replay_profit_3tk_q);
+    $display("[TC-FINAL] v91_iq_gate_suppress=%0d", tc_dbg_iq_gate_suppress_q);
+    $display("[TC-FINAL] replay_len_hist: L3=%0d L4=%0d L5=%0d L6=%0d L7=%0d L8=%0d L9=%0d L10p=%0d",
+             tc_dbg_replay_len_hist_q[0], tc_dbg_replay_len_hist_q[1], tc_dbg_replay_len_hist_q[2],
+             tc_dbg_replay_len_hist_q[3], tc_dbg_replay_len_hist_q[4], tc_dbg_replay_len_hist_q[5],
+             tc_dbg_replay_len_hist_q[6], tc_dbg_replay_len_hist_q[7]);
     $display("[TC-FINAL] ========================================");
 
     // V72: ROI stats

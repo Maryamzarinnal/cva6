@@ -2,21 +2,22 @@
 import trace_cache_pkg::*;
 import riscv::*;
 
-// V70 single-window trace builder.
-// Records up to TRACE_LEN (4) instructions spanning one taken branch.
-// The trace stitches the tail of one basic block with the head of the next,
-// eliminating the taken-branch redirect bubble for the frontend.
+// V90 multi-window trace builder.
+// Records up to TRACE_LEN (4) instructions spanning up to MAX_TAKEN (3)
+// taken branches.  Each taken branch triggers a new FILL cycle to collect
+// target-block instructions, building multi-block traces that eliminate
+// multiple taken-branch redirect bubbles for the frontend.
 //
 // State machine:
 //   IDLE ? taken direct branch found ? FILL (if room for target instructions)
-//   FILL ? fill remaining slots from target window ? commit
+//   FILL ? scan target window:
+//          ? PC doesn't match target yet ? wait (stay in FILL)
+//          ? another taken branch found AND room left ? stay in FILL (loop)
+//          ? no taken branch / full / reject ? commit trace
 //
-// If the taken branch fills the trace's last slot, there is no room for
-// target instructions ? the trace would be identical to the I-cache output,
-// so it is not recorded.
-//
-// Indirect/call branches are rejected (target unpredictable / RAS update
-// not handled during trace replay).
+// V85: Returns and direct calls are accepted.
+// V90: FILL loops across multiple taken branches (up to MAX_TAKEN).
+// V90-fix: PC guard waits instead of discarding (was killing 98.8% of traces).
 
 module trace_builder #(
   parameter int unsigned MAX_INSTR_PER_TRACE = MAX_TRACE_INSTR
@@ -76,6 +77,42 @@ module trace_builder #(
     end
   endfunction
 
+  // V85: Return CF ? jalr rd, rs1 where rs1 is a link register (x1/x5)
+  // and rs1 != rd (standard RISC-V return convention).
+  // Target comes from the frontend's RAS prediction.
+  function automatic logic is_return_cf(input logic [INSTR_WIDTH-1:0] inst);
+    logic rvc;
+    begin
+      rvc = is_compressed(inst);
+      if (!rvc)
+        // jalr rd, rs1, imm ? return when rs1 is link register and rs1 != rd
+        is_return_cf = (inst[6:0] == riscv::OpcodeJalr) &&
+                       ((inst[19:15] == 5'd1) || (inst[19:15] == 5'd5)) &&
+                       (inst[19:15] != inst[11:7]);
+      else
+        // c.jr rs1 where rs1 = x1 or x5 (funct4=1000, rs2=0, [1:0]=10)
+        // c.jr has rd=x0 implicitly, so rs1 != rd is always true for x1/x5
+        is_return_cf = (inst[1:0] == riscv::OpcodeC2) &&
+                       (inst[15:12] == 4'b1000) &&
+                       (inst[6:2] == 5'b00000) &&
+                       ((inst[11:7] == 5'd1) || (inst[11:7] == 5'd5));
+    end
+  endfunction
+
+  // V85: Direct call CF ? jal rd, imm where rd = x1(ra) or x5(t0).
+  // Target is PC-relative (deterministic). RAS push needed during replay.
+  function automatic logic is_call_cf(input logic [INSTR_WIDTH-1:0] inst);
+    logic rvc;
+    begin
+      rvc = is_compressed(inst);
+      if (!rvc)
+        is_call_cf = (inst[6:0] == riscv::OpcodeJal) &&
+                     ((inst[11:7] == 5'd1) || (inst[11:7] == 5'd5));
+      else
+        is_call_cf = 1'b0;  // No compressed direct call in RV64
+    end
+  endfunction
+
   // -----------------------------------------------------------------------
   // Accumulation registers (partial trace latched from the IDLE window)
   // -----------------------------------------------------------------------
@@ -90,6 +127,9 @@ module trace_builder #(
   logic [CHUNK_PTR_W-1:0]                  accum_chunk_ptr_q;
   logic [INSTR_CNT_W-1:0]                  accum_instr_cnt_q;
   logic [GHR_WIDTH-1:0]                    accum_ghr_q;  // V82: GHR snapshot at trace start
+  // V90: multi-taken accumulators
+  logic [TAKEN_CNT_WIDTH-1:0]              accum_taken_cnt_q;
+  logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]      accum_taken_targets_q;
 
   // Next-state wires (set by always_comb, consumed by always_ff).
   logic [PC_WIDTH-1:0]                     accum_base_pc_nxt;
@@ -102,6 +142,24 @@ module trace_builder #(
   logic [PC_WIDTH-1:0]                     accum_taken_target_nxt;
   logic [CHUNK_PTR_W-1:0]                  accum_chunk_ptr_nxt;
   logic [INSTR_CNT_W-1:0]                  accum_instr_cnt_nxt;
+  // V90: multi-taken next-state wires
+  logic [TAKEN_CNT_WIDTH-1:0]              accum_taken_cnt_nxt;
+  logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]      accum_taken_targets_nxt;
+
+  // V90-diag: FILL exit reason (set in always_comb, read in always_ff)
+  logic [2:0] fill_exit_reason;
+
+  // V90-fix: latch-enable for accum registers ? only asserted when the
+  // combinational block actually computes new accumulator values.
+  // Without this, wait cycles in TB_FILL overwrite accum_*_q with
+  // the default '0 (the original bug that zeroed accum_taken_target_q).
+  logic accum_latch_en;
+
+`ifndef SYNTHESIS
+  // V90-diag: PC guard diagnostics (declared early for use in always_comb)
+  longint unsigned dbg_pcguard_miss_total;
+  longint unsigned dbg_pcguard_hit_total;
+`endif
 
   // Commit output registers (1-cycle write to SRAM).
   logic                    commit_valid_q;
@@ -142,7 +200,7 @@ module trace_builder #(
     end
   end
 
-  // Accumulation registers: latch on IDLE?FILL, clear on flush or return to IDLE.
+  // Accumulation registers: latch on IDLE?FILL or FILL?FILL, clear on flush or return to IDLE.
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       accum_base_pc_q      <= '0;
@@ -155,7 +213,9 @@ module trace_builder #(
       accum_taken_target_q <= '0;
       accum_chunk_ptr_q    <= '0;
       accum_instr_cnt_q    <= '0;
-      accum_ghr_q          <= '0;  // V82
+      accum_ghr_q          <= '0;
+      accum_taken_cnt_q    <= '0;
+      accum_taken_targets_q <= '0;
     end else if (flush_i || (state_d == TB_IDLE && state_q != TB_IDLE)) begin
       accum_base_pc_q      <= '0;
       accum_trig_flags_q   <= '0;
@@ -167,8 +227,12 @@ module trace_builder #(
       accum_taken_target_q <= '0;
       accum_chunk_ptr_q    <= '0;
       accum_instr_cnt_q    <= '0;
-      accum_ghr_q          <= '0;  // V82
-    end else if (state_d == TB_FILL && state_q == TB_IDLE) begin
+      accum_ghr_q          <= '0;
+      accum_taken_cnt_q    <= '0;
+      accum_taken_targets_q <= '0;
+    end else if (state_d == TB_FILL && accum_latch_en) begin
+      // V90-fix: Latch only when combo block produced new data
+      // (IDLE?FILL or FILL?FILL loop), NOT during wait cycles.
       accum_base_pc_q      <= accum_base_pc_nxt;
       accum_trig_flags_q   <= accum_trig_flags_nxt;
       accum_trig_cnt_q     <= accum_trig_cnt_nxt;
@@ -179,13 +243,17 @@ module trace_builder #(
       accum_taken_target_q <= accum_taken_target_nxt;
       accum_chunk_ptr_q    <= accum_chunk_ptr_nxt;
       accum_instr_cnt_q    <= accum_instr_cnt_nxt;
-      accum_ghr_q          <= ghr_i;  // V82: capture GHR at trace start
+      accum_taken_cnt_q    <= accum_taken_cnt_nxt;
+      accum_taken_targets_q <= accum_taken_targets_nxt;
+      if (state_q == TB_IDLE)
+        accum_ghr_q <= ghr_i;  // V82: capture GHR only at trace start
     end
   end
 
   // -----------------------------------------------------------------------
-  // V70 combinational scan: IDLE finds a taken branch, FILL gets target
-  // instructions, commit writes trace to SRAM.
+  // V90 combinational scan: IDLE finds a taken branch ? FILL.
+  // FILL scans target window: if another taken branch ? loop (FILL?FILL);
+  // otherwise ? commit.  Up to MAX_TAKEN taken branches per trace.
   // -----------------------------------------------------------------------
 
   always_comb begin
@@ -206,9 +274,17 @@ module trace_builder #(
     logic                                    w_reject;
     logic                                    w_overflow;
     logic                                    w_had_input;
+    // V90: multi-taken accumulators carried through scan
+    logic [TAKEN_CNT_WIDTH-1:0]              w_taken_cnt;
+    logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]      w_taken_targets;
 
     trace_data_t                             payload;
     logic [TRACE_ADDRW-1:0]                  cand_addr;
+
+    // V90-diag: FILL exit reason tracking (0=none, 1=flush, 2=pcguard,
+    //           3=commit, 4=discard/accum, 5=loop-mt, 6=wait)
+    fill_exit_reason = 3'd0;
+    accum_latch_en  = 1'b0;
 
     // Defaults
     state_d        = state_q;
@@ -227,6 +303,8 @@ module trace_builder #(
     accum_taken_target_nxt = '0;
     accum_chunk_ptr_nxt    = '0;
     accum_instr_cnt_nxt    = '0;
+    accum_taken_cnt_nxt    = '0;
+    accum_taken_targets_nxt = '0;
 
     w_base_pc      = '0;
     w_has_base     = 1'b0;
@@ -238,6 +316,8 @@ module trace_builder #(
     w_had_input    = 1'b0;
     w_taken_target = '0;
     w_exit_pc      = '0;
+    w_taken_cnt    = '0;
+    w_taken_targets = '0;
     payload        = '0;
     cand_addr      = '0;
 
@@ -250,6 +330,8 @@ module trace_builder #(
       w_cptr         = accum_chunk_ptr_q;
       w_icnt         = accum_instr_cnt_q;
       w_exit_pc      = accum_taken_target_q;  // default exit: branch target
+      w_taken_cnt    = accum_taken_cnt_q;      // V90
+      w_taken_targets = accum_taken_targets_q; // V90
     end else begin
       w_chunks       = '0;
       w_valid_chunks = '0;
@@ -261,23 +343,35 @@ module trace_builder #(
 
     if (flush_i) begin
       state_d = TB_IDLE;
+      if (state_q == TB_FILL) fill_exit_reason = 3'd1;  // flush
     end else begin
       // ---- Scan current fetch window ----
       for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
         logic rvc, direct, taken_cf;
+        logic ret_cf, call_cf;  // V85: return / direct-call classification
 
         if (!(instr_i.consumed[i] && instr_i.valid[i]))
           continue;
 
-        // V71 FILL-PC guard: the first instruction of the fill window MUST
-        // start at the taken-branch target.  If the target window was
-        // invisible (IQ full / tc_hit gating), the builder stays in FILL
-        // and the NEXT visible window has the wrong instructions.  Reject
-        // that case by verifying the PC of the first fill-phase instruction.
+        // V71 FILL-PC guard: the first consumed instruction of the fill
+        // window MUST start at the taken-branch target.  If the PC does
+        // not match, the pipeline hasn't redirected yet ? skip without
+        // setting w_had_input so the builder waits another cycle in FILL.
         if (state_q == TB_FILL && !w_had_input) begin
           if (instr_i.pc[i] != accum_taken_target_q) begin
-            w_reject = 1'b1;
-            break;
+`ifndef SYNTHESIS
+            if (dbg_pcguard_miss_total < 20)
+              $display("[TC-PCGUARD] t=%0t slot=%0d got_pc=0x%h expect_pc=0x%h delta=%0d",
+                       $time, i, instr_i.pc[i], accum_taken_target_q,
+                       instr_i.pc[i] - accum_taken_target_q);
+`endif
+            break;  // not the target window yet ? wait
+          end else begin
+`ifndef SYNTHESIS
+            if (dbg_pcguard_hit_total < 20)
+              $display("[TC-PCGUARD-HIT] t=%0t slot=%0d pc=0x%h TARGET MATCHED",
+                       $time, i, instr_i.pc[i]);
+`endif
           end
         end
 
@@ -288,6 +382,8 @@ module trace_builder #(
 
         rvc      = is_compressed(instr_i.inst[i]);
         direct   = instr_i.is_branch[i] && is_direct_cf(instr_i.inst[i]);
+        ret_cf   = instr_i.is_branch[i] && is_return_cf(instr_i.inst[i]);
+        call_cf  = instr_i.is_branch[i] && is_call_cf(instr_i.inst[i]);
         taken_cf = instr_i.is_branch[i] && instr_i.taken[i];
 
         // IDLE: set base PC from first valid slot
@@ -296,14 +392,17 @@ module trace_builder #(
           w_has_base = 1'b1;
         end
 
-        // FILL: stop BEFORE any taken CF (trace already has MAX_TAKEN=1)
-        if (state_q == TB_FILL && taken_cf) begin
-          w_has_taken = 1'b1;
+        // V90: FILL with taken branch ? if we've already reached MAX_TAKEN,
+        // stop BEFORE this instruction (trace is full of taken branches).
+        if (state_q == TB_FILL && taken_cf &&
+            (w_taken_cnt >= TAKEN_CNT_WIDTH'(MAX_TAKEN))) begin
+          // Don't add this instruction ? commit what we have.
           break;
         end
 
-        // Reject indirect/call branches in both states
-        if (instr_i.is_branch[i] && !direct) begin
+        // V85: Accept direct CFs, returns (RAS-predicted target), and
+        // direct calls.  Reject other indirect CFs (computed jumps).
+        if (instr_i.is_branch[i] && !direct && !ret_cf && !call_cf) begin
           w_reject = 1'b1;
           break;
         end
@@ -341,12 +440,16 @@ module trace_builder #(
           w_br_flags[w_num_br] = instr_i.taken[i];
           w_num_br = w_num_br + BR_CNT_WIDTH'(1);
 
-          // IDLE: first taken branch ? stop scanning, prepare for FILL
-          if (state_q == TB_IDLE && taken_cf) begin
+          if (taken_cf) begin
+            // V90: Record this taken target in the targets array
+            if (w_taken_cnt < TAKEN_CNT_WIDTH'(MAX_TAKEN))
+              w_taken_targets[w_taken_cnt] = instr_i.target[i];
+            w_taken_cnt = w_taken_cnt + TAKEN_CNT_WIDTH'(1);
+
             w_taken_target = instr_i.target[i];
             w_exit_pc      = instr_i.target[i];  // override: exit ? target
             w_has_taken    = 1'b1;
-            break;
+            break;  // Stop scanning this window ? next window starts at target
           end
         end
       end // for each slot
@@ -356,7 +459,7 @@ module trace_builder #(
         TB_IDLE: begin
           if (w_has_taken && w_has_base && !w_reject && !w_overflow) begin
             if (w_icnt >= INSTR_CNT_W'(MAX_INSTR_PER_TRACE)) begin
-              // No room for target instructions ? skip (no benefit over I-cache)
+              // No room for target instructions ? skip
               state_d = TB_IDLE;
             end else begin
               // Partial trace ? go to FILL for target instructions
@@ -370,47 +473,126 @@ module trace_builder #(
               accum_taken_target_nxt = w_taken_target;
               accum_chunk_ptr_nxt    = w_cptr;
               accum_instr_cnt_nxt    = w_icnt;
+              accum_taken_cnt_nxt    = w_taken_cnt;
+              accum_taken_targets_nxt = w_taken_targets;
+              accum_latch_en         = 1'b1;  // V90-fix
               state_d = TB_FILL;
             end
           end
-          // else: no taken branch or rejected ? stay IDLE
         end
 
         TB_FILL: begin
-          if (w_had_input || w_reject || w_overflow) begin
+          // V90: If trace is already full entering this cycle, commit immediately.
+          if (w_icnt >= INSTR_CNT_W'(MAX_INSTR_PER_TRACE) && !w_had_input && !w_reject) begin
+            payload               = '0;
+            payload.valid         = 1'b1;
+            payload.base_pc       = accum_base_pc_q;
+            payload.chunks        = accum_chunks_q;
+            payload.valid_chunks  = accum_valid_chunks_q;
+            payload.branch_flags  = accum_br_flags_q;
+            payload.num_branches  = accum_num_br_q;
+            payload.num_taken     = accum_taken_cnt_q;
+            payload.taken_targets = accum_taken_targets_q;
+            payload.target_addr   = accum_taken_target_q;
+            payload.lookup_branch_flags = accum_br_flags_q;
+            payload.lookup_num_branches = accum_num_br_q;
+
+            cand_addr = tc_index(accum_base_pc_q, accum_ghr_q);
+            commit_addr_d  = cand_addr;
+            commit_tag_d   = make_trace_tag(accum_base_pc_q,
+                                            accum_trig_cnt_q,
+                                            accum_trig_flags_q,
+                                            accum_ghr_q);
+            commit_valid_d = 1'b1;
+            commit_data_d  = payload;
+            state_d = TB_IDLE;
+            fill_exit_reason = 3'd3;  // early-commit (full at entry)
+          end else if (w_had_input || w_reject || w_overflow) begin
             logic fill_added;
             fill_added = (w_icnt > accum_instr_cnt_q);
 
             if (fill_added) begin
-              // Successfully got target instructions ? commit trace
-              payload               = '0;
-              payload.valid         = 1'b1;
-              payload.base_pc       = accum_base_pc_q;
-              payload.chunks        = w_chunks;
-              payload.valid_chunks  = w_valid_chunks;
-              payload.branch_flags  = w_br_flags;
-              payload.num_branches  = w_num_br;
-              payload.num_taken     = TAKEN_CNT_WIDTH'(1);
-              payload.taken_targets[0] = accum_taken_target_q;
-              payload.target_addr   = w_exit_pc;
-              payload.lookup_branch_flags = w_br_flags;
-              payload.lookup_num_branches = w_num_br;
+              if (w_has_taken &&
+                  (w_icnt < INSTR_CNT_W'(MAX_INSTR_PER_TRACE)) &&
+                  !w_reject && !w_overflow) begin
+                // V90: Another taken branch found AND room for more ?
+                // loop back to FILL for the next target window.
+                accum_base_pc_nxt      = accum_base_pc_q;  // keep original base
+                accum_trig_flags_nxt   = accum_trig_flags_q;
+                accum_trig_cnt_nxt     = accum_trig_cnt_q;
+                accum_chunks_nxt       = w_chunks;
+                accum_valid_chunks_nxt = w_valid_chunks;
+                accum_br_flags_nxt     = w_br_flags;
+                accum_num_br_nxt       = w_num_br;
+                accum_taken_target_nxt = w_taken_target;
+                accum_chunk_ptr_nxt    = w_cptr;
+                accum_instr_cnt_nxt    = w_icnt;
+                accum_taken_cnt_nxt    = w_taken_cnt;
+                accum_taken_targets_nxt = w_taken_targets;
+                accum_latch_en         = 1'b1;  // V90-fix
+                state_d = TB_FILL;  // loop
+                fill_exit_reason = 3'd5;  // loop-mt (multi-taken)
+              end else begin
+                // No more taken branches, or trace full ? commit
+                payload               = '0;
+                payload.valid         = 1'b1;
+                payload.base_pc       = accum_base_pc_q;
+                payload.chunks        = w_chunks;
+                payload.valid_chunks  = w_valid_chunks;
+                payload.branch_flags  = w_br_flags;
+                payload.num_branches  = w_num_br;
+                payload.num_taken     = w_taken_cnt;
+                payload.taken_targets = w_taken_targets;
+                payload.target_addr   = w_exit_pc;
+                payload.lookup_branch_flags = w_br_flags;
+                payload.lookup_num_branches = w_num_br;
 
-              cand_addr = tc_index(accum_base_pc_q, accum_ghr_q);  // V82: GHR in index
+                cand_addr = tc_index(accum_base_pc_q, accum_ghr_q);
 
-              commit_addr_d  = cand_addr;
-              commit_tag_d   = make_trace_tag(accum_base_pc_q,
-                                              accum_trig_cnt_q,
-                                              accum_trig_flags_q,
-                                              accum_ghr_q);  // V82: GHR in tag
-              commit_valid_d = 1'b1;
-              commit_data_d  = payload;
+                commit_addr_d  = cand_addr;
+                commit_tag_d   = make_trace_tag(accum_base_pc_q,
+                                                accum_trig_cnt_q,
+                                                accum_trig_flags_q,
+                                                accum_ghr_q);
+                commit_valid_d = 1'b1;
+                commit_data_d  = payload;
+                state_d = TB_IDLE;
+                fill_exit_reason = 3'd3;  // commit (fill_added, no-taken/full)
+              end
+            end else begin
+              // V90: No new instructions added this cycle, but we may have a
+              // multi-block trace from previous FILL loops.  Commit if
+              // accumulated count exceeds 1 instruction (the IDLE window).
+              if (accum_instr_cnt_q > INSTR_CNT_W'(1)) begin
+                payload               = '0;
+                payload.valid         = 1'b1;
+                payload.base_pc       = accum_base_pc_q;
+                payload.chunks        = accum_chunks_q;
+                payload.valid_chunks  = accum_valid_chunks_q;
+                payload.branch_flags  = accum_br_flags_q;
+                payload.num_branches  = accum_num_br_q;
+                payload.num_taken     = accum_taken_cnt_q;
+                payload.taken_targets = accum_taken_targets_q;
+                payload.target_addr   = accum_taken_target_q;
+                payload.lookup_branch_flags = accum_br_flags_q;
+                payload.lookup_num_branches = accum_num_br_q;
+
+                cand_addr = tc_index(accum_base_pc_q, accum_ghr_q);
+                commit_addr_d  = cand_addr;
+                commit_tag_d   = make_trace_tag(accum_base_pc_q,
+                                                accum_trig_cnt_q,
+                                                accum_trig_flags_q,
+                                                accum_ghr_q);
+                commit_valid_d = 1'b1;
+                commit_data_d  = payload;
+              end
+              state_d = TB_IDLE;
+              fill_exit_reason = (commit_valid_d) ? 3'd4 : 3'd2;  // 4=accum-commit, 2=discard(pcguard/etc)
             end
-            // else: no target instructions added ? discard (no benefit)
-
-            state_d = TB_IDLE;
           end
-          // else: no input yet ? stay in FILL (wait for target window)
+          // else: no input yet ? stay in FILL
+          if (state_q == TB_FILL && state_d == TB_FILL && fill_exit_reason == 3'd0)
+            fill_exit_reason = 3'd6;  // wait (no input)
         end
       endcase
     end
@@ -419,6 +601,15 @@ module trace_builder #(
 `ifndef SYNTHESIS
   longint unsigned dbg_commit_q;
   longint unsigned dbg_fill_start_q;
+  longint unsigned dbg_fill_loop_q;  // V90: FILL?FILL loops (multi-taken)
+
+  // V90-diag: FILL exit reason breakdown
+  longint unsigned dbg_fill_flush_q;      // flush killed FILL
+  longint unsigned dbg_fill_pcguard_q;    // PC guard rejected (w_reject from guard)
+  longint unsigned dbg_fill_commit_q;     // fill_added ? commit (no taken / full)
+  longint unsigned dbg_fill_discard_q;    // !fill_added ? discard/accum-commit
+  longint unsigned dbg_fill_loop_mt_q;    // fill_added + taken + room ? FILL loop
+  longint unsigned dbg_fill_wait_q;       // no input, stayed in FILL
 
   // V77 hot-PC tracker: monitor builder activity for the top mismatch PCs
   localparam logic [PC_WIDTH-1:0] HOT_PC_0 = 64'h80002880;
@@ -433,10 +624,43 @@ module trace_builder #(
     if (!rst_ni) begin
       dbg_commit_q     <= 0;
       dbg_fill_start_q <= 0;
+      dbg_fill_loop_q  <= 0;
+      dbg_fill_flush_q    <= 0;
+      dbg_fill_pcguard_q  <= 0;
+      dbg_fill_commit_q   <= 0;
+      dbg_fill_discard_q  <= 0;
+      dbg_fill_loop_mt_q  <= 0;
+      dbg_fill_wait_q     <= 0;
+      dbg_pcguard_miss_total <= 0;
+      dbg_pcguard_hit_total  <= 0;
       dbg_fill_hot0 <= 0; dbg_fill_hot1 <= 0; dbg_fill_hot2 <= 0; dbg_fill_hot3 <= 0;
       dbg_commit_hot0 <= 0; dbg_commit_hot1 <= 0; dbg_commit_hot2 <= 0; dbg_commit_hot3 <= 0;
     end else begin
       if (commit_valid_d)                              dbg_commit_q     <= dbg_commit_q + 1;
+      // V90: count FILL?FILL loops (multi-taken continuations)
+      if (state_q == TB_FILL && state_d == TB_FILL)
+        dbg_fill_loop_q <= dbg_fill_loop_q + 1;
+      // V90-diag: FILL exit reason counters
+      if (state_q == TB_FILL) begin
+        case (fill_exit_reason)
+          3'd1: dbg_fill_flush_q    <= dbg_fill_flush_q + 1;
+          3'd2: dbg_fill_pcguard_q  <= dbg_fill_pcguard_q + 1;  // discard (pcguard or other)
+          3'd3: dbg_fill_commit_q   <= dbg_fill_commit_q + 1;
+          3'd4: dbg_fill_discard_q  <= dbg_fill_discard_q + 1;  // accum-commit (!fill_added)
+          3'd5: dbg_fill_loop_mt_q  <= dbg_fill_loop_mt_q + 1;
+          3'd6: dbg_fill_wait_q     <= dbg_fill_wait_q + 1;
+          default: ;
+        endcase
+        // Count cycles where PC guard gets a valid but wrong-PC window
+        if (fill_exit_reason == 3'd6) begin
+          // Check if any slots were valid (wrong-PC wait) vs no slots valid (empty wait)
+          if (|instr_i.valid)
+            dbg_pcguard_miss_total <= dbg_pcguard_miss_total + 1;
+        end
+        // Count successful PC guard matches (w_had_input means guard passed)
+        if (fill_exit_reason != 3'd1 && fill_exit_reason != 3'd6 && fill_exit_reason != 3'd0)
+          dbg_pcguard_hit_total <= dbg_pcguard_hit_total + 1;
+      end
       if (state_d == TB_FILL && state_q == TB_IDLE) begin
         dbg_fill_start_q <= dbg_fill_start_q + 1;
         if (accum_base_pc_nxt == HOT_PC_0) begin dbg_fill_hot0 <= dbg_fill_hot0 + 1;
@@ -462,8 +686,14 @@ module trace_builder #(
   end
 
   final begin
-    $display("[TC-BUILDER] V70 1-window: commits=%0d fill_starts=%0d",
-             dbg_commit_q, dbg_fill_start_q);
+    $display("[TC-BUILDER] V90 multi-taken: commits=%0d fill_starts=%0d fill_loops=%0d",
+             dbg_commit_q, dbg_fill_start_q, dbg_fill_loop_q);
+    $display("[TC-BUILDER-DIAG] flush=%0d pcguard_discard=%0d commit=%0d accum_commit=%0d loop_mt=%0d wait=%0d",
+             dbg_fill_flush_q, dbg_fill_pcguard_q, dbg_fill_commit_q,
+             dbg_fill_discard_q, dbg_fill_loop_mt_q, dbg_fill_wait_q);
+    $display("[TC-BUILDER-DIAG2] pcguard_hit=%0d pcguard_miss_with_valid=%0d wait_no_valid=%0d",
+             dbg_pcguard_hit_total, dbg_pcguard_miss_total,
+             dbg_fill_wait_q - dbg_pcguard_miss_total);
     $display("[TC-HOTPC-BUILDER] fill_starts: 0x%h=%0d  0x%h=%0d  0x%h=%0d  0x%h=%0d",
              HOT_PC_0[31:0], dbg_fill_hot0, HOT_PC_1[31:0], dbg_fill_hot1,
              HOT_PC_2[31:0], dbg_fill_hot2, HOT_PC_3[31:0], dbg_fill_hot3);

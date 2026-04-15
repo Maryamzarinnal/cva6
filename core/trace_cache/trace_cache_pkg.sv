@@ -28,8 +28,8 @@ package trace_cache_pkg;
   localparam int unsigned SUFFIX_CHUNKS = MAX_TRACE_INSTR * 2;
   localparam int unsigned SUFFIX_LEN_WIDTH = $clog2(MAX_TRACE_INSTR + 1);
 
-  // V70: one taken branch per trace.
-  localparam int unsigned MAX_TAKEN = 1;
+  // V90: up to 3 taken branches per trace (multi-window builder).
+  localparam int unsigned MAX_TAKEN = 3;
   localparam int unsigned TAKEN_CNT_WIDTH = $clog2(MAX_TAKEN + 1);
 
   // PCs are not stored per instruction; on hit we derive them from base_pc + instr + branch_flags.

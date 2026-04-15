@@ -2,11 +2,17 @@
 import trace_cache_pkg::*;
 import riscv::*;
 
-// V83 skewed-associative trace cache with speculative trace invalidation.
+// V90 skewed-associative trace cache with multi-taken-branch support.
+// V90: MAX_TAKEN raised to 3.  Builder spans multiple fetch windows to
+//      record traces with up to 3 taken branches.  Simple replay policy
+//      (accept length ? 3, no profitability filter).
 // Each way uses a different hash function (H0 / H1) so that PCs
 // colliding in one way's set likely map to different sets in the other
 // way.  This breaks hot-set concentration.
 // Traces are 1 fetch window (4 instructions, 1 taken branch max).
+// V85: builder now accepts returns (target from RAS prediction) and
+// direct calls (PC-relative target).  Frontend syncs the RAS during
+// trace replay.
 
 module trace_cache_top #(
   parameter int unsigned MaxTraceInstr = MAX_TRACE_INSTR
@@ -223,6 +229,12 @@ module trace_cache_top #(
   // Dedup comparison result (combinational ? see always_comb after gen_ways)
   logic [NUM_WAYS-1:0]     dedup_way_match;
   logic                    dedup_hit;
+
+  // V84: dedup revalidation ? suppress matched an FF-invalid entry (SRAM still has data)
+  logic [NUM_WAYS-1:0]     dedup_way_ff_invalid;  // matched way was FF-invalid
+  logic                    dedup_revalidate;      // suppress AND matched entry was FF-invalid
+  logic                    dedup_revalidate_way;  // which way to re-validate
+  logic [TRACE_ADDRW-1:0]  dedup_revalidate_addr; // set index to re-validate
 
   // Phase control signals (active for exactly one cycle each)
   logic                    dedup_check_fire;     // Phase 1: builder commit ? tag read
@@ -451,6 +463,9 @@ module trace_cache_top #(
       // that write is itself speculative)
       if (actual_write && !is_mispredict_event)
         valid_ff[final_wr_way][dedup_wr_addr] <= 1'b1;
+      // V84: re-validate FF bit when dedup matches an FF-invalid SRAM entry
+      if (dedup_revalidate && !is_mispredict_event)
+        valid_ff[dedup_revalidate_way][dedup_revalidate_addr] <= 1'b1;
     end
   end
 
@@ -467,17 +482,20 @@ module trace_cache_top #(
       for (int i = 0; i < SPEC_LOG_DEPTH; i++)
         spec_log_valid[i] <= 1'b0;
       spec_log_head <= '0;
-    end else if (actual_write) begin
+    end else if (actual_write || dedup_revalidate) begin
+      // V84: also log revalidated entries ? they're still speculative
       spec_log_valid[spec_log_head] <= 1'b1;
-      spec_log_way[spec_log_head]   <= final_wr_way;
-      spec_log_set[spec_log_head]   <= dedup_wr_addr;
+      spec_log_way[spec_log_head]   <= actual_write ? final_wr_way      : dedup_revalidate_way;
+      spec_log_set[spec_log_head]   <= actual_write ? dedup_wr_addr     : dedup_revalidate_addr;
       spec_log_head <= spec_log_head + 1;  // wraps naturally at SPEC_LOG_DEPTH
     end
   end
 
   // -----------------------------------------------------------------------
-  // V74 Dedup comparison: tag read-back from Phase 1 vs pending commit tag.
-  // Runs combinationally every cycle; gated by dedup_pending_q.
+  // V84 Dedup comparison: tag read-back from Phase 1 vs pending commit tag.
+  // Uses SRAM valid (not FF valid) so that FF-invalidated entries still
+  // suppress duplicate writes.  On suppress of an FF-invalid entry, the
+  // FF bit is re-validated (the data is already in SRAM).
   // -----------------------------------------------------------------------
   always_comb begin
     for (int w = 0; w < NUM_WAYS; w++) begin
@@ -488,12 +506,17 @@ module trace_cache_top #(
           dd_flags_ok &= (tag_rdata[w].branch_flags[b] == dedup_tag_q.branch_flags[b]);
       end
       dedup_way_match[w] = dedup_pending_q
-                         && dedup_ff_valid[w]  // V83: FF valid (not SRAM)
+                         && tag_rdata[w].valid  // V84: SRAM valid (catches FF-invalid entries)
                          && (tag_rdata[w].base_pc      == dedup_tag_q.base_pc)
                          && (tag_rdata[w].num_branches  == dedup_tag_q.num_branches)
                          && dd_flags_ok;
+      dedup_way_ff_invalid[w] = dedup_way_match[w] && !dedup_ff_valid[w];  // V84
     end
     dedup_hit = |dedup_way_match;
+    // V84: revalidation ? the matched entry needs its FF bit restored
+    dedup_revalidate = dedup_suppress_fire && |dedup_way_ff_invalid;
+    dedup_revalidate_way  = dedup_way_ff_invalid[1] ? 1'b1 : 1'b0;
+    dedup_revalidate_addr = dedup_way_ff_invalid[1] ? dedup_addr_w1_q : dedup_addr_q;
   end
 
   trace_data_t trace_read [NUM_WAYS];
@@ -924,6 +947,7 @@ module trace_cache_top #(
   int unsigned tc_spec_invalidations;   // V83: traces invalidated on misprediction
   int unsigned tc_spec_log_clears;      // V83: spec log cleared (correct resolution)
   int unsigned tc_spec_log_overflows;   // V83: spec log head wrapped before clear
+  int unsigned tc_dedup_revalidations;  // V84: dedup suppress re-validated an FF-invalid entry
 
   // -----------------------------------------------------------------------
   // V73 COMMIT DEBUG: Shadow tag/data arrays + churn analysis counters.
@@ -1242,6 +1266,7 @@ module trace_cache_top #(
       tc_spec_invalidations <= 0;
       tc_spec_log_clears <= 0;
       tc_spec_log_overflows <= 0;
+      tc_dedup_revalidations <= 0;
     end else begin
       if (actual_write)
         tc_recorded_traces <= tc_recorded_traces + 1;
@@ -1280,6 +1305,9 @@ module trace_cache_top #(
       // V83: spec log overflow (head wraps with valid entry still present)
       if (actual_write && spec_log_valid[spec_log_head])
         tc_spec_log_overflows <= tc_spec_log_overflows + 1;
+      // V84: count dedup revalidations
+      if (dedup_revalidate)
+        tc_dedup_revalidations <= tc_dedup_revalidations + 1;
 
       if (lookup_eligible) begin
         logic any_valid;
@@ -1326,10 +1354,10 @@ module trace_cache_top #(
              tc_valid_lookups, tc_useful_hits, tc_useful_rate);
     $display("[TC-USEFUL] unaligned_suppressed=%0d no_taken_suppressed=%0d (V78+V79)",
              tc_unaligned_suppressed, tc_no_taken_suppressed);
-    $display("[TC-GHR] mispredicts_seen=%0d restores=%0d resets=%0d (V83 pipeline+index+tag+spec_inval)",
+    $display("[TC-GHR] mispredicts_seen=%0d restores=%0d resets=%0d (V84 pipeline+index+tag+spec_inval+revalid)",
              tc_mispredicts_seen, tc_ghr_restores, tc_ghr_resets);
-    $display("[TC-SPEC] invalidations=%0d log_clears=%0d log_overflows=%0d (V83 speculative trace invalidation)",
-             tc_spec_invalidations, tc_spec_log_clears, tc_spec_log_overflows);
+    $display("[TC-SPEC] invalidations=%0d log_clears=%0d log_overflows=%0d revalidations=%0d (V84 spec inval + dedup revalid)",
+             tc_spec_invalidations, tc_spec_log_clears, tc_spec_log_overflows, tc_dedup_revalidations);
     $display("[TC-SPLIT-TAG] payload_mismatch=%0d (tag hit but payload slot was invalid)",
              tc_tag_payload_mismatch);
     `ifdef MODEL_TECH
