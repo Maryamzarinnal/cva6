@@ -44,6 +44,9 @@ module trace_builder #(
 
   localparam int unsigned CHUNK_PTR_W = $clog2(CHUNKS_PER_TRACE + 1);
   localparam int unsigned INSTR_CNT_W = $clog2(MAX_INSTR_PER_TRACE + 1);
+  // Minimum instruction count for a committed trace to survive replay-time
+  // policy (tc_trace_policy_ok in frontend.sv).  Must equal TC_MIN_ACCEPT_LEN.
+  localparam int unsigned TB_MIN_ACCEPT_LEN = 3;
 
   // -----------------------------------------------------------------------
   // State machine
@@ -148,6 +151,9 @@ module trace_builder #(
 
   // V90-diag: FILL exit reason (set in always_comb, read in always_ff)
   logic [2:0] fill_exit_reason;
+  // V92-retsafe: set in always_comb when a return stops the scan early,
+  // read in always_ff for counters ? must be module-scope for cross-block access.
+  logic        w_truncate_at_return;
 
   // V90-fix: latch-enable for accum registers ? only asserted when the
   // combinational block actually computes new accumulator values.
@@ -318,6 +324,7 @@ module trace_builder #(
     w_exit_pc      = '0;
     w_taken_cnt    = '0;
     w_taken_targets = '0;
+    w_truncate_at_return = 1'b0;
     payload        = '0;
     cand_addr      = '0;
 
@@ -404,6 +411,15 @@ module trace_builder #(
         // direct calls.  Reject other indirect CFs (computed jumps).
         if (instr_i.is_branch[i] && !direct && !ret_cf && !call_cf) begin
           w_reject = 1'b1;
+          break;
+        end
+
+        // V92-retsafe: Truncate trace at return instruction boundary.
+        // Do not store the return or any instruction at/after it ? the
+        // return target comes from the RAS and is runtime-dynamic, so
+        // embedding it in the trace would produce stale wrong-path replays.
+        if (ret_cf) begin
+          w_truncate_at_return = 1'b1;
           break;
         end
 
@@ -595,6 +611,17 @@ module trace_builder #(
             fill_exit_reason = 3'd6;  // wait (no input)
         end
       endcase
+
+      // V92-retsafe: suppress the write if the truncated trace is shorter
+      // than the replay-time minimum.  A too-short trace written to SRAM
+      // would be rejected on every replay anyway, wasting a slot.
+      // Also fix fill_exit_reason so dbg_fill_commit_q does not count this
+      // as a successful commit (reclassify to 2 = discard).
+      if (w_truncate_at_return && commit_valid_d &&
+          (w_icnt < INSTR_CNT_W'(TB_MIN_ACCEPT_LEN))) begin
+        commit_valid_d   = 1'b0;
+        fill_exit_reason = 3'd2;  // discard ? return made trace too short
+      end
     end
   end
 
@@ -610,6 +637,10 @@ module trace_builder #(
   longint unsigned dbg_fill_discard_q;    // !fill_added ? discard/accum-commit
   longint unsigned dbg_fill_loop_mt_q;    // fill_added + taken + room ? FILL loop
   longint unsigned dbg_fill_wait_q;       // no input, stayed in FILL
+
+  // V92-retsafe counters
+  longint unsigned dbg_ret_truncated_q;   // trace shortened before return, still accepted
+  longint unsigned dbg_ret_rejected_q;    // trace dropped because return made it too short
 
   // V77 hot-PC tracker: monitor builder activity for the top mismatch PCs
   localparam logic [PC_WIDTH-1:0] HOT_PC_0 = 64'h80002880;
@@ -631,6 +662,8 @@ module trace_builder #(
       dbg_fill_discard_q  <= 0;
       dbg_fill_loop_mt_q  <= 0;
       dbg_fill_wait_q     <= 0;
+      dbg_ret_truncated_q <= 0;
+      dbg_ret_rejected_q  <= 0;
       dbg_pcguard_miss_total <= 0;
       dbg_pcguard_hit_total  <= 0;
       dbg_fill_hot0 <= 0; dbg_fill_hot1 <= 0; dbg_fill_hot2 <= 0; dbg_fill_hot3 <= 0;
@@ -661,6 +694,15 @@ module trace_builder #(
         if (fill_exit_reason != 3'd1 && fill_exit_reason != 3'd6 && fill_exit_reason != 3'd0)
           dbg_pcguard_hit_total <= dbg_pcguard_hit_total + 1;
       end
+      // V92-retsafe: count all return encounters ? TB_IDLE (trace never started)
+      // and TB_FILL (truncated-and-accepted vs. too-short-or-no-taken rejected).
+      if (w_truncate_at_return) begin
+        if (commit_valid_d)
+          dbg_ret_truncated_q <= dbg_ret_truncated_q + 1;
+        else
+          dbg_ret_rejected_q  <= dbg_ret_rejected_q  + 1;
+      end
+
       if (state_d == TB_FILL && state_q == TB_IDLE) begin
         dbg_fill_start_q <= dbg_fill_start_q + 1;
         if (accum_base_pc_nxt == HOT_PC_0) begin dbg_fill_hot0 <= dbg_fill_hot0 + 1;
@@ -694,6 +736,8 @@ module trace_builder #(
     $display("[TC-BUILDER-DIAG2] pcguard_hit=%0d pcguard_miss_with_valid=%0d wait_no_valid=%0d",
              dbg_pcguard_hit_total, dbg_pcguard_miss_total,
              dbg_fill_wait_q - dbg_pcguard_miss_total);
+    $display("[TC-FINAL] tc_truncated_return=%0d tc_rejected_return=%0d",
+             dbg_ret_truncated_q, dbg_ret_rejected_q);
     $display("[TC-HOTPC-BUILDER] fill_starts: 0x%h=%0d  0x%h=%0d  0x%h=%0d  0x%h=%0d",
              HOT_PC_0[31:0], dbg_fill_hot0, HOT_PC_1[31:0], dbg_fill_hot1,
              HOT_PC_2[31:0], dbg_fill_hot2, HOT_PC_3[31:0], dbg_fill_hot3);
