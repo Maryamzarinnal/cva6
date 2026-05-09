@@ -50,6 +50,13 @@ module trace_cache_top #(
   // Lookup interface
   input  logic                         lookup_valid_i,
   input  logic [PC_WIDTH-1:0]          lookup_pc_i,
+  // V94: 1 = frontend fired this lookup as the early-unaligned variant
+  // (lookup_pc_i is the address of the unaligned instruction that next
+  // cycle's instr_realign will deliver as addr[0]). The result cycle is
+  // therefore expected to have serving_unaligned_i==1; otherwise the
+  // predicted unaligned delivery did not actually happen (flush /
+  // mispredict / pipeline stall) and the lookup result is meaningless.
+  input  logic                         lookup_predicts_unaligned_i,
 
   // Lookup results
   output logic                                        trace_hit_o,
@@ -190,13 +197,21 @@ module trace_cache_top #(
   logic [TRACE_ADDRW-1:0]      lookup_set_w1_q;  // V83: way-1 set index for FF valid lookup
   logic [GHR_WIDTH-1:0]        lookup_ghr_q;  // V82: registered GHR for tag compare
 
-  // V79: combined eligibility ? lookup result is only meaningful when:
-  //  (a) not serving an unaligned straddling instruction (V78), AND
-  //  (b) the window has at least one predicted-taken CF (V79).
-  // Without (b) no stored trace can match: every stored trace has ?1
-  // taken branch, so a tk0-window always produces path_mismatch or
-  // pc_mismatch.  Suppressing these avoids SRAM-bandwidth waste in
-  // the counters and eliminates ~55% of spurious miss events.
+  // V94: registered "this lookup targeted the unaligned PC of the cycle that
+  // is now the result cycle". Used to check that the actual delivery cycle
+  // matches the prediction (serving_unaligned_i must agree).
+  logic lookup_predicted_unaligned_q;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni)            lookup_predicted_unaligned_q <= 1'b0;
+    else if (lookup_fire)   lookup_predicted_unaligned_q <= lookup_predicts_unaligned_i;
+    else                    lookup_predicted_unaligned_q <= 1'b0;
+  end
+
+  // Tag comparison consumes LIVE branch_predictions_i / lookup_num_branches_i
+  // from the result cycle. With the V94 early-unaligned lookup, the result
+  // cycle's window IS the window the lookup targeted (aligned-for-aligned,
+  // unaligned-for-unaligned), so the live predictions correctly describe it.
+  // No more prev-cycle registers, no more eff_* selectors.
   logic lookup_eligible;
 
   // -----------------------------------------------------------------------
@@ -249,7 +264,18 @@ module trace_cache_top #(
 
   assign lookup_fire           = lookup_valid_i && !dedup_check_fire && !dedup_write_fire;
   assign lookup_result_valid_o = lookup_valid_q;
-  assign lookup_eligible       = lookup_valid_q && !serving_unaligned_i && window_has_taken_pred_i;
+  // V94: a lookup result is meaningful when:
+  //   1. it actually fired (lookup_valid_q),
+  //   2. the result-cycle window has >=1 predicted-taken CF (V79: every
+  //      stored trace has >=1 taken branch, so a no-taken window can't hit),
+  //   3. the lookup's predicted alignment matches the actual delivery
+  //      (predicted-unaligned <-> serving_unaligned_i). When they disagree,
+  //      a flush/mispredict cancelled the predicted unaligned cycle (or vice
+  //      versa) and the SRAM result describes a window that isn't being
+  //      served ? suppress to avoid polluting hit/miss counters.
+  assign lookup_eligible = lookup_valid_q &&
+                           window_has_taken_pred_i &&
+                           (lookup_predicted_unaligned_q == serving_unaligned_i);
 
   // IMPORTANT: exact trace-start PC, not a 16-byte aligned block base.
   logic [PC_WIDTH-1:0] lookup_base;
@@ -541,6 +567,11 @@ module trace_cache_top #(
                                    (trace_tag_read[w].num_branches ==
                                     TRIGGER_BRANCH_CNT_WIDTH'(lookup_num_branches_i));
 
+    // V94: tag compare uses LIVE branch_predictions_i / lookup_num_branches_i.
+    // The early-unaligned lookup makes the result cycle's window match the
+    // lookup target (aligned for aligned, unaligned for unaligned), so the
+    // live predictions correctly describe the window the SRAM tag should be
+    // compared against ? no prev-cycle compensation needed.
     trace_tag_compare i_trace_tag_compare (
       .base_pc_i      (lookup_pc_q),
       .num_branches_i (TRIGGER_BRANCH_CNT_WIDTH'(lookup_num_branches_i)),
@@ -1000,6 +1031,8 @@ module trace_cache_top #(
   int unsigned cmt_other_way_same_pc;
   // Trace length histogram for committed traces.
   int unsigned cmt_len_hist [2:TRACE_LEN];
+  // Committed trace histogram by number of taken control-flow instructions.
+  int unsigned cmt_taken_hist [0:MAX_TAKEN];
 
   // Combinational classification signals (computed every cycle, consumed
   // by always_ff on actual_write).
@@ -1011,7 +1044,10 @@ module trace_cache_top #(
   logic        cmt_oth_same_pc;
   int          cmt_new_instr_cnt;
   logic [PC_WIDTH-1:0] cmt_new_target_addr;
+  logic [TAKEN_CNT_WIDTH-1:0] cmt_new_num_taken;
   logic [PC_WIDTH-1:0] cmt_new_taken_tgt0;
+  logic [PC_WIDTH-1:0] cmt_new_taken_tgt1;
+  logic [PC_WIDTH-1:0] cmt_new_taken_tgt2;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -1042,7 +1078,10 @@ module trace_cache_top #(
     c_new_data   = dedup_data_q;
 
     cmt_new_target_addr = c_new_data.target_addr;
+    cmt_new_num_taken   = c_new_data.num_taken;
     cmt_new_taken_tgt0  = c_new_data.taken_targets[0];
+    cmt_new_taken_tgt1  = c_new_data.taken_targets[1];
+    cmt_new_taken_tgt2  = c_new_data.taken_targets[2];
 
     cmt_old_valid = c_old_tag.valid && shadow_data_valid[final_wr_way][dedup_wr_addr];
     cmt_same_pc   = (c_old_tag.base_pc == c_new_tag.base_pc);
@@ -1107,6 +1146,8 @@ module trace_cache_top #(
       cmt_other_way_same_pc       <= 0;
       for (int l = 2; l <= TRACE_LEN; l++)
         cmt_len_hist[l] <= 0;
+      for (int t = 0; t <= MAX_TAKEN; t++)
+        cmt_taken_hist[t] <= 0;
     end else if (actual_write) begin
       if (!cmt_old_valid) begin
         cmt_into_invalid <= cmt_into_invalid + 1;
@@ -1129,6 +1170,13 @@ module trace_cache_top #(
 
       if (cmt_new_instr_cnt >= 2 && cmt_new_instr_cnt <= TRACE_LEN)
         cmt_len_hist[cmt_new_instr_cnt] <= cmt_len_hist[cmt_new_instr_cnt] + 1;
+
+      case (cmt_new_num_taken)
+        TAKEN_CNT_WIDTH'(0): cmt_taken_hist[0] <= cmt_taken_hist[0] + 1;
+        TAKEN_CNT_WIDTH'(1): cmt_taken_hist[1] <= cmt_taken_hist[1] + 1;
+        TAKEN_CNT_WIDTH'(2): cmt_taken_hist[2] <= cmt_taken_hist[2] + 1;
+        default:             cmt_taken_hist[MAX_TAKEN] <= cmt_taken_hist[MAX_TAKEN] + 1;
+      endcase
     end
   end
 
@@ -1141,15 +1189,18 @@ module trace_cache_top #(
       cmt_display_count <= cmt_display_count + 1;
 
       if (cmt_display_count < 512 || (cmt_display_count % 50000 == 0)) begin
-        $display("[TC-COMMIT] #%0d t=%0t set_h0=%0d set_h1=%0d way=%0d | new: base_pc=0x%h nbr=%0d bflags=%b tgt=0x%h len=%0d taken_tgt[0]=0x%h",
+        $display("[TC-COMMIT] #%0d t=%0t set_h0=%0d set_h1=%0d way=%0d | new: base_pc=0x%h nbr=%0d ntaken=%0d bflags=%b tgt=0x%h len=%0d taken_tgt[0]=0x%h taken_tgt[1]=0x%h taken_tgt[2]=0x%h",
                  cmt_display_count, $time,
                  dedup_addr_q, dedup_addr_w1_q, final_wr_way,
                  dedup_tag_q.base_pc[31:0],
                  dedup_tag_q.num_branches,
+                 cmt_new_num_taken,
                  dedup_tag_q.branch_flags,
                  cmt_new_target_addr[31:0],
                  cmt_new_instr_cnt,
-                 cmt_new_taken_tgt0[31:0]);
+                 cmt_new_taken_tgt0[31:0],
+                 cmt_new_taken_tgt1[31:0],
+                 cmt_new_taken_tgt2[31:0]);
 
         if (cmt_old_valid)
           $display("[TC-COMMIT]   replaced: base_pc=0x%h nbr=%0d bflags=%b tgt=0x%h %s",
@@ -1276,9 +1327,11 @@ module trace_cache_top #(
       if (lookup_valid_i && (dedup_check_fire || dedup_write_fire))
         tc_lookup_blocked_by_builder <= tc_lookup_blocked_by_builder + 1;
 
-      // V78: count suppressed unaligned-window lookups separately
-      // V79: also count suppressed no-taken-pred lookups
-      if (lookup_valid_q && serving_unaligned_i)
+      // V94: counters reflect the alignment-mismatch suppression. With the
+      // early-unaligned lookup the prediction usually matches delivery; this
+      // increments only when a flush/mispredict cancels the predicted cycle
+      // (predicted aligned but delivery unaligned, or vice versa).
+      if (lookup_valid_q && (lookup_predicted_unaligned_q != serving_unaligned_i))
         tc_unaligned_suppressed <= tc_unaligned_suppressed + 1;
       else if (lookup_valid_q && !window_has_taken_pred_i)
         tc_no_taken_suppressed <= tc_no_taken_suppressed + 1;
@@ -1381,6 +1434,9 @@ module trace_cache_top #(
              cmt_other_way_same_pc);
     $display("[TC-CHURN] len_hist: len2=%0d len3=%0d len4=%0d",
              cmt_len_hist[2], cmt_len_hist[3], cmt_len_hist[4]);
+    $display("[TC-MULTITAKEN] commit_taken_hist: tk0=%0d tk1=%0d tk2=%0d tk3p=%0d",
+             cmt_taken_hist[0], cmt_taken_hist[1], cmt_taken_hist[2],
+             cmt_taken_hist[MAX_TAKEN]);
     $display("[TC-CHURN] ==========================================");
 
     // V76 PC-mismatch analysis summary

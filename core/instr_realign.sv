@@ -43,7 +43,13 @@ module instr_realign
     // Instruction address - FRONTEND
     output logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] addr_o,
     // Instruction - instr_scan&instr_queue
-    output logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0] instr_o
+    output logic [CVA6Cfg.INSTR_PER_FETCH-1:0][31:0] instr_o,
+    // V94: combinational telegraph of next-cycle alignment state. Lets the
+    // trace cache fire its SRAM read one cycle ahead for unaligned-bound
+    // windows so the result is available the same cycle the unaligned
+    // instruction reaches the IQ (matching the aligned lookup pipeline).
+    output logic                                                 next_serving_unaligned_o,
+    output logic [CVA6Cfg.VLEN-1:0]                              next_unaligned_address_o
 );
   // as a maximum we support a fetch width of 64-bit, hence there can be 4 compressed instructions
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0] instr_is_compressed;
@@ -61,6 +67,12 @@ module instr_realign
   logic [CVA6Cfg.VLEN-1:0] unaligned_address_d, unaligned_address_q;
   // we have an unaligned instruction
   assign serving_unaligned_o = unaligned_q;
+
+  // V94: expose the combinational next-cycle state. unaligned_d == 1 means
+  // the FF will latch unaligned_q=1 at end of this cycle, so next cycle's
+  // serving_unaligned_o will be 1 with addr_o[0]==unaligned_address_d.
+  assign next_serving_unaligned_o = unaligned_d;
+  assign next_unaligned_address_o = unaligned_address_d;
 
   // Instruction re-alignment
   if (CVA6Cfg.FETCH_WIDTH == 32) begin : realign_bp_32

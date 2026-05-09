@@ -161,6 +161,18 @@ module trace_builder #(
   // the default '0 (the original bug that zeroed accum_taken_target_q).
   logic accum_latch_en;
 
+  // V95: Builder value filter. Each commit site sets this to "is this trace
+  // worth occupying an SRAM way?".
+  //   - num_taken >= 2 : multi-taken trace, always worth it (saves redirect
+  //                      bubbles the icache pipeline cannot avoid).
+  //   - num_taken == 1 : single-taken trace, worth it only if long enough
+  //                      to net positive vs the kill_s1 bubble cost
+  //                      (instr_count >= 4, since net = N - K - 1 where K~2).
+  // Anything else (single-taken length 2 or 3) is dropped at commit time ?
+  // these would either be net-zero (L=3) or net-negative (L=2) replays and
+  // would just evict more valuable entries from the cache.
+  logic tb_commit_value_ok_d;
+
 `ifndef SYNTHESIS
   // V90-diag: PC guard diagnostics (declared early for use in always_comb)
   longint unsigned dbg_pcguard_miss_total;
@@ -199,7 +211,10 @@ module trace_builder #(
       commit_data_q  <= '0;
     end else begin
       state_q        <= state_d;
-      commit_valid_q <= commit_valid_d;
+      // V95: gate the commit on the value filter so dropped traces never
+      // touch SRAM. commit_addr/tag/data still latch (cheap, single payload)
+      // but with commit_valid_q=0 they are inert downstream.
+      commit_valid_q <= commit_valid_d && tb_commit_value_ok_d;
       commit_addr_q  <= commit_addr_d;
       commit_tag_q   <= commit_tag_d;
       commit_data_q  <= commit_data_d;
@@ -298,6 +313,10 @@ module trace_builder #(
     commit_addr_d  = commit_addr_q;
     commit_tag_d   = commit_tag_q;
     commit_data_d  = commit_data_q;
+    // V95: default 0; each commit branch sets it explicitly. With
+    // commit_valid_d also defaulted to 0 the FF gate is a no-op until a
+    // branch sets both.
+    tb_commit_value_ok_d = 1'b0;
 
     accum_base_pc_nxt      = '0;
     accum_trig_flags_nxt   = '0;
@@ -521,6 +540,10 @@ module trace_builder #(
                                             accum_ghr_q);
             commit_valid_d = 1'b1;
             commit_data_d  = payload;
+            // V95: at-entry-full path ? instr count == MAX_INSTR_PER_TRACE,
+            // which is >=4, so always passes the value filter.
+            tb_commit_value_ok_d = (accum_taken_cnt_q >= TAKEN_CNT_WIDTH'(2)) ||
+                                   (INSTR_CNT_W'(MAX_INSTR_PER_TRACE) >= INSTR_CNT_W'(4));
             state_d = TB_IDLE;
             fill_exit_reason = 3'd3;  // early-commit (full at entry)
           end else if (w_had_input || w_reject || w_overflow) begin
@@ -572,6 +595,9 @@ module trace_builder #(
                                                 accum_ghr_q);
                 commit_valid_d = 1'b1;
                 commit_data_d  = payload;
+                // V95: value filter ? commit only multi-taken or length>=4.
+                tb_commit_value_ok_d = (w_taken_cnt >= TAKEN_CNT_WIDTH'(2)) ||
+                                       (w_icnt      >= INSTR_CNT_W'(4));
                 state_d = TB_IDLE;
                 fill_exit_reason = 3'd3;  // commit (fill_added, no-taken/full)
               end
@@ -601,6 +627,9 @@ module trace_builder #(
                                                 accum_ghr_q);
                 commit_valid_d = 1'b1;
                 commit_data_d  = payload;
+                // V95: value filter ? commit only multi-taken or length>=4.
+                tb_commit_value_ok_d = (accum_taken_cnt_q >= TAKEN_CNT_WIDTH'(2)) ||
+                                       (accum_instr_cnt_q >= INSTR_CNT_W'(4));
               end
               state_d = TB_IDLE;
               fill_exit_reason = (commit_valid_d) ? 3'd4 : 3'd2;  // 4=accum-commit, 2=discard(pcguard/etc)
@@ -650,6 +679,9 @@ module trace_builder #(
 
   int unsigned dbg_fill_hot0, dbg_fill_hot1, dbg_fill_hot2, dbg_fill_hot3;
   int unsigned dbg_commit_hot0, dbg_commit_hot1, dbg_commit_hot2, dbg_commit_hot3;
+  // V95: how many builder commits were dropped by the value filter.
+  longint unsigned dbg_value_filter_drops_q;
+  longint unsigned dbg_value_filter_pass_q;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -668,8 +700,13 @@ module trace_builder #(
       dbg_pcguard_hit_total  <= 0;
       dbg_fill_hot0 <= 0; dbg_fill_hot1 <= 0; dbg_fill_hot2 <= 0; dbg_fill_hot3 <= 0;
       dbg_commit_hot0 <= 0; dbg_commit_hot1 <= 0; dbg_commit_hot2 <= 0; dbg_commit_hot3 <= 0;
+      dbg_value_filter_drops_q <= 0;
+      dbg_value_filter_pass_q  <= 0;
     end else begin
       if (commit_valid_d)                              dbg_commit_q     <= dbg_commit_q + 1;
+      // V95: split commits by value-filter outcome.
+      if (commit_valid_d &&  tb_commit_value_ok_d)     dbg_value_filter_pass_q  <= dbg_value_filter_pass_q  + 1;
+      if (commit_valid_d && !tb_commit_value_ok_d)     dbg_value_filter_drops_q <= dbg_value_filter_drops_q + 1;
       // V90: count FILL?FILL loops (multi-taken continuations)
       if (state_q == TB_FILL && state_d == TB_FILL)
         dbg_fill_loop_q <= dbg_fill_loop_q + 1;
@@ -738,6 +775,8 @@ module trace_builder #(
              dbg_fill_wait_q - dbg_pcguard_miss_total);
     $display("[TC-FINAL] tc_truncated_return=%0d tc_rejected_return=%0d",
              dbg_ret_truncated_q, dbg_ret_rejected_q);
+    $display("[TC-V95] builder_value_filter: pass=%0d drop=%0d (drop = single-taken trace with len<4)",
+             dbg_value_filter_pass_q, dbg_value_filter_drops_q);
     $display("[TC-HOTPC-BUILDER] fill_starts: 0x%h=%0d  0x%h=%0d  0x%h=%0d  0x%h=%0d",
              HOT_PC_0[31:0], dbg_fill_hot0, HOT_PC_1[31:0], dbg_fill_hot1,
              HOT_PC_2[31:0], dbg_fill_hot2, HOT_PC_3[31:0], dbg_fill_hot3);
