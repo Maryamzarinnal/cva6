@@ -255,17 +255,22 @@ module frontend
   cf_t [CVA6Cfg.INSTR_PER_FETCH-1:0]                     cf_type;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]                    taken_rvi_cf, taken_rvc_cf;
   logic                                                   serving_unaligned;
+  // V94: combinational next-cycle alignment forecast from instr_realign.
+  logic                                                   next_serving_unaligned;
+  logic [CVA6Cfg.VLEN-1:0]                                next_unaligned_address;
 
   instr_realign #(.CVA6Cfg(CVA6Cfg)) i_instr_realign (
       .clk_i, .rst_ni,
-      .flush_i            (icache_dreq_o.kill_s2),
-      .valid_i            (icache_valid_q),
-      .serving_unaligned_o(serving_unaligned),
-      .address_i          (icache_vaddr_q),
-      .data_i             (icache_data_q),
-      .valid_o            (instruction_valid),
-      .addr_o             (addr),
-      .instr_o            (instr)
+      .flush_i                  (icache_dreq_o.kill_s2),
+      .valid_i                  (icache_valid_q),
+      .serving_unaligned_o      (serving_unaligned),
+      .address_i                (icache_vaddr_q),
+      .data_i                   (icache_data_q),
+      .valid_o                  (instruction_valid),
+      .addr_o                   (addr),
+      .instr_o                  (instr),
+      .next_serving_unaligned_o (next_serving_unaligned),
+      .next_unaligned_address_o (next_unaligned_address)
   );
 
   if (CVA6Cfg.RVC) begin : gen_btb_prediction_shifted
@@ -1005,26 +1010,50 @@ module frontend
   end
 
   // -----------------------------------------------------------------------
-  // V71: TC SRAM lookup fires when I$ responds.  The SRAM data arrives
-  // next cycle ? the same cycle the instruction scan runs and produces
-  // branch_predictions.  Tag comparison is then same-cycle.
+  // TC SRAM lookup. Single-cycle SRAM: the read fires this cycle, the data
+  // returns next cycle, where it is tag-compared against the same window's
+  // live branch_predictions and consumed by the IQ-side mux.
   //
-  // Lookup PC is icache_dreq_i.vaddr of the *previous* cycle, latched
-  // into icache_vaddr_q.  We use addr[0] (the realigned first-instruction
-  // PC) as the precise lookup key ? it equals icache_vaddr_q for aligned
-  // fetches and is the correct base_pc for tag matching.
+  // Two firing paths share the SRAM port:
+  //  - aligned: lookup fires the cycle the I$ returns a new block; result
+  //    lands the cycle that block is realigned and presented to the IQ.
+  //  - V94 early-unaligned: when this cycle's instr_realign tells us next
+  //    cycle will be serving_unaligned, fire the SRAM at the unaligned PC
+  //    THIS cycle so the result lands the same cycle the unaligned instr
+  //    is presented to the IQ ? same pipeline shape as aligned. The aligned
+  //    lookup that would otherwise fire this cycle is overridden because
+  //    its result would have landed on the unaligned cycle (wrong window).
   // -----------------------------------------------------------------------
   logic                tc_lookup_valid;
   logic [PC_WIDTH-1:0] tc_lookup_pc;
+  // V94: early-unaligned lookup. instr_realign tells us THIS cycle whether
+  // next cycle will serve an unaligned 32-bit instruction whose first half
+  // sits in the block being processed now and whose second half is in the
+  // block currently arriving on icache_dreq_i. By firing the SRAM read at
+  // H(next_unaligned_address) THIS cycle, the result returns next cycle,
+  // exactly when serving_unaligned=1 and addr[0]=next_unaligned_address ?
+  // identical timing to an aligned lookup. The aligned lookup that would
+  // otherwise have fired this cycle would have its result land on the
+  // unaligned cycle (wrong window) so it's strictly safe to override it.
+  logic                    tc_early_unaligned_lookup;
+  assign tc_early_unaligned_lookup = next_serving_unaligned && icache_valid_q &&
+                                     tc_window_eligible && !flush_i;
 
-  assign tc_lookup_valid = icache_dreq_i.valid && !flush_i && tc_window_eligible;
-  assign tc_lookup_pc    = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}}, icache_dreq_i.vaddr};
+  assign tc_lookup_valid = tc_early_unaligned_lookup ||
+                           (icache_dreq_i.valid && !flush_i && tc_window_eligible);
 
-  // V77: 1-cycle delayed lookup PC (aligned with tc_lookup_result_valid)
+  assign tc_lookup_pc    = {{(PC_WIDTH-CVA6Cfg.VLEN){1'b0}},
+                            tc_early_unaligned_lookup ? next_unaligned_address
+                                                      : icache_dreq_i.vaddr};
+
+  // 1-cycle delayed lookup PC, aligned with tc_lookup_result_valid. Must
+  // mirror the actual key submitted to the SRAM (not icache_dreq_i.vaddr,
+  // which diverges from tc_lookup_pc on early-unaligned lookups). Used by
+  // TC-PCMISS / HOTPC observability in this file.
   logic [CVA6Cfg.VLEN-1:0] tc_lookup_pc_q;
   always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) tc_lookup_pc_q <= '0;
-    else         tc_lookup_pc_q <= icache_dreq_i.vaddr;
+    if (!rst_ni)               tc_lookup_pc_q <= '0;
+    else if (tc_lookup_valid)  tc_lookup_pc_q <= tc_lookup_pc[CVA6Cfg.VLEN-1:0];
   end
 
   trace_cache_top #(
@@ -1040,6 +1069,7 @@ module frontend
       .branch_target_i                (tc_target),
       .serving_unaligned_i            (serving_unaligned),
       .flush_i                        (flush_i || is_mispredict),
+      .tc_replay_fired_i              (tc_hit_this_cycle),
       .instr_queue_ready_i            (instr_queue_ready && tc_builder_enable),
       .instr_queue_consumed_i         (tc_builder_enable ? instr_queue_consumed : '0),
       .branch_predictions_i           (tc_branch_predictions),
@@ -1053,6 +1083,7 @@ module frontend
       .ghr_o                          (tc_ghr_from_tc),
       .lookup_valid_i                 (tc_lookup_valid),
       .lookup_pc_i                    (tc_lookup_pc),
+      .lookup_predicts_unaligned_i    (tc_early_unaligned_lookup),
       .trace_hit_o                    (tc_trace_hit),
       .trace_instructions_o           (tc_trace_instructions),
       .trace_length_o                 (tc_trace_length),
@@ -1118,17 +1149,76 @@ module frontend
                               !tc_disable_replay_q;
 
   // V72: Pending trace buffer invalidation ? any path-breaking event.
+  // V96-fix: use (replay & ~tc_pending_valid_q) instead of replay_eff here.
+  // replay_eff = replay & ~tc_hit_this_cycle caused a combinational loop:
+  //   tc_pending_use ? tc_hit_this_cycle ? tc_feeding_i ? IQ replay_o ?
+  //   replay ? replay_eff ? tc_pending_invalidate ? tc_pending_use
+  // Since tc_pending_valid_q is registered, substituting ~tc_pending_valid_q
+  // for ~tc_hit_this_cycle breaks the loop.  The semantics are equivalent:
+  //   ? when tc_pending_valid_q=1: replay=0 always (tc_suppress_icache=1 ?
+  //     valid_to_iq=0 ? no IQ overflow), so both terms are 0.
+  //   ? when tc_pending_valid_q=0: tc_pending_use=0 regardless, and
+  //     tc_hit_this_cycle=tc_direct_hit (registered-based), so replay is
+  //     stable ? no feedback through this path.
   assign tc_pending_invalidate = flush_i || is_mispredict || ex_valid_i ||
-                                 eret_i || set_pc_commit_i || replay_eff ||
+                                 eret_i || set_pc_commit_i ||
+                                 (replay & ~tc_pending_valid_q) ||
                                  (CVA6Cfg.DebugEn && set_debug_pc_i);
+
+  // -----------------------------------------------------------------------
+  // V95 ? Two-tier value-aware replay gating.
+  //
+  // A TC hit costs 1 kill_s1 bubble. Whether it pays back depends on what
+  // the trace can do that the icache + BHT/BTB pipeline cannot:
+  //   - single-taken trace : icache already handles a 1-taken-branch window
+  //                          in 1 cycle; replay only nets cycles when the
+  //                          frontend is starving (IQ empty).
+  //   - multi-taken trace  : each extra taken branch in the trace saves a
+  //                          redirect bubble the icache pipeline cannot
+  //                          avoid; replay is net-positive even when the IQ
+  //                          has work pending.
+  //
+  // C3 evidence: 538 multi-taken hits, 516 (96%) killed by the strict
+  // IQ-empty gate. Those are the highest-value hits in the cache.
+  //
+  // V95 Rule (original):
+  //   hi-value (num_taken >= 2): require only IQ ready_o (room), drop the
+  //                              instr_queue_empty requirement.
+  //   lo-value (num_taken == 1): keep the strict IQ-empty gate.
+  //
+  // V97 Rule (loosened lo-value gate):
+  //   wikisort C4 evidence: 16,039 lo-value hits, 15,905 (99%) killed by
+  //   the strict IQ-empty gate; the 134 that slipped through cost only
+  //   ~17 extra mispredicts (7,030 ? 7,047 vs A baseline). The strict
+  //   gate is paying ~zero misprediction insurance ? it is just blocking
+  //   acceptance. Loosening lo-value to also use IQ-ready (room) unlocks
+  //   the rejected_not_ready pile without measurable misprediction risk.
+  //   tc_direct_hit independently AND's instr_queue_ready, so this gate
+  //   change cannot fire on a full IQ.
+  // -----------------------------------------------------------------------
+  logic tc_trace_is_hi_value;
+  logic tc_pending_is_hi_value;
+  assign tc_trace_is_hi_value   = (tc_trace_num_taken     >= TAKEN_CNT_WIDTH'(2));
+  assign tc_pending_is_hi_value = (tc_pending_num_taken_q >= TAKEN_CNT_WIDTH'(2));
+
+  // Effective IQ-occupancy gate. V97: lo-value also passes when IQ has
+  // room (ready_o), matching hi-value behaviour. The original
+  // instr_queue_empty term remains as an OR so that the gate is also
+  // satisfied during the natural empty windows that V95 relied on.
+  logic tc_value_gate_direct;
+  logic tc_value_gate_pending_use;
+  assign tc_value_gate_direct      = tc_no_iq_gate_q || tc_trace_is_hi_value
+                                     || instr_queue_empty || instr_queue_ready;
+  assign tc_value_gate_pending_use = tc_no_iq_gate_q || tc_pending_is_hi_value
+                                     || instr_queue_empty || instr_queue_ready;
 
   // V72: Capture a TC hit into the pending buffer when IQ is not ready.
   // Do not overwrite an existing valid pending trace (it takes priority).
-  // V91: Also gate on IQ-empty ? no point capturing a trace for later
-  // replay if the IQ is already non-empty (backend has work).
+  // V95: gate is now value-aware ? hi-value hits get captured even when
+  // the IQ has work backed up, so we don't lose multi-taken bubble savings.
   assign tc_pending_capture = tc_active_hit && tc_trace_policy_ok &&
                               !tc_trace_used && !instr_queue_ready &&
-                              (tc_no_iq_gate_q || instr_queue_empty) &&
+                              tc_value_gate_direct &&
                               !tc_pending_invalidate &&
                               !tc_pending_valid_q;
 
@@ -1141,28 +1231,16 @@ module frontend
   assign tc_suppress_icache = tc_pending_capture || tc_pending_valid_q;
 
   // V72: Use the pending buffer when it is valid, IQ is ready, and no
-  // invalidation event has occurred.  All path-breaking events (mispredict,
-  // flush, eret, exception, commit redirect, debug, replay) clear the
-  // buffer via tc_pending_invalidate, so if the buffer survives it is
-  // guaranteed to be on the correct path.
-  // V91: Also gate on IQ-empty for consistency with replay gate.
+  // invalidation event has occurred.
+  // V95: value-aware gate (hi-value bypasses IQ-empty).
   assign tc_pending_use = tc_pending_valid_q && instr_queue_ready &&
-                          (tc_no_iq_gate_q || instr_queue_empty) &&
+                          tc_value_gate_pending_use &&
                           !tc_pending_invalidate;
 
   // V72: tc_hit_this_cycle ? fires on direct same-cycle hit OR pending use.
-  // When pending_use fires, the feed MUX uses the buffered trace data.
-  // Pending use takes priority over a concurrent direct hit.
-  //
-  // V91: IQ-empty replay gate ? only allow TC replay when the IQ is empty
-  // (frontend starvation).  Evidence from run 60:
-  //   tc_hit_nonempty_iq = 131,407 out of 132,762 (99%)
-  //   Each replay costs 1 kill_s1 bubble cycle.
-  //   When IQ is non-empty, the backend already has enough work;
-  //   replaying just wastes a bubble and adds I-cache pressure.
-  //   Only starvation replays (IQ empty) can provide net benefit.
+  // V91/V95: replay gate is now value-aware (see tc_value_gate_direct above).
   logic tc_replay_iq_gate;
-  assign tc_replay_iq_gate = tc_no_iq_gate_q ? 1'b1 : instr_queue_empty;
+  assign tc_replay_iq_gate = tc_value_gate_direct;
 
   logic tc_direct_hit;
   assign tc_direct_hit = tc_active_hit &&
@@ -1252,6 +1330,14 @@ module frontend
   int unsigned tc_dbg_replay_len_hist_q [8];  // accepted trace length histogram [3..7+]
   // V91: IQ-gate suppression counter
   int unsigned tc_dbg_iq_gate_suppress_q;     // hits suppressed because IQ was non-empty
+  // Multi-taken coverage histograms.  Bucket tk3p is MAX_TAKEN (currently 3).
+  localparam int unsigned TC_TAKEN_HIST_BINS = MAX_TAKEN + 1;
+  int unsigned tc_dbg_hit_taken_hist_q [TC_TAKEN_HIST_BINS];
+  int unsigned tc_dbg_accept_taken_hist_q [TC_TAKEN_HIST_BINS];
+  int unsigned tc_dbg_not_ready_taken_hist_q [TC_TAKEN_HIST_BINS];
+  int unsigned tc_dbg_iq_gate_taken_hist_q [TC_TAKEN_HIST_BINS];
+  int unsigned tc_dbg_policy_taken_hist_q [TC_TAKEN_HIST_BINS];
+  int unsigned tc_dbg_used_taken_hist_q [TC_TAKEN_HIST_BINS];
 
   // V77 Hot-PC frontend tracker: hit/miss/policy for top mismatch PCs
   localparam logic [CVA6Cfg.VLEN-1:0] FE_HP0 = CVA6Cfg.VLEN'(64'h80002880);
@@ -1288,6 +1374,8 @@ module frontend
   int unsigned roi_tc_miss_pc_q;
   int unsigned roi_tc_miss_path_q;
   int unsigned roi_icache_instr_q;
+  int unsigned roi_tc_hit_taken_hist_q [TC_TAKEN_HIST_BINS];
+  int unsigned roi_tc_accept_taken_hist_q [TC_TAKEN_HIST_BINS];
 
   // V72: ROI plusarg configuration
   initial begin
@@ -1374,6 +1462,16 @@ module frontend
       tc_dbg_replay_profit_3tk_q <= 0;
       tc_dbg_iq_gate_suppress_q <= 0;
       for (int i = 0; i < 8; i++) tc_dbg_replay_len_hist_q[i] <= 0;
+      for (int i = 0; i < TC_TAKEN_HIST_BINS; i++) begin
+        tc_dbg_hit_taken_hist_q[i]       <= 0;
+        tc_dbg_accept_taken_hist_q[i]    <= 0;
+        tc_dbg_not_ready_taken_hist_q[i] <= 0;
+        tc_dbg_iq_gate_taken_hist_q[i]   <= 0;
+        tc_dbg_policy_taken_hist_q[i]    <= 0;
+        tc_dbg_used_taken_hist_q[i]      <= 0;
+        roi_tc_hit_taken_hist_q[i]       <= 0;
+        roi_tc_accept_taken_hist_q[i]    <= 0;
+      end
       for (int i = 0; i < 4; i++) begin
         fe_hp_lookup[i] <= 0; fe_hp_hit[i] <= 0; fe_hp_accept[i] <= 0;
         fe_hp_reject_policy[i] <= 0; fe_hp_miss_pc[i] <= 0;
@@ -1398,6 +1496,8 @@ module frontend
       int unsigned first_taken_idx;
       int unsigned deq_count;
       int unsigned replay_remaining_after;
+      int unsigned trace_taken_idx;
+      int unsigned feed_taken_idx;
       tc_total_cycles_q <= tc_total_cycles_q + 1;
       deq_count = 0;
       replay_remaining_after = tc_dbg_replay_remaining_q;
@@ -1421,15 +1521,27 @@ module frontend
 
         if (tc_trace_hit) begin
           tc_dbg_hit_count_q <= tc_dbg_hit_count_q + 1;
+          trace_taken_idx = int'(tc_trace_num_taken);
+          if (trace_taken_idx > MAX_TAKEN)
+            trace_taken_idx = MAX_TAKEN;
+          tc_dbg_hit_taken_hist_q[trace_taken_idx] <=
+              tc_dbg_hit_taken_hist_q[trace_taken_idx] + 1;
 
           if (tc_trace_policy_ok) begin
-            if (tc_trace_used)
+            if (tc_trace_used) begin
               tc_dbg_reject_used_q <= tc_dbg_reject_used_q + 1;
-            else if (!tc_direct_hit && !tc_pending_capture) begin
+              tc_dbg_used_taken_hist_q[trace_taken_idx] <=
+                  tc_dbg_used_taken_hist_q[trace_taken_idx] + 1;
+            end else if (!tc_direct_hit && !tc_pending_capture) begin
               tc_dbg_reject_not_ready_q <= tc_dbg_reject_not_ready_q + 1;
+              tc_dbg_not_ready_taken_hist_q[trace_taken_idx] <=
+                  tc_dbg_not_ready_taken_hist_q[trace_taken_idx] + 1;
               // V91: Count how many of these were specifically blocked by IQ gate
-              if (instr_queue_ready && !instr_queue_empty)
+              if (instr_queue_ready && !instr_queue_empty) begin
                 tc_dbg_iq_gate_suppress_q <= tc_dbg_iq_gate_suppress_q + 1;
+                tc_dbg_iq_gate_taken_hist_q[trace_taken_idx] <=
+                    tc_dbg_iq_gate_taken_hist_q[trace_taken_idx] + 1;
+              end
             end
           end else begin
             if (tc_trace_has_indirect || tc_trace_has_call)
@@ -1439,6 +1551,8 @@ module frontend
             if (tc_trace_length < TRACE_LEN_WIDTH'(TC_MIN_ACCEPT_LEN))
               tc_dbg_reject_short_q <= tc_dbg_reject_short_q + 1;
             tc_dbg_reject_policy_q <= tc_dbg_reject_policy_q + 1;
+            tc_dbg_policy_taken_hist_q[trace_taken_idx] <=
+                tc_dbg_policy_taken_hist_q[trace_taken_idx] + 1;
           end
         end else begin
           if (tc_trace_used && tc_trace_policy_ok)
@@ -1659,6 +1773,11 @@ module frontend
 
       // V90: Replay profitability tracking.
       if (tc_hit_this_cycle) begin
+        feed_taken_idx = int'(tc_feed_src_num_taken);
+        if (feed_taken_idx > MAX_TAKEN)
+          feed_taken_idx = MAX_TAKEN;
+        tc_dbg_accept_taken_hist_q[feed_taken_idx] <=
+            tc_dbg_accept_taken_hist_q[feed_taken_idx] + 1;
         if (tc_feed_src_num_taken == TAKEN_CNT_WIDTH'(2))
           tc_dbg_replay_profit_2tk_q <= tc_dbg_replay_profit_2tk_q + 1;
         if (tc_feed_src_num_taken >= TAKEN_CNT_WIDTH'(3))
@@ -1711,6 +1830,11 @@ module frontend
         // TC stats within ROI
         if (tc_hit_this_cycle) begin
           roi_tc_accept_q <= roi_tc_accept_q + 1;
+          feed_taken_idx = int'(tc_feed_src_num_taken);
+          if (feed_taken_idx > MAX_TAKEN)
+            feed_taken_idx = MAX_TAKEN;
+          roi_tc_accept_taken_hist_q[feed_taken_idx] <=
+              roi_tc_accept_taken_hist_q[feed_taken_idx] + 1;
           roi_src_cnt = 0;
           for (int k = 0; k < CVA6Cfg.INSTR_PER_FETCH; k++)
             if (tc_feed_valid[k]) roi_src_cnt++;
@@ -1722,9 +1846,14 @@ module frontend
 
         if (tc_lookup_result_valid) begin
           roi_tc_lookup_q <= roi_tc_lookup_q + 1;
-          if (tc_trace_hit)
+          if (tc_trace_hit) begin
             roi_tc_hit_q <= roi_tc_hit_q + 1;
-          else begin
+            trace_taken_idx = int'(tc_trace_num_taken);
+            if (trace_taken_idx > MAX_TAKEN)
+              trace_taken_idx = MAX_TAKEN;
+            roi_tc_hit_taken_hist_q[trace_taken_idx] <=
+                roi_tc_hit_taken_hist_q[trace_taken_idx] + 1;
+          end else begin
             if (tc_miss_reason_empty) roi_tc_miss_empty_q <= roi_tc_miss_empty_q + 1;
             if (tc_miss_reason_pc)    roi_tc_miss_pc_q    <= roi_tc_miss_pc_q + 1;
             if (tc_miss_reason_path)  roi_tc_miss_path_q  <= roi_tc_miss_path_q + 1;
@@ -1750,22 +1879,23 @@ module frontend
       if (tc_hit_this_cycle) begin
         tc_dbg_feed_done_q <= tc_dbg_feed_done_q + 1;
         if (tc_dbg_feed_done_q < 256) begin
-          $display("[TC-FEED-DONE] t=%0t len=%0d iq_ready=%0b iq_empty=%0b next_pc=0x%h",
-                   $time, tc_trace_length, instr_queue_ready,
-                   instr_queue_empty, tc_trace_next_pc[CVA6Cfg.VLEN-1:0]);
+          $display("[TC-FEED-DONE] t=%0t len=%0d num_taken=%0d iq_ready=%0b iq_empty=%0b next_pc=0x%h",
+                   $time, tc_feed_src_length, tc_feed_src_num_taken,
+                   instr_queue_ready, instr_queue_empty,
+                   tc_feed_src_next_pc[CVA6Cfg.VLEN-1:0]);
         end
       end
 
       if (tc_hit_this_cycle && (tc_dbg_feed_start_count_q < 96)) begin
         tc_dbg_feed_start_count_q <= tc_dbg_feed_start_count_q + 1;
-        $display("[TC-HIT-FEED] #%0d t=%0t len=%0d next_pc=0x%h",
-                 tc_dbg_feed_start_count_q + 1, $time, tc_trace_length,
-                 tc_trace_next_pc[CVA6Cfg.VLEN-1:0]);
+        $display("[TC-HIT-FEED] #%0d t=%0t len=%0d num_taken=%0d next_pc=0x%h",
+                 tc_dbg_feed_start_count_q + 1, $time, tc_feed_src_length,
+                 tc_feed_src_num_taken, tc_feed_src_next_pc[CVA6Cfg.VLEN-1:0]);
         for (int k = 0; k < TRACE_LEN; k++) begin
-          if (k < int'(tc_trace_length)) begin
+          if (k < int'(tc_feed_src_length)) begin
             $display("[TC-HIT-FEED]   src[%0d] pc=0x%h instr=0x%08h cf=%0d",
-                     k, tc_trace_pcs[k][CVA6Cfg.VLEN-1:0], tc_trace_instructions[k],
-                     tc_replay_cf_type(tc_trace_instructions[k]));
+                     k, tc_feed_src_pcs[k][CVA6Cfg.VLEN-1:0], tc_feed_src_instructions[k],
+                     tc_replay_cf_type(tc_feed_src_instructions[k]));
           end
         end
       end
@@ -1863,6 +1993,24 @@ module frontend
     $display("[TC-FINAL] replay_profit: 2taken=%0d 3p_taken=%0d",
              tc_dbg_replay_profit_2tk_q, tc_dbg_replay_profit_3tk_q);
     $display("[TC-FINAL] v91_iq_gate_suppress=%0d", tc_dbg_iq_gate_suppress_q);
+    $display("[TC-MULTITAKEN] hit_taken_hist: tk0=%0d tk1=%0d tk2=%0d tk3p=%0d",
+             tc_dbg_hit_taken_hist_q[0], tc_dbg_hit_taken_hist_q[1],
+             tc_dbg_hit_taken_hist_q[2], tc_dbg_hit_taken_hist_q[MAX_TAKEN]);
+    $display("[TC-MULTITAKEN] accept_taken_hist: tk0=%0d tk1=%0d tk2=%0d tk3p=%0d",
+             tc_dbg_accept_taken_hist_q[0], tc_dbg_accept_taken_hist_q[1],
+             tc_dbg_accept_taken_hist_q[2], tc_dbg_accept_taken_hist_q[MAX_TAKEN]);
+    $display("[TC-MULTITAKEN] drop_not_ready_hist: tk0=%0d tk1=%0d tk2=%0d tk3p=%0d",
+             tc_dbg_not_ready_taken_hist_q[0], tc_dbg_not_ready_taken_hist_q[1],
+             tc_dbg_not_ready_taken_hist_q[2], tc_dbg_not_ready_taken_hist_q[MAX_TAKEN]);
+    $display("[TC-MULTITAKEN] drop_iq_gate_hist: tk0=%0d tk1=%0d tk2=%0d tk3p=%0d",
+             tc_dbg_iq_gate_taken_hist_q[0], tc_dbg_iq_gate_taken_hist_q[1],
+             tc_dbg_iq_gate_taken_hist_q[2], tc_dbg_iq_gate_taken_hist_q[MAX_TAKEN]);
+    $display("[TC-MULTITAKEN] drop_policy_hist: tk0=%0d tk1=%0d tk2=%0d tk3p=%0d",
+             tc_dbg_policy_taken_hist_q[0], tc_dbg_policy_taken_hist_q[1],
+             tc_dbg_policy_taken_hist_q[2], tc_dbg_policy_taken_hist_q[MAX_TAKEN]);
+    $display("[TC-MULTITAKEN] drop_used_hist: tk0=%0d tk1=%0d tk2=%0d tk3p=%0d",
+             tc_dbg_used_taken_hist_q[0], tc_dbg_used_taken_hist_q[1],
+             tc_dbg_used_taken_hist_q[2], tc_dbg_used_taken_hist_q[MAX_TAKEN]);
     $display("[TC-FINAL] replay_len_hist: L3=%0d L4=%0d L5=%0d L6=%0d L7=%0d L8=%0d L9=%0d L10p=%0d",
              tc_dbg_replay_len_hist_q[0], tc_dbg_replay_len_hist_q[1], tc_dbg_replay_len_hist_q[2],
              tc_dbg_replay_len_hist_q[3], tc_dbg_replay_len_hist_q[4], tc_dbg_replay_len_hist_q[5],
@@ -1898,6 +2046,12 @@ module frontend
                roi_tc_lookup_q, roi_tc_hit_q, roi_tc_hit_rate);
       $display("[TC-ROI] tc_accepted=%0d accept_rate=%0d%% (of hits) pending_use=%0d",
                roi_tc_accept_q, roi_tc_accept_rate, roi_tc_pending_use_q);
+      $display("[TC-MULTITAKEN-ROI] hit_taken_hist: tk0=%0d tk1=%0d tk2=%0d tk3p=%0d",
+               roi_tc_hit_taken_hist_q[0], roi_tc_hit_taken_hist_q[1],
+               roi_tc_hit_taken_hist_q[2], roi_tc_hit_taken_hist_q[MAX_TAKEN]);
+      $display("[TC-MULTITAKEN-ROI] accept_taken_hist: tk0=%0d tk1=%0d tk2=%0d tk3p=%0d",
+               roi_tc_accept_taken_hist_q[0], roi_tc_accept_taken_hist_q[1],
+               roi_tc_accept_taken_hist_q[2], roi_tc_accept_taken_hist_q[MAX_TAKEN]);
       $display("[TC-ROI] tc_instr=%0d icache_instr=%0d tc_instr_share=%0d%%",
                roi_tc_instr_q, roi_icache_instr_q, roi_tc_instr_share);
       $display("[TC-ROI] miss_breakdown: empty=%0d pc=%0d path=%0d",

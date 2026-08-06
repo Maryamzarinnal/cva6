@@ -30,6 +30,11 @@ module trace_cache_top #(
   input  logic                                        serving_unaligned_i,
 
   input  logic                        flush_i,
+  // V99 (Option B): high the cycle a TC replay fires.  Forwarded to the
+  // trace_builder so it can drop a stale TB_FILL state instead of
+  // waiting forever for a target window the redirected fetch will not
+  // deliver.
+  input  logic                        tc_replay_fired_i,
   input  logic                        instr_queue_ready_i,
   input  logic [SLOTS_PER_CYCLE-1:0]  instr_queue_consumed_i,
 
@@ -179,6 +184,7 @@ module trace_cache_top #(
     .instr_i          (instr_if),
     .ghr_i            (ghr),
     .flush_i          (flush_i),
+    .tc_replay_fired_i(tc_replay_fired_i),
     .trace_valid_o    (),
     .trace_data_o     (),
     .mem_tag_o        (mem_tag_builder),

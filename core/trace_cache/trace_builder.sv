@@ -29,6 +29,11 @@ module trace_builder #(
 
     input  logic [GHR_WIDTH-1:0] ghr_i,
     input  logic                 flush_i,
+    // V99 (Option B): high the cycle a TC replay fires.  Forces the FSM
+    // out of TB_FILL so the next icache window (which will be exit_pc,
+    // not the previously expected branch target) starts a fresh trace
+    // instead of being rejected forever by the PC guard.
+    input  logic                 tc_replay_fired_i,
 
     output logic                   trace_valid_o,
     output logic [TRACE_WIDTH-1:0] trace_data_o,
@@ -651,6 +656,23 @@ module trace_builder #(
         commit_valid_d   = 1'b0;
         fill_exit_reason = 3'd2;  // discard ? return made trace too short
       end
+
+      // V99 (Option B): TC replay fired this cycle.  Fetch has been
+      // redirected to exit_pc, so any TB_FILL state we were going to
+      // remain in is now waiting for a target window the pipeline will
+      // never deliver.  Force the FSM to TB_IDLE; the always_ff clear
+      // branch (state_d == TB_IDLE && state_q != TB_IDLE) will then
+      // zero the accumulators next cycle, letting the builder start
+      // fresh from the exit_pc window.  Legitimate commits (state_d
+      // already TB_IDLE with commit_valid_d=1) are not touched ? the
+      // partial trace this kicks out had no commit pending anyway,
+      // because tc_builder_enable in the frontend zeroed instr valid
+      // for this cycle, so no scan progress could have produced one.
+      if (tc_replay_fired_i && state_d == TB_FILL) begin
+        state_d          = TB_IDLE;
+        accum_latch_en   = 1'b0;
+        fill_exit_reason = 3'd7;  // V99: tc-replay-reset
+      end
     end
   end
 
@@ -666,6 +688,7 @@ module trace_builder #(
   longint unsigned dbg_fill_discard_q;    // !fill_added ? discard/accum-commit
   longint unsigned dbg_fill_loop_mt_q;    // fill_added + taken + room ? FILL loop
   longint unsigned dbg_fill_wait_q;       // no input, stayed in FILL
+  longint unsigned dbg_fill_tc_reset_q;   // V99: TB_FILL aborted by tc_replay_fired_i
 
   // V92-retsafe counters
   longint unsigned dbg_ret_truncated_q;   // trace shortened before return, still accepted
@@ -694,6 +717,7 @@ module trace_builder #(
       dbg_fill_discard_q  <= 0;
       dbg_fill_loop_mt_q  <= 0;
       dbg_fill_wait_q     <= 0;
+      dbg_fill_tc_reset_q <= 0;
       dbg_ret_truncated_q <= 0;
       dbg_ret_rejected_q  <= 0;
       dbg_pcguard_miss_total <= 0;
@@ -719,6 +743,7 @@ module trace_builder #(
           3'd4: dbg_fill_discard_q  <= dbg_fill_discard_q + 1;  // accum-commit (!fill_added)
           3'd5: dbg_fill_loop_mt_q  <= dbg_fill_loop_mt_q + 1;
           3'd6: dbg_fill_wait_q     <= dbg_fill_wait_q + 1;
+          3'd7: dbg_fill_tc_reset_q <= dbg_fill_tc_reset_q + 1;
           default: ;
         endcase
         // Count cycles where PC guard gets a valid but wrong-PC window
@@ -728,7 +753,8 @@ module trace_builder #(
             dbg_pcguard_miss_total <= dbg_pcguard_miss_total + 1;
         end
         // Count successful PC guard matches (w_had_input means guard passed)
-        if (fill_exit_reason != 3'd1 && fill_exit_reason != 3'd6 && fill_exit_reason != 3'd0)
+        if (fill_exit_reason != 3'd1 && fill_exit_reason != 3'd6 &&
+            fill_exit_reason != 3'd0 && fill_exit_reason != 3'd7)
           dbg_pcguard_hit_total <= dbg_pcguard_hit_total + 1;
       end
       // V92-retsafe: count all return encounters ? TB_IDLE (trace never started)
@@ -767,9 +793,10 @@ module trace_builder #(
   final begin
     $display("[TC-BUILDER] V90 multi-taken: commits=%0d fill_starts=%0d fill_loops=%0d",
              dbg_commit_q, dbg_fill_start_q, dbg_fill_loop_q);
-    $display("[TC-BUILDER-DIAG] flush=%0d pcguard_discard=%0d commit=%0d accum_commit=%0d loop_mt=%0d wait=%0d",
+    $display("[TC-BUILDER-DIAG] flush=%0d pcguard_discard=%0d commit=%0d accum_commit=%0d loop_mt=%0d wait=%0d tc_reset=%0d",
              dbg_fill_flush_q, dbg_fill_pcguard_q, dbg_fill_commit_q,
-             dbg_fill_discard_q, dbg_fill_loop_mt_q, dbg_fill_wait_q);
+             dbg_fill_discard_q, dbg_fill_loop_mt_q, dbg_fill_wait_q,
+             dbg_fill_tc_reset_q);
     $display("[TC-BUILDER-DIAG2] pcguard_hit=%0d pcguard_miss_with_valid=%0d wait_no_valid=%0d",
              dbg_pcguard_hit_total, dbg_pcguard_miss_total,
              dbg_fill_wait_q - dbg_pcguard_miss_total);

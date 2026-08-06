@@ -124,8 +124,7 @@ package trace_cache_pkg;
                         stored_tag_i.valid &&
                         (lookup_tag_i.base_pc      == stored_tag_i.base_pc) &&
                         (lookup_tag_i.num_branches == stored_tag_i.num_branches) &&
-                        (lookup_tag_i.ghr          == stored_tag_i.ghr) &&  // V82
-                        flags_match;
+                        flags_match;  // V98: GHR removed from tag match (kept in struct for capture)
     end
   endfunction
 
@@ -138,27 +137,43 @@ package trace_cache_pkg;
   // predictions are available).  The 2-way associativity handles the
   // slightly higher set pressure from collapsing branch variants.
   // V77: Way-0 hash (H0) ? XOR-fold of pc[11:4]^pc[19:12]^pc[27:20].
-  // V82: XOR with GHR for path-sensitive indexing.
+  //
+  // V97 (revert V82 in index): GHR is NOT XOR'd into the set index.
+  // V98 (revert V82 in tag): GHR is NOT compared in trace_tag_match.
+  //   - V82 added GHR to both the set index and the tag to enforce path
+  //     sensitivity.  Both choices hurt wikisort hit rate:
+  //       index: same PC under different GHR ? different sets ? empty misses
+  //              (5,908 ? 62,648 empty misses, C ? C4, 10x churn)
+  //       tag:   same PC under different GHR ? same set (after V97) but tag
+  //              rejects the entry ? 17,498 path misses, hit rate 11% ? 0.36%
+  //   - TC mispredictions have the same recovery cost as branch mispredicts.
+  //     The branch_flags field already encodes the local taken/not-taken
+  //     pattern per fetch window; GHR adds distant path context that aliases
+  //     rarely and eliminates reuse aggressively.
+  //   - The `ghr` argument is kept in both function signatures so call sites
+  //     do not need to change; it is intentionally unused.
   function automatic logic [TRACE_ADDRW-1:0] tc_index(
     input logic [PC_WIDTH-1:0]  pc,
-    input logic [GHR_WIDTH-1:0] ghr  // V82
+    input logic [GHR_WIDTH-1:0] ghr
   );
+    logic [GHR_WIDTH-1:0] ghr_unused;
+    ghr_unused = ghr;  // suppress unused-input lint
     tc_index = pc[TRACE_ADDRW+3:4]
              ^ pc[2*TRACE_ADDRW+3:TRACE_ADDRW+4]
-             ^ pc[3*TRACE_ADDRW+3:2*TRACE_ADDRW+4]
-             ^ ghr;  // V82: path-sensitive set mapping
+             ^ pc[3*TRACE_ADDRW+3:2*TRACE_ADDRW+4];
   endfunction
 
   // V77: Way-1 hash (H1) ? shifted 3 bits down: pc[8:1]^pc[16:9]^pc[24:17].
-  // V82: XOR with GHR for path-sensitive indexing.
+  // V97/V98 (revert V82): see tc_index above for rationale.
   function automatic logic [TRACE_ADDRW-1:0] tc_index_w1(
     input logic [PC_WIDTH-1:0]  pc,
-    input logic [GHR_WIDTH-1:0] ghr  // V82
+    input logic [GHR_WIDTH-1:0] ghr
   );
+    logic [GHR_WIDTH-1:0] ghr_unused;
+    ghr_unused = ghr;
     tc_index_w1 = pc[TRACE_ADDRW:1]
                 ^ pc[2*TRACE_ADDRW:TRACE_ADDRW+1]
-                ^ pc[3*TRACE_ADDRW:2*TRACE_ADDRW+1]
-                ^ ghr;  // V82: path-sensitive set mapping
+                ^ pc[3*TRACE_ADDRW:2*TRACE_ADDRW+1];
   endfunction
 
 endpackage : trace_cache_pkg
