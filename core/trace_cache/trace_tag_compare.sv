@@ -5,7 +5,7 @@ module trace_tag_compare (
     input  logic [PC_WIDTH-1:0]                 base_pc_i,
     input  logic [TRIGGER_BRANCH_CNT_WIDTH-1:0] num_branches_i,
     input  logic [TRIGGER_BRANCH_BITS-1:0]      branch_flags_i,
-    input  logic [GHR_WIDTH-1:0]                ghr_i,  // V82: path history
+    input  logic [GHR_WIDTH-1:0]                ghr_i,  // path history
 
     input  trace_tag_t                          stored_tag_i,
 

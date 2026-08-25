@@ -5,17 +5,15 @@ package trace_cache_pkg;
   // Match frontend: one fetch window = up to 4 slots per cycle.
   localparam int unsigned SLOTS_PER_CYCLE = 4;
 
-  // V70: 1-fetch-window traces.  TRACE_LEN = INSTR_PER_FETCH = 4.
-  // The entire trace fits in a single IQ push cycle ? no multi-cycle
-  // feeding FSM, no phase-2 injection, no post-feed drain wait.
-  // One taken branch per trace (MAX_TAKEN = 1).
+  // Trace length equals the fetch window, so a whole trace goes into the IQ
+  // in one push -- no multi-cycle feed FSM and no drain wait afterwards.
   localparam int unsigned TRACE_LEN = 4;
   localparam int unsigned MAX_TRACE_INSTR = TRACE_LEN;
   localparam int unsigned INSTR_WIDTH = 32;
   localparam int unsigned TRACE_LEN_WIDTH = $clog2(TRACE_LEN + 1);
 
   localparam int unsigned NUM_WAYS = 2;
-  localparam int unsigned TRACE_ADDRW = 10;  // 2 ways x 1024 sets
+  localparam int unsigned TRACE_ADDRW = 8;
   localparam int unsigned GHR_WIDTH = 8;
 
   localparam int unsigned PC_WIDTH = 64;  // CVA6 is 64-bit
@@ -28,8 +26,10 @@ package trace_cache_pkg;
   localparam int unsigned SUFFIX_CHUNKS = MAX_TRACE_INSTR * 2;
   localparam int unsigned SUFFIX_LEN_WIDTH = $clog2(MAX_TRACE_INSTR + 1);
 
-  // V90: up to 3 taken branches per trace (multi-window builder).
-  localparam int unsigned MAX_TAKEN = 3;
+  // Taken branches a trace may cross.  A third target costs 64 bits in every
+  // entry and served 12 hits out of 768592 on CoreMark, so it is not worth
+  // provisioning; the multi-window builder still spans two taken branches.
+  localparam int unsigned MAX_TAKEN = 2;
   localparam int unsigned TAKEN_CNT_WIDTH = $clog2(MAX_TAKEN + 1);
 
   // PCs are not stored per instruction; on hit we derive them from base_pc + instr + branch_flags.
@@ -45,7 +45,7 @@ package trace_cache_pkg;
   localparam int unsigned BE_WIDTH = (TRACE_WIDTH + 7) / 8;
 
   // -----------------------------------------------------------------------
-  // TC V68 window-format tag/data representation.
+  // Window-format tag / data representation.
   // Tag: identifies the trigger fetch window (base PC + branch outcomes up to
   //      and including the first taken branch, canonicalized).
   // Data: instructions from base_pc through the taken branch (inclusive),
@@ -57,7 +57,10 @@ package trace_cache_pkg;
     logic [PC_WIDTH-1:0]                        base_pc;
     logic [TRIGGER_BRANCH_CNT_WIDTH-1:0]        num_branches;
     logic [TRIGGER_BRANCH_BITS-1:0]             branch_flags;
-    logic [GHR_WIDTH-1:0]                       ghr;  // V82: path history for misprediction recovery
+    // No ghr field: history is neither indexed nor compared (see tc_index),
+    // so storing it in every tag cost 8 bits per entry for nothing.  The
+    // misprediction restore in tc_ghr works off the pipeline snapshot, not
+    // off the tag, and is unaffected.
   } trace_tag_t;
 
   typedef struct packed {
@@ -95,15 +98,16 @@ package trace_cache_pkg;
     input logic [PC_WIDTH-1:0]                 base_pc_i,
     input logic [TRIGGER_BRANCH_CNT_WIDTH-1:0] num_branches_i,
     input logic [TRIGGER_BRANCH_BITS-1:0]      branch_flags_i,
-    input logic [GHR_WIDTH-1:0]                ghr_i  // V82: path history
+    input logic [GHR_WIDTH-1:0]                ghr_i  // unused, kept for call sites
   );
     trace_tag_t tag;
+    logic [GHR_WIDTH-1:0] ghr_unused;
     begin
+      ghr_unused       = ghr_i;
       tag.valid        = 1'b1;
       tag.base_pc      = base_pc_i;
       tag.num_branches = num_branches_i;
       tag.branch_flags = branch_flags_i;
-      tag.ghr          = ghr_i;  // V82
       make_trace_tag   = tag;
     end
   endfunction
@@ -124,7 +128,7 @@ package trace_cache_pkg;
                         stored_tag_i.valid &&
                         (lookup_tag_i.base_pc      == stored_tag_i.base_pc) &&
                         (lookup_tag_i.num_branches == stored_tag_i.num_branches) &&
-                        flags_match;  // V98: GHR removed from tag match (kept in struct for capture)
+                        flags_match;  // GHR removed from tag match (kept in struct for capture)
     end
   endfunction
 
@@ -132,26 +136,17 @@ package trace_cache_pkg;
     pc_align_16 = pc & {{(PC_WIDTH-4){1'b1}}, 4'b0};
   endfunction
 
-  // V71: PC-only set index.  Branch flags removed from the index so the
-  // SRAM can be read in parallel with the I$ request (before branch
-  // predictions are available).  The 2-way associativity handles the
-  // slightly higher set pressure from collapsing branch variants.
-  // V77: Way-0 hash (H0) ? XOR-fold of pc[11:4]^pc[19:12]^pc[27:20].
+  // Set index is PC-only so the SRAM read can start alongside the I$ request,
+  // before any branch prediction exists.  Two skewed ways absorb the extra
+  // set pressure from folding the branch variants of a PC together.
   //
-  // V97 (revert V82 in index): GHR is NOT XOR'd into the set index.
-  // V98 (revert V82 in tag): GHR is NOT compared in trace_tag_match.
-  //   - V82 added GHR to both the set index and the tag to enforce path
-  //     sensitivity.  Both choices hurt wikisort hit rate:
-  //       index: same PC under different GHR ? different sets ? empty misses
-  //              (5,908 ? 62,648 empty misses, C ? C4, 10x churn)
-  //       tag:   same PC under different GHR ? same set (after V97) but tag
-  //              rejects the entry ? 17,498 path misses, hit rate 11% ? 0.36%
-  //   - TC mispredictions have the same recovery cost as branch mispredicts.
-  //     The branch_flags field already encodes the local taken/not-taken
-  //     pattern per fetch window; GHR adds distant path context that aliases
-  //     rarely and eliminates reuse aggressively.
-  //   - The `ghr` argument is kept in both function signatures so call sites
-  //     do not need to change; it is intentionally unused.
+  // The GHR is deliberately not part of the index or the tag.  Adding it
+  // sent the same PC under different histories to different sets --
+  // empty misses went 5.9k -> 62.6k on wikisort -- and once that was fixed,
+  // tag rejection alone still dropped the hit rate from 11% to 0.36%.
+  // branch_flags already carries the local taken pattern, which is the part
+  // that matters; distant history just destroys reuse.  The ghr argument
+  // stays in the signature so call sites are untouched.
   function automatic logic [TRACE_ADDRW-1:0] tc_index(
     input logic [PC_WIDTH-1:0]  pc,
     input logic [GHR_WIDTH-1:0] ghr
@@ -163,8 +158,8 @@ package trace_cache_pkg;
              ^ pc[3*TRACE_ADDRW+3:2*TRACE_ADDRW+4];
   endfunction
 
-  // V77: Way-1 hash (H1) ? shifted 3 bits down: pc[8:1]^pc[16:9]^pc[24:17].
-  // V97/V98 (revert V82): see tc_index above for rationale.
+  // Way-1 hash (H1) ? shifted 3 bits down: pc[8:1]^pc[16:9]^pc[24:17].
+  // Same reasoning as tc_index above.
   function automatic logic [TRACE_ADDRW-1:0] tc_index_w1(
     input logic [PC_WIDTH-1:0]  pc,
     input logic [GHR_WIDTH-1:0] ghr

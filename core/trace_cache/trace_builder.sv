@@ -2,22 +2,17 @@
 import trace_cache_pkg::*;
 import riscv::*;
 
-// V90 multi-window trace builder.
-// Records up to TRACE_LEN (4) instructions spanning up to MAX_TAKEN (3)
-// taken branches.  Each taken branch triggers a new FILL cycle to collect
-// target-block instructions, building multi-block traces that eliminate
-// multiple taken-branch redirect bubbles for the frontend.
+// Multi-window trace builder.  Collects up to TRACE_LEN (4) instructions
+// across up to MAX_TAKEN (3) taken branches, so one replay can cover several
+// taken-branch redirects the frontend would otherwise pay for one at a time.
 //
-// State machine:
-//   IDLE ? taken direct branch found ? FILL (if room for target instructions)
-//   FILL ? scan target window:
-//          ? PC doesn't match target yet ? wait (stay in FILL)
-//          ? another taken branch found AND room left ? stay in FILL (loop)
-//          ? no taken branch / full / reject ? commit trace
+//   IDLE  taken direct branch in the window -> FILL, if there is room left
+//   FILL  target window has not arrived yet    -> wait
+//         another taken branch, still room     -> stay in FILL
+//         otherwise                            -> commit
 //
-// V85: Returns and direct calls are accepted.
-// V90: FILL loops across multiple taken branches (up to MAX_TAKEN).
-// V90-fix: PC guard waits instead of discarding (was killing 98.8% of traces).
+// Returns and direct calls are recorded.  The PC guard waits for the target
+// window rather than discarding the trace; discarding lost 98.8% of them.
 
 module trace_builder #(
   parameter int unsigned MAX_INSTR_PER_TRACE = MAX_TRACE_INSTR
@@ -29,7 +24,7 @@ module trace_builder #(
 
     input  logic [GHR_WIDTH-1:0] ghr_i,
     input  logic                 flush_i,
-    // V99 (Option B): high the cycle a TC replay fires.  Forces the FSM
+    // (Option B): high the cycle a TC replay fires.  Forces the FSM
     // out of TB_FILL so the next icache window (which will be exit_pc,
     // not the previously expected branch target) starts a fresh trace
     // instead of being rejected forever by the PC guard.
@@ -52,6 +47,18 @@ module trace_builder #(
   // Minimum instruction count for a committed trace to survive replay-time
   // policy (tc_trace_policy_ok in frontend.sv).  Must equal TC_MIN_ACCEPT_LEN.
   localparam int unsigned TB_MIN_ACCEPT_LEN = 3;
+
+  // Shortest single-taken trace the builder will store.  Multi-taken traces
+  // ignore this and are always admitted.
+  //
+  // This was 4, on the reasoning that a length-3 single-taken replay breaks
+  // even and so should not occupy a way.  That only holds if the ways are
+  // contended, and they are not: 161 traces in 2048 entries, 9 evictions in
+  // 13.2M cycles, and 99.84% of built traces thrown away by this filter.
+  // With the ways empty, a break-even trace still beats nothing.  Matching
+  // TB_MIN_ACCEPT_LEN also closes a mismatch where the frontend would happily
+  // replay length-3 traces the builder refused to store.  Length 2 stays out.
+  localparam int unsigned TB_VALUE_MIN_LEN = TB_MIN_ACCEPT_LEN;
 
   // -----------------------------------------------------------------------
   // State machine
@@ -85,7 +92,7 @@ module trace_builder #(
     end
   endfunction
 
-  // V85: Return CF ? jalr rd, rs1 where rs1 is a link register (x1/x5)
+  // Return CF ? jalr rd, rs1 where rs1 is a link register (x1/x5)
   // and rs1 != rd (standard RISC-V return convention).
   // Target comes from the frontend's RAS prediction.
   function automatic logic is_return_cf(input logic [INSTR_WIDTH-1:0] inst);
@@ -107,7 +114,7 @@ module trace_builder #(
     end
   endfunction
 
-  // V85: Direct call CF ? jal rd, imm where rd = x1(ra) or x5(t0).
+  // Direct call CF ? jal rd, imm where rd = x1(ra) or x5(t0).
   // Target is PC-relative (deterministic). RAS push needed during replay.
   function automatic logic is_call_cf(input logic [INSTR_WIDTH-1:0] inst);
     logic rvc;
@@ -134,8 +141,8 @@ module trace_builder #(
   logic [PC_WIDTH-1:0]                     accum_taken_target_q;
   logic [CHUNK_PTR_W-1:0]                  accum_chunk_ptr_q;
   logic [INSTR_CNT_W-1:0]                  accum_instr_cnt_q;
-  logic [GHR_WIDTH-1:0]                    accum_ghr_q;  // V82: GHR snapshot at trace start
-  // V90: multi-taken accumulators
+  logic [GHR_WIDTH-1:0]                    accum_ghr_q;  // GHR snapshot at trace start
+  // multi-taken accumulators
   logic [TAKEN_CNT_WIDTH-1:0]              accum_taken_cnt_q;
   logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]      accum_taken_targets_q;
 
@@ -150,36 +157,30 @@ module trace_builder #(
   logic [PC_WIDTH-1:0]                     accum_taken_target_nxt;
   logic [CHUNK_PTR_W-1:0]                  accum_chunk_ptr_nxt;
   logic [INSTR_CNT_W-1:0]                  accum_instr_cnt_nxt;
-  // V90: multi-taken next-state wires
+  // multi-taken next-state wires
   logic [TAKEN_CNT_WIDTH-1:0]              accum_taken_cnt_nxt;
   logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]      accum_taken_targets_nxt;
 
-  // V90-diag: FILL exit reason (set in always_comb, read in always_ff)
+  // FILL exit reason (set in always_comb, read in always_ff)
   logic [2:0] fill_exit_reason;
-  // V92-retsafe: set in always_comb when a return stops the scan early,
+  // set in always_comb when a return stops the scan early,
   // read in always_ff for counters ? must be module-scope for cross-block access.
   logic        w_truncate_at_return;
 
-  // V90-fix: latch-enable for accum registers ? only asserted when the
+  // latch-enable for accum registers ? only asserted when the
   // combinational block actually computes new accumulator values.
   // Without this, wait cycles in TB_FILL overwrite accum_*_q with
   // the default '0 (the original bug that zeroed accum_taken_target_q).
   logic accum_latch_en;
 
-  // V95: Builder value filter. Each commit site sets this to "is this trace
-  // worth occupying an SRAM way?".
-  //   - num_taken >= 2 : multi-taken trace, always worth it (saves redirect
-  //                      bubbles the icache pipeline cannot avoid).
-  //   - num_taken == 1 : single-taken trace, worth it only if long enough
-  //                      to net positive vs the kill_s1 bubble cost
-  //                      (instr_count >= 4, since net = N - K - 1 where K~2).
-  // Anything else (single-taken length 2 or 3) is dropped at commit time ?
-  // these would either be net-zero (L=3) or net-negative (L=2) replays and
-  // would just evict more valuable entries from the cache.
+  // Set at every commit site: is this trace worth a way?  Multi-taken always
+  // is -- it saves redirects the icache cannot.  Single-taken only if it is
+  // at least TB_VALUE_MIN_LEN long, otherwise the replay does not cover its
+  // own bubble.
   logic tb_commit_value_ok_d;
 
 `ifndef SYNTHESIS
-  // V90-diag: PC guard diagnostics (declared early for use in always_comb)
+  // PC guard diagnostics (declared early for use in always_comb)
   longint unsigned dbg_pcguard_miss_total;
   longint unsigned dbg_pcguard_hit_total;
 `endif
@@ -216,7 +217,7 @@ module trace_builder #(
       commit_data_q  <= '0;
     end else begin
       state_q        <= state_d;
-      // V95: gate the commit on the value filter so dropped traces never
+      // gate the commit on the value filter so dropped traces never
       // touch SRAM. commit_addr/tag/data still latch (cheap, single payload)
       // but with commit_valid_q=0 they are inert downstream.
       commit_valid_q <= commit_valid_d && tb_commit_value_ok_d;
@@ -257,7 +258,7 @@ module trace_builder #(
       accum_taken_cnt_q    <= '0;
       accum_taken_targets_q <= '0;
     end else if (state_d == TB_FILL && accum_latch_en) begin
-      // V90-fix: Latch only when combo block produced new data
+      // Latch only when combo block produced new data
       // (IDLE?FILL or FILL?FILL loop), NOT during wait cycles.
       accum_base_pc_q      <= accum_base_pc_nxt;
       accum_trig_flags_q   <= accum_trig_flags_nxt;
@@ -272,12 +273,12 @@ module trace_builder #(
       accum_taken_cnt_q    <= accum_taken_cnt_nxt;
       accum_taken_targets_q <= accum_taken_targets_nxt;
       if (state_q == TB_IDLE)
-        accum_ghr_q <= ghr_i;  // V82: capture GHR only at trace start
+        accum_ghr_q <= ghr_i;  // capture GHR only at trace start
     end
   end
 
   // -----------------------------------------------------------------------
-  // V90 combinational scan: IDLE finds a taken branch ? FILL.
+  // combinational scan: IDLE finds a taken branch ? FILL.
   // FILL scans target window: if another taken branch ? loop (FILL?FILL);
   // otherwise ? commit.  Up to MAX_TAKEN taken branches per trace.
   // -----------------------------------------------------------------------
@@ -300,14 +301,14 @@ module trace_builder #(
     logic                                    w_reject;
     logic                                    w_overflow;
     logic                                    w_had_input;
-    // V90: multi-taken accumulators carried through scan
+    // multi-taken accumulators carried through scan
     logic [TAKEN_CNT_WIDTH-1:0]              w_taken_cnt;
     logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]      w_taken_targets;
 
     trace_data_t                             payload;
     logic [TRACE_ADDRW-1:0]                  cand_addr;
 
-    // V90-diag: FILL exit reason tracking (0=none, 1=flush, 2=pcguard,
+    // FILL exit reason tracking (0=none, 1=flush, 2=pcguard,
     //           3=commit, 4=discard/accum, 5=loop-mt, 6=wait)
     fill_exit_reason = 3'd0;
     accum_latch_en  = 1'b0;
@@ -318,7 +319,7 @@ module trace_builder #(
     commit_addr_d  = commit_addr_q;
     commit_tag_d   = commit_tag_q;
     commit_data_d  = commit_data_q;
-    // V95: default 0; each commit branch sets it explicitly. With
+    // default 0; each commit branch sets it explicitly. With
     // commit_valid_d also defaulted to 0 the FF gate is a no-op until a
     // branch sets both.
     tb_commit_value_ok_d = 1'b0;
@@ -361,8 +362,8 @@ module trace_builder #(
       w_cptr         = accum_chunk_ptr_q;
       w_icnt         = accum_instr_cnt_q;
       w_exit_pc      = accum_taken_target_q;  // default exit: branch target
-      w_taken_cnt    = accum_taken_cnt_q;      // V90
-      w_taken_targets = accum_taken_targets_q; // V90
+      w_taken_cnt    = accum_taken_cnt_q;
+      w_taken_targets = accum_taken_targets_q;
     end else begin
       w_chunks       = '0;
       w_valid_chunks = '0;
@@ -379,12 +380,12 @@ module trace_builder #(
       // ---- Scan current fetch window ----
       for (int i = 0; i < SLOTS_PER_CYCLE; i++) begin
         logic rvc, direct, taken_cf;
-        logic ret_cf, call_cf;  // V85: return / direct-call classification
+        logic ret_cf, call_cf;  // return / direct-call classification
 
         if (!(instr_i.consumed[i] && instr_i.valid[i]))
           continue;
 
-        // V71 FILL-PC guard: the first consumed instruction of the fill
+        // FILL-PC guard: the first consumed instruction of the fill
         // window MUST start at the taken-branch target.  If the PC does
         // not match, the pipeline hasn't redirected yet ? skip without
         // setting w_had_input so the builder waits another cycle in FILL.
@@ -423,7 +424,7 @@ module trace_builder #(
           w_has_base = 1'b1;
         end
 
-        // V90: FILL with taken branch ? if we've already reached MAX_TAKEN,
+        // FILL with taken branch ? if we've already reached MAX_TAKEN,
         // stop BEFORE this instruction (trace is full of taken branches).
         if (state_q == TB_FILL && taken_cf &&
             (w_taken_cnt >= TAKEN_CNT_WIDTH'(MAX_TAKEN))) begin
@@ -431,14 +432,14 @@ module trace_builder #(
           break;
         end
 
-        // V85: Accept direct CFs, returns (RAS-predicted target), and
+        // Accept direct CFs, returns (RAS-predicted target), and
         // direct calls.  Reject other indirect CFs (computed jumps).
         if (instr_i.is_branch[i] && !direct && !ret_cf && !call_cf) begin
           w_reject = 1'b1;
           break;
         end
 
-        // V92-retsafe: Truncate trace at return instruction boundary.
+        // Truncate trace at return instruction boundary.
         // Do not store the return or any instruction at/after it ? the
         // return target comes from the RAS and is runtime-dynamic, so
         // embedding it in the trace would produce stale wrong-path replays.
@@ -481,7 +482,7 @@ module trace_builder #(
           w_num_br = w_num_br + BR_CNT_WIDTH'(1);
 
           if (taken_cf) begin
-            // V90: Record this taken target in the targets array
+            // Record this taken target in the targets array
             if (w_taken_cnt < TAKEN_CNT_WIDTH'(MAX_TAKEN))
               w_taken_targets[w_taken_cnt] = instr_i.target[i];
             w_taken_cnt = w_taken_cnt + TAKEN_CNT_WIDTH'(1);
@@ -515,14 +516,14 @@ module trace_builder #(
               accum_instr_cnt_nxt    = w_icnt;
               accum_taken_cnt_nxt    = w_taken_cnt;
               accum_taken_targets_nxt = w_taken_targets;
-              accum_latch_en         = 1'b1;  // V90-fix
+              accum_latch_en         = 1'b1;
               state_d = TB_FILL;
             end
           end
         end
 
         TB_FILL: begin
-          // V90: If trace is already full entering this cycle, commit immediately.
+          // If trace is already full entering this cycle, commit immediately.
           if (w_icnt >= INSTR_CNT_W'(MAX_INSTR_PER_TRACE) && !w_had_input && !w_reject) begin
             payload               = '0;
             payload.valid         = 1'b1;
@@ -545,10 +546,10 @@ module trace_builder #(
                                             accum_ghr_q);
             commit_valid_d = 1'b1;
             commit_data_d  = payload;
-            // V95: at-entry-full path ? instr count == MAX_INSTR_PER_TRACE,
-            // which is >=4, so always passes the value filter.
+            // at-entry-full path ? instr count == MAX_INSTR_PER_TRACE,
+            // which is >= TB_VALUE_MIN_LEN, so always passes the value filter.
             tb_commit_value_ok_d = (accum_taken_cnt_q >= TAKEN_CNT_WIDTH'(2)) ||
-                                   (INSTR_CNT_W'(MAX_INSTR_PER_TRACE) >= INSTR_CNT_W'(4));
+                                   (INSTR_CNT_W'(MAX_INSTR_PER_TRACE) >= INSTR_CNT_W'(TB_VALUE_MIN_LEN));
             state_d = TB_IDLE;
             fill_exit_reason = 3'd3;  // early-commit (full at entry)
           end else if (w_had_input || w_reject || w_overflow) begin
@@ -559,7 +560,7 @@ module trace_builder #(
               if (w_has_taken &&
                   (w_icnt < INSTR_CNT_W'(MAX_INSTR_PER_TRACE)) &&
                   !w_reject && !w_overflow) begin
-                // V90: Another taken branch found AND room for more ?
+                // Another taken branch found AND room for more ?
                 // loop back to FILL for the next target window.
                 accum_base_pc_nxt      = accum_base_pc_q;  // keep original base
                 accum_trig_flags_nxt   = accum_trig_flags_q;
@@ -573,7 +574,7 @@ module trace_builder #(
                 accum_instr_cnt_nxt    = w_icnt;
                 accum_taken_cnt_nxt    = w_taken_cnt;
                 accum_taken_targets_nxt = w_taken_targets;
-                accum_latch_en         = 1'b1;  // V90-fix
+                accum_latch_en         = 1'b1;
                 state_d = TB_FILL;  // loop
                 fill_exit_reason = 3'd5;  // loop-mt (multi-taken)
               end else begin
@@ -600,14 +601,14 @@ module trace_builder #(
                                                 accum_ghr_q);
                 commit_valid_d = 1'b1;
                 commit_data_d  = payload;
-                // V95: value filter ? commit only multi-taken or length>=4.
+                // value filter ? multi-taken, or length >= TB_VALUE_MIN_LEN.
                 tb_commit_value_ok_d = (w_taken_cnt >= TAKEN_CNT_WIDTH'(2)) ||
-                                       (w_icnt      >= INSTR_CNT_W'(4));
+                                       (w_icnt      >= INSTR_CNT_W'(TB_VALUE_MIN_LEN));
                 state_d = TB_IDLE;
                 fill_exit_reason = 3'd3;  // commit (fill_added, no-taken/full)
               end
             end else begin
-              // V90: No new instructions added this cycle, but we may have a
+              // No new instructions added this cycle, but we may have a
               // multi-block trace from previous FILL loops.  Commit if
               // accumulated count exceeds 1 instruction (the IDLE window).
               if (accum_instr_cnt_q > INSTR_CNT_W'(1)) begin
@@ -632,9 +633,9 @@ module trace_builder #(
                                                 accum_ghr_q);
                 commit_valid_d = 1'b1;
                 commit_data_d  = payload;
-                // V95: value filter ? commit only multi-taken or length>=4.
+                // value filter ? multi-taken, or length >= TB_VALUE_MIN_LEN.
                 tb_commit_value_ok_d = (accum_taken_cnt_q >= TAKEN_CNT_WIDTH'(2)) ||
-                                       (accum_instr_cnt_q >= INSTR_CNT_W'(4));
+                                       (accum_instr_cnt_q >= INSTR_CNT_W'(TB_VALUE_MIN_LEN));
               end
               state_d = TB_IDLE;
               fill_exit_reason = (commit_valid_d) ? 3'd4 : 3'd2;  // 4=accum-commit, 2=discard(pcguard/etc)
@@ -646,7 +647,7 @@ module trace_builder #(
         end
       endcase
 
-      // V92-retsafe: suppress the write if the truncated trace is shorter
+      // suppress the write if the truncated trace is shorter
       // than the replay-time minimum.  A too-short trace written to SRAM
       // would be rejected on every replay anyway, wasting a slot.
       // Also fix fill_exit_reason so dbg_fill_commit_q does not count this
@@ -657,21 +658,14 @@ module trace_builder #(
         fill_exit_reason = 3'd2;  // discard ? return made trace too short
       end
 
-      // V99 (Option B): TC replay fired this cycle.  Fetch has been
-      // redirected to exit_pc, so any TB_FILL state we were going to
-      // remain in is now waiting for a target window the pipeline will
-      // never deliver.  Force the FSM to TB_IDLE; the always_ff clear
-      // branch (state_d == TB_IDLE && state_q != TB_IDLE) will then
-      // zero the accumulators next cycle, letting the builder start
-      // fresh from the exit_pc window.  Legitimate commits (state_d
-      // already TB_IDLE with commit_valid_d=1) are not touched ? the
-      // partial trace this kicks out had no commit pending anyway,
-      // because tc_builder_enable in the frontend zeroed instr valid
-      // for this cycle, so no scan progress could have produced one.
+      // A replay fired, so fetch jumped to exit_pc and the target window we
+      // were sitting in FILL waiting for is never coming.  Drop back to IDLE
+      // and let the accumulators clear.  No commit can be lost here: the
+      // frontend zeroed instr valid this cycle, so the scan made no progress.
       if (tc_replay_fired_i && state_d == TB_FILL) begin
         state_d          = TB_IDLE;
         accum_latch_en   = 1'b0;
-        fill_exit_reason = 3'd7;  // V99: tc-replay-reset
+        fill_exit_reason = 3'd7;  // tc-replay-reset
       end
     end
   end
@@ -679,22 +673,22 @@ module trace_builder #(
 `ifndef SYNTHESIS
   longint unsigned dbg_commit_q;
   longint unsigned dbg_fill_start_q;
-  longint unsigned dbg_fill_loop_q;  // V90: FILL?FILL loops (multi-taken)
+  longint unsigned dbg_fill_loop_q;  // FILL?FILL loops (multi-taken)
 
-  // V90-diag: FILL exit reason breakdown
+  // FILL exit reason breakdown
   longint unsigned dbg_fill_flush_q;      // flush killed FILL
   longint unsigned dbg_fill_pcguard_q;    // PC guard rejected (w_reject from guard)
   longint unsigned dbg_fill_commit_q;     // fill_added ? commit (no taken / full)
   longint unsigned dbg_fill_discard_q;    // !fill_added ? discard/accum-commit
   longint unsigned dbg_fill_loop_mt_q;    // fill_added + taken + room ? FILL loop
   longint unsigned dbg_fill_wait_q;       // no input, stayed in FILL
-  longint unsigned dbg_fill_tc_reset_q;   // V99: TB_FILL aborted by tc_replay_fired_i
+  longint unsigned dbg_fill_tc_reset_q;   // TB_FILL aborted by tc_replay_fired_i
 
-  // V92-retsafe counters
+  // counters
   longint unsigned dbg_ret_truncated_q;   // trace shortened before return, still accepted
   longint unsigned dbg_ret_rejected_q;    // trace dropped because return made it too short
 
-  // V77 hot-PC tracker: monitor builder activity for the top mismatch PCs
+  // hot-PC tracker: monitor builder activity for the top mismatch PCs
   localparam logic [PC_WIDTH-1:0] HOT_PC_0 = 64'h80002880;
   localparam logic [PC_WIDTH-1:0] HOT_PC_1 = 64'h8000287a;
   localparam logic [PC_WIDTH-1:0] HOT_PC_2 = 64'h80002888;  // stored neighbour
@@ -702,7 +696,7 @@ module trace_builder #(
 
   int unsigned dbg_fill_hot0, dbg_fill_hot1, dbg_fill_hot2, dbg_fill_hot3;
   int unsigned dbg_commit_hot0, dbg_commit_hot1, dbg_commit_hot2, dbg_commit_hot3;
-  // V95: how many builder commits were dropped by the value filter.
+  // how many builder commits were dropped by the value filter.
   longint unsigned dbg_value_filter_drops_q;
   longint unsigned dbg_value_filter_pass_q;
 
@@ -728,13 +722,13 @@ module trace_builder #(
       dbg_value_filter_pass_q  <= 0;
     end else begin
       if (commit_valid_d)                              dbg_commit_q     <= dbg_commit_q + 1;
-      // V95: split commits by value-filter outcome.
+      // split commits by value-filter outcome.
       if (commit_valid_d &&  tb_commit_value_ok_d)     dbg_value_filter_pass_q  <= dbg_value_filter_pass_q  + 1;
       if (commit_valid_d && !tb_commit_value_ok_d)     dbg_value_filter_drops_q <= dbg_value_filter_drops_q + 1;
-      // V90: count FILL?FILL loops (multi-taken continuations)
+      // count FILL?FILL loops (multi-taken continuations)
       if (state_q == TB_FILL && state_d == TB_FILL)
         dbg_fill_loop_q <= dbg_fill_loop_q + 1;
-      // V90-diag: FILL exit reason counters
+      // FILL exit reason counters
       if (state_q == TB_FILL) begin
         case (fill_exit_reason)
           3'd1: dbg_fill_flush_q    <= dbg_fill_flush_q + 1;
@@ -757,7 +751,7 @@ module trace_builder #(
             fill_exit_reason != 3'd0 && fill_exit_reason != 3'd7)
           dbg_pcguard_hit_total <= dbg_pcguard_hit_total + 1;
       end
-      // V92-retsafe: count all return encounters ? TB_IDLE (trace never started)
+      // count all return encounters ? TB_IDLE (trace never started)
       // and TB_FILL (truncated-and-accepted vs. too-short-or-no-taken rejected).
       if (w_truncate_at_return) begin
         if (commit_valid_d)
@@ -802,8 +796,8 @@ module trace_builder #(
              dbg_fill_wait_q - dbg_pcguard_miss_total);
     $display("[TC-FINAL] tc_truncated_return=%0d tc_rejected_return=%0d",
              dbg_ret_truncated_q, dbg_ret_rejected_q);
-    $display("[TC-V95] builder_value_filter: pass=%0d drop=%0d (drop = single-taken trace with len<4)",
-             dbg_value_filter_pass_q, dbg_value_filter_drops_q);
+    $display("[TC-V95] builder_value_filter: pass=%0d drop=%0d (drop = single-taken trace with len<%0d)",
+             dbg_value_filter_pass_q, dbg_value_filter_drops_q, TB_VALUE_MIN_LEN);
     $display("[TC-HOTPC-BUILDER] fill_starts: 0x%h=%0d  0x%h=%0d  0x%h=%0d  0x%h=%0d",
              HOT_PC_0[31:0], dbg_fill_hot0, HOT_PC_1[31:0], dbg_fill_hot1,
              HOT_PC_2[31:0], dbg_fill_hot2, HOT_PC_3[31:0], dbg_fill_hot3);

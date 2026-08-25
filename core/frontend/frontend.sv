@@ -88,7 +88,7 @@ module frontend
   logic [CVA6Cfg.VLEN-1:0]                 replay_addr;
 
   // -----------------------------------------------------------------------
-  // Trace Cache state ? V71 parallel-lookup / same-cycle competition
+  // Trace cache state ? parallel lookup, same-cycle competition with the I$
   // -----------------------------------------------------------------------
   logic                                    tc_trace_hit;
   logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   tc_trace_instructions;
@@ -115,12 +115,12 @@ module frontend
   logic                                    tc_trace_has_call;
   logic                                    tc_trace_has_indirect;
 
-  // V71: same-cycle hit decision ? replaces pending/replay model.
+  // same-cycle hit decision ? replaces pending/replay model.
   logic                                    tc_hit_this_cycle;
   logic                                    tc_suppress_port1;  // tied to 0
   logic [SLOTS_PER_CYCLE-1:0]              tc_valid_mask;  // valid up to first taken
 
-  // V72: 1-entry pending trace buffer ? captures TC hit when IQ not ready.
+  // 1-entry pending trace buffer ? captures TC hit when IQ not ready.
   logic                                    tc_pending_valid_q;
   logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   tc_pending_instructions_q;
   logic [TRACE_LEN_WIDTH-1:0]              tc_pending_length_q;
@@ -131,12 +131,12 @@ module frontend
   logic [MAX_TAKEN-1:0][PC_WIDTH-1:0]      tc_pending_taken_targets_q;
   logic [TAKEN_CNT_WIDTH-1:0]              tc_pending_num_taken_q;
   logic [PC_WIDTH-1:0]                     tc_pending_base_pc_q;  // for PC safety check
-  logic [7:0]                              tc_pending_ghr_q;      // V86-fix: GHR snapshot at capture time
+  logic [7:0]                              tc_pending_ghr_q;      // GHR snapshot at capture time
   // Pending buffer control signals
   logic                                    tc_pending_capture;  // TC hit + IQ not ready
   logic                                    tc_pending_use;      // pending valid + IQ ready + safe
   logic                                    tc_pending_invalidate; // any path-breaking event
-  // V72-fix: Suppress I$ data into IQ while pending buffer owns the trace.
+  // Suppress I$ data into IQ while pending buffer owns the trace.
   // Active during the capture cycle AND all subsequent cycles until the
   // pending buffer is consumed (tc_pending_use) or invalidated.  This
   // prevents the I$ scan from partially inserting instructions into
@@ -158,8 +158,8 @@ module frontend
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]                   valid_to_iq;
   cf_t  [CVA6Cfg.INSTR_PER_FETCH-1:0]                   cf_type_to_iq;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0][CVA6Cfg.VLEN-1:0] predict_addr_to_iq;
-  logic [7:0]                                           tc_ghr_from_tc;        // V81: current GHR from trace cache
-  logic [7:0]                                           tc_ghr_to_iq;          // V81: GHR snapshot for pipeline propagation
+  logic [7:0]                                           tc_ghr_from_tc;        // current GHR from trace cache
+  logic [7:0]                                           tc_ghr_to_iq;          // GHR snapshot for pipeline propagation
   ariane_pkg::frontend_exception_t                      exception_to_iq;
   logic [CVA6Cfg.VLEN-1:0]                              exception_addr_to_iq;
   logic [CVA6Cfg.GPLEN-1:0]                             exception_gpaddr_to_iq;
@@ -167,6 +167,8 @@ module frontend
   logic                                                 exception_gva_to_iq;
   logic                                                 tc_disable_replay_q;
   logic                                                 tc_no_iq_gate_q;
+  logic                                                 tc_no_path_gate_q;
+  logic                                                 tc_loose_lo_gate_q;
 
   function automatic cf_t tc_replay_cf_type(input logic [31:0] instr_i);
     logic is_rvc;
@@ -255,7 +257,7 @@ module frontend
   cf_t [CVA6Cfg.INSTR_PER_FETCH-1:0]                     cf_type;
   logic [CVA6Cfg.INSTR_PER_FETCH-1:0]                    taken_rvi_cf, taken_rvc_cf;
   logic                                                   serving_unaligned;
-  // V94: combinational next-cycle alignment forecast from instr_realign.
+  // combinational next-cycle alignment forecast from instr_realign.
   logic                                                   next_serving_unaligned;
   logic [CVA6Cfg.VLEN-1:0]                                next_unaligned_address;
 
@@ -285,7 +287,7 @@ module frontend
     assign btb_prediction_shifted[0] = (serving_unaligned) ? btb_q : btb_prediction[addr[0][1]];
   end
 
-  // V71: instruction scan always runs ? no gating during TC hit.
+  // instruction scan always runs ? no gating during TC hit.
   // Side effects (RAS push/pop) are suppressed separately in tc_hit_this_cycle.
   logic bp_valid;
   logic tc_icache_sidefx_en;
@@ -373,10 +375,10 @@ module frontend
 
   assign is_mispredict = resolved_branch_i.valid & resolved_branch_i.is_mispredict;
 
-  // V71: I$ runs continuously ? no TC gating.  TC competes same-cycle.
+  // I$ runs continuously ? no TC gating.  TC competes same-cycle.
   assign icache_dreq_o.req     = instr_queue_ready & ~halt_frontend_i;
   assign if_ready              = icache_dreq_i.ready & instr_queue_ready & ~halt_frontend_i;
-  // V72-fix: kill I$ stage-1 during pending capture to prevent stale
+  // kill I$ stage-1 during pending capture to prevent stale
   // pipeline-drain responses from reaching icache_valid_q next cycle.
   assign icache_dreq_o.kill_s1 = is_mispredict | flush_i | replay_eff | tc_hit_this_cycle | tc_pending_capture;
   assign icache_dreq_o.kill_s2 = icache_dreq_o.kill_s1 | bp_valid;
@@ -439,7 +441,7 @@ module frontend
     end
   end
 
-  // V90: With MAX_TAKEN=3, TAKEN_CNT_WIDTH=2 bits ? wide enough for
+  // With MAX_TAKEN=3, TAKEN_CNT_WIDTH=2 bits ? wide enough for
   // correct comparisons.  Check both branches and taken counts.
   assign tc_trace_branch_map_ok = (tc_trace_mapped_num_branches == tc_trace_num_branches) &&
                                   (tc_trace_mapped_num_taken == tc_trace_num_taken);
@@ -459,13 +461,13 @@ module frontend
   end
 
   // -----------------------------------------------------------------------
-  // V71: Same-cycle TC/I$ MUX ? no pending/replay model.
+  // Same-cycle TC/I$ MUX ? no pending/replay model.
   // When tc_hit_this_cycle fires, trace data replaces I$ data for the IQ
   // push *in the same cycle*.  No extra latency on miss.
   // -----------------------------------------------------------------------
 
   // Combinational feed signals: format trace output for IQ push.
-  // V72: When tc_pending_use fires, feed from the buffered registers.
+  // When tc_pending_use fires, feed from the buffered registers.
   //      When tc_direct_hit fires, feed from live SRAM trace outputs.
   logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   tc_feed_src_instructions;
   logic [TRACE_LEN_WIDTH-1:0]              tc_feed_src_length;
@@ -542,7 +544,7 @@ module frontend
   end
 
   // -----------------------------------------------------------------------
-  // V85: TC-driven RAS synchronization.
+  // TC-driven RAS synchronization.
   // When a trace containing a return/call is replayed, the RAS must be
   // updated to stay consistent.  The normal I$-path RAS push/pop are
   // suppressed on tc_hit_this_cycle ? these signals provide the TC path.
@@ -580,7 +582,7 @@ module frontend
   // -----------------------------------------------------------------------
   assign instr_to_iq            = tc_hit_this_cycle ? tc_feed_instr : instr;
   assign addr_to_iq             = tc_hit_this_cycle ? tc_feed_addr  : addr;
-  // V72-fix: When the pending buffer is active (capture or holding),
+  // When the pending buffer is active (capture or holding),
   // suppress I$ data to the IQ.  This prevents the I$ scan from
   // partially inserting instructions into non-full IQ lanes that
   // would duplicate the captured trace when tc_pending_use fires.
@@ -598,15 +600,15 @@ module frontend
     assign predict_addr_to_iq[gi] = tc_hit_this_cycle ? tc_feed_predict_addr[gi] : predict_address;
   end
 
-  // V81: GHR snapshot ? same for all slots in the window
-  // V86-fix: use captured GHR when replaying from pending buffer
+  // GHR snapshot ? same for all slots in the window
+  // use captured GHR when replaying from pending buffer
   assign tc_ghr_to_iq = tc_pending_use ? tc_pending_ghr_q : tc_ghr_from_tc;
 
   // During TC hit, supply the trace's own branch outcomes as branch_flags.
   assign branch_flags_to_iq = tc_hit_this_cycle ?
       tc_feed_src_branch_flags[CHUNKS_PER_TRACE-1:0] : tc_branch_predictions;
 
-  // V71: tc_active_branch_flags for restore on mispredict.
+  // tc_active_branch_flags for restore on mispredict.
   always_comb begin
     tc_active_branch_flags = '0;
     if (tc_hit_this_cycle) begin
@@ -639,9 +641,9 @@ module frontend
       npc_d = {fetch_address[CVA6Cfg.VLEN-1:CVA6Cfg.FETCH_ALIGN_BITS] + 1,
                {CVA6Cfg.FETCH_ALIGN_BITS{1'b0}}};
 
-    // [V68: BHT scan cancel NPC redirect removed ? tc_scan_cancel is always 0]
+    // [BHT scan cancel NPC redirect removed ? tc_scan_cancel is always 0]
 
-    // V72: Steer NPC to trace exit on same-cycle TC hit (direct or pending).
+    // Steer NPC to trace exit on same-cycle TC hit (direct or pending).
     if (tc_hit_this_cycle)
       npc_d = tc_feed_src_next_pc[CVA6Cfg.VLEN-1:0];
 
@@ -678,7 +680,7 @@ module frontend
       npc_rst_load_q <= 1'b0;
       npc_q          <= npc_d;
       speculative_q  <= speculative_d;
-      // V72-fix: Suppress stale I$ response registration while the
+      // Suppress stale I$ response registration while the
       // pending buffer owns a trace.  Without this, a pipeline-drain
       // response could arrive, be registered, run through instr_realign
       // next cycle, and partially leak into the IQ via non-full lanes
@@ -716,7 +718,7 @@ module frontend
   end
 
   // -----------------------------------------------------------------------
-  // V72: Pending trace buffer ? 1-entry register
+  // Pending trace buffer ? 1-entry register
   // Captures a TC hit when IQ is not ready.  Used next cycle if IQ becomes
   // ready and the path context is still valid (no redirect, no flush).
   // -----------------------------------------------------------------------
@@ -748,7 +750,7 @@ module frontend
       tc_pending_taken_targets_q  <= tc_trace_taken_targets;
       tc_pending_num_taken_q      <= tc_trace_num_taken;
       tc_pending_base_pc_q        <= tc_trace_pcs[0];
-      tc_pending_ghr_q            <= tc_ghr_from_tc;  // V86-fix: snapshot GHR at capture
+      tc_pending_ghr_q            <= tc_ghr_from_tc;  // snapshot GHR at capture
     end
   end
 
@@ -763,9 +765,9 @@ module frontend
         .clk_i,
         .rst_ni,
         .flush_bp_i(flush_bp_i),
-        .push_i(ras_push | tc_ras_push),         // V85: include TC-driven push
-        .pop_i(ras_pop | tc_ras_pop),             // V85: include TC-driven pop
-        .data_i(tc_ras_push ? tc_ras_update : ras_update),  // V85: TC call return addr
+        .push_i(ras_push | tc_ras_push),         // include TC-driven push
+        .pop_i(ras_pop | tc_ras_pop),             // include TC-driven pop
+        .data_i(tc_ras_push ? tc_ras_update : ras_update),  // TC call return addr
         .data_o(ras_predict)
     );
   end
@@ -777,7 +779,7 @@ module frontend
   // Second BHT read port for TC branch scan (dedicated, no MUX conflicts).
   ariane_pkg::bht_prediction_t [CVA6Cfg.INSTR_PER_FETCH-1:0] tc_bht_prediction;
 
-  // V70: BHT scan removed ? no pre-replay branch cancellation.
+  // BHT scan removed ? no pre-replay branch cancellation.
   // Second BHT port tied to npc_q (unused result, kept for interface).
   logic [CVA6Cfg.VLEN-1:0] tc_scan_vpc;
   assign tc_scan_vpc = npc_q;
@@ -861,7 +863,7 @@ module frontend
   ) i_instr_queue (
       .clk_i,
       .rst_ni,
-      // V71: On TC hit, trace data replaces I$ data in the IQ MUX.
+      // On TC hit, trace data replaces I$ data in the IQ MUX.
       // On miss, I$ data flows through unchanged.
       .flush_i            (flush_i || is_mispredict || set_pc_commit_i || eret_i ||
                            ex_valid_i),
@@ -886,18 +888,18 @@ module frontend
       .fetch_entry_o      (fetch_entry_o),
       .fetch_entry_valid_o(fetch_entry_valid_o),
       .fetch_entry_ready_i(fetch_entry_ready_i),
-      .tc_feeding_i       (tc_hit_this_cycle),  // V71: same-cycle TC feed
+      .tc_feeding_i       (tc_hit_this_cycle),  // same-cycle TC feed
       .tc_suppress_port1_i(tc_suppress_port1),
       .reseed_pc_i        (tc_hit_this_cycle)
   );
 
   // -----------------------------------------------------------------------
-  // V71: Suppress IQ replay during TC hit (NPC is being re-steered).
+  // Suppress IQ replay during TC hit (NPC is being re-steered).
   // -----------------------------------------------------------------------
   assign replay_eff = replay & ~tc_hit_this_cycle;
 
   // -----------------------------------------------------------------------
-  // Trace Cache signals for recording & lookup ? V71 parallel design
+  // Trace cache signals for recording and lookup
   // -----------------------------------------------------------------------
   logic [SLOTS_PER_CYCLE-1:0]               tc_instr_valid;
   logic [SLOTS_PER_CYCLE-1:0][31:0]         tc_instr;
@@ -969,10 +971,10 @@ module frontend
   end
 
   // -----------------------------------------------------------------------
-  // V71: Branch predictions for TC tag matching ? computed from the live
+  // Branch predictions for TC tag matching ? computed from the live
   // instruction scan (tc_valid_mask), NOT from instr_queue_consumed.
   // -----------------------------------------------------------------------
-  logic tc_window_has_taken_pred; // V79: true when ?1 branch is predicted-taken
+  logic tc_window_has_taken_pred; // true when ?1 branch is predicted-taken
   always_comb begin
     integer br_idx;
     automatic logic seen_taken;
@@ -1006,35 +1008,19 @@ module frontend
         br_idx++;
       end
     end
-    tc_window_has_taken_pred = seen_taken;  // V79
+    tc_window_has_taken_pred = seen_taken;
   end
 
-  // -----------------------------------------------------------------------
-  // TC SRAM lookup. Single-cycle SRAM: the read fires this cycle, the data
-  // returns next cycle, where it is tag-compared against the same window's
-  // live branch_predictions and consumed by the IQ-side mux.
-  //
-  // Two firing paths share the SRAM port:
-  //  - aligned: lookup fires the cycle the I$ returns a new block; result
-  //    lands the cycle that block is realigned and presented to the IQ.
-  //  - V94 early-unaligned: when this cycle's instr_realign tells us next
-  //    cycle will be serving_unaligned, fire the SRAM at the unaligned PC
-  //    THIS cycle so the result lands the same cycle the unaligned instr
-  //    is presented to the IQ ? same pipeline shape as aligned. The aligned
-  //    lookup that would otherwise fire this cycle is overridden because
-  //    its result would have landed on the unaligned cycle (wrong window).
-  // -----------------------------------------------------------------------
+  // TC SRAM lookup.  Read fires this cycle, data lands next cycle and is
+  // tag-compared against that window's live branch predictions.
   logic                tc_lookup_valid;
   logic [PC_WIDTH-1:0] tc_lookup_pc;
-  // V94: early-unaligned lookup. instr_realign tells us THIS cycle whether
-  // next cycle will serve an unaligned 32-bit instruction whose first half
-  // sits in the block being processed now and whose second half is in the
-  // block currently arriving on icache_dreq_i. By firing the SRAM read at
-  // H(next_unaligned_address) THIS cycle, the result returns next cycle,
-  // exactly when serving_unaligned=1 and addr[0]=next_unaligned_address ?
-  // identical timing to an aligned lookup. The aligned lookup that would
-  // otherwise have fired this cycle would have its result land on the
-  // unaligned cycle (wrong window) so it's strictly safe to override it.
+  // Unaligned windows need the read fired one cycle early.  instr_realign
+  // knows this cycle that the next one will serve an unaligned 32-bit
+  // instruction straddling two blocks, so we index on the unaligned PC now
+  // and the result arrives exactly when that instruction reaches the IQ.
+  // Overriding the aligned lookup is safe -- its result would have landed on
+  // the unaligned cycle and described the wrong window anyway.
   logic                    tc_early_unaligned_lookup;
   assign tc_early_unaligned_lookup = next_serving_unaligned && icache_valid_q &&
                                      tc_window_eligible && !flush_i;
@@ -1108,113 +1094,106 @@ module frontend
   );
 
   logic tc_trace_policy_ok;
-  // V73: Minimum trace length to accept.  A TC hit fires kill_s1 which
-  // kills one extra I$ pipeline stage vs normal branch prediction (which
-  // only fires kill_s2).  This costs 1 bubble cycle.  A trace of length
-  // N delivers (N - pre_branch_count) extra instructions over what the
-  // I$ would have provided.  For length-2 traces (1 pre + 1 post branch),
-  // the 1 extra instruction equals the 1 bubble cost ? net zero benefit.
-  // V92 experiment: raised to 4, but run 62 showed no improvement (L3
-  // replays were marginally helpful).  Reverted to 3.
+  // A hit fires kill_s1, one bubble more than an ordinary BTB redirect.  A
+  // length-2 trace delivers exactly one extra instruction, so it breaks even
+  // at best; 3 is the shortest trace worth the redirect.  Tried 4 -- no gain.
   localparam int unsigned TC_MIN_ACCEPT_LEN = 3;
 
 `ifndef SYNTHESIS
   initial begin
     tc_disable_replay_q = $test$plusargs("TC_DISABLE_REPLAY");
     tc_no_iq_gate_q     = $test$plusargs("TC_NO_IQ_GATE");
+    tc_no_path_gate_q   = $test$plusargs("TC_NO_PATH_GATE");  // V101: A/B the path gate
+    tc_loose_lo_gate_q  = $test$plusargs("TC_LOOSE_LO_GATE"); // V102: restore V97 lo-value gate
   end
 
   initial begin
     $display("[TC-RUN-MARKER] TC_V74_DEDUP_GUARD");
     $display("[TC-POLICY] min_accept_len=%0d", TC_MIN_ACCEPT_LEN);
+    $display("[TC-POLICY] full_path_validation=%0d (V101)", !tc_no_path_gate_q);
+    $display("[TC-POLICY] lo_value_requires_iq_empty=%0d (V102)", !tc_loose_lo_gate_q);
     if (tc_disable_replay_q)
       $display("[TC-RUN-MARKER] TC_SWITCH_DISABLE_REPLAY_ACTIVE");
     if (tc_no_iq_gate_q)
       $display("[TC-RUN-MARKER] TC_NO_IQ_GATE_ACTIVE");
+    if (tc_no_path_gate_q)
+      $display("[TC-RUN-MARKER] TC_NO_PATH_GATE_ACTIVE");
   end
 `else
   assign tc_disable_replay_q = 1'b0;
   assign tc_no_iq_gate_q     = 1'b0;
+  assign tc_no_path_gate_q   = 1'b0;
+  assign tc_loose_lo_gate_q  = 1'b0;
 `endif
 
   assign tc_active_hit = tc_lookup_result_valid && tc_trace_hit &&
                          (tc_trace_length != '0) && !flush_i && !is_mispredict;
 
-  // V90: Accept any trace that passes consistency checks and meets minimum
-  // length.  The multi-taken builder (V90) now produces traces spanning
-  // multiple taken branches, so all committed traces are worth replaying.
+  // Only replay traces whose every branch was checked against the predictor.
+  //
+  // The tag covers the trigger window alone: the builder freezes trig_cnt /
+  // trig_flags once it leaves TB_IDLE, so the tag holds the first window's
+  // branch count while the payload holds the whole trace's.  A hit has
+  // already forced stored_tag.num_branches == tc_lookup_num_branches, so the
+  // two counts being equal means no branch escaped the compare.
+  //
+  // Branches past the first window are otherwise replayed as fact.  On
+  // CoreMark they mispredicted 1.31% of the time (+8724 mispredicts, +2.32%
+  // runtime) while 98% of replays landed in a non-empty IQ and bought
+  // nothing.  Lookup-side policy only -- trace format and builder untouched.
+  // +TC_NO_PATH_GATE disables it for A/B runs.
+  logic tc_trace_path_validated;
+  assign tc_trace_path_validated = (tc_trace_num_branches == tc_lookup_num_branches);
+
+  // Replay anything that is self-consistent, long enough to pay for its
+  // bubble, and fully path-checked.
   assign tc_trace_policy_ok = tc_trace_starts_ok &&
                               tc_trace_branch_map_ok &&
                               (tc_trace_length >= TRACE_LEN_WIDTH'(TC_MIN_ACCEPT_LEN)) &&
+                              (tc_trace_path_validated || tc_no_path_gate_q) &&
                               !tc_disable_replay_q;
 
-  // V72: Pending trace buffer invalidation ? any path-breaking event.
-  // V96-fix: use (replay & ~tc_pending_valid_q) instead of replay_eff here.
-  // replay_eff = replay & ~tc_hit_this_cycle caused a combinational loop:
-  //   tc_pending_use ? tc_hit_this_cycle ? tc_feeding_i ? IQ replay_o ?
-  //   replay ? replay_eff ? tc_pending_invalidate ? tc_pending_use
-  // Since tc_pending_valid_q is registered, substituting ~tc_pending_valid_q
-  // for ~tc_hit_this_cycle breaks the loop.  The semantics are equivalent:
-  //   ? when tc_pending_valid_q=1: replay=0 always (tc_suppress_icache=1 ?
-  //     valid_to_iq=0 ? no IQ overflow), so both terms are 0.
-  //   ? when tc_pending_valid_q=0: tc_pending_use=0 regardless, and
-  //     tc_hit_this_cycle=tc_direct_hit (registered-based), so replay is
-  //     stable ? no feedback through this path.
+  // Drop the pending trace on anything that breaks the path it assumed.
+  // The replay term uses ~tc_pending_valid_q rather than ~tc_hit_this_cycle:
+  // the latter closes a comb loop through tc_pending_use -> tc_feeding_i ->
+  // IQ replay_o -> back here.  Equivalent because replay is always 0 while a
+  // pending trace is valid (tc_suppress_icache blocks the IQ push).
   assign tc_pending_invalidate = flush_i || is_mispredict || ex_valid_i ||
                                  eret_i || set_pc_commit_i ||
                                  (replay & ~tc_pending_valid_q) ||
                                  (CVA6Cfg.DebugEn && set_debug_pc_i);
 
-  // -----------------------------------------------------------------------
-  // V95 ? Two-tier value-aware replay gating.
-  //
-  // A TC hit costs 1 kill_s1 bubble. Whether it pays back depends on what
-  // the trace can do that the icache + BHT/BTB pipeline cannot:
-  //   - single-taken trace : icache already handles a 1-taken-branch window
-  //                          in 1 cycle; replay only nets cycles when the
-  //                          frontend is starving (IQ empty).
-  //   - multi-taken trace  : each extra taken branch in the trace saves a
-  //                          redirect bubble the icache pipeline cannot
-  //                          avoid; replay is net-positive even when the IQ
-  //                          has work pending.
-  //
-  // C3 evidence: 538 multi-taken hits, 516 (96%) killed by the strict
-  // IQ-empty gate. Those are the highest-value hits in the cache.
-  //
-  // V95 Rule (original):
-  //   hi-value (num_taken >= 2): require only IQ ready_o (room), drop the
-  //                              instr_queue_empty requirement.
-  //   lo-value (num_taken == 1): keep the strict IQ-empty gate.
-  //
-  // V97 Rule (loosened lo-value gate):
-  //   wikisort C4 evidence: 16,039 lo-value hits, 15,905 (99%) killed by
-  //   the strict IQ-empty gate; the 134 that slipped through cost only
-  //   ~17 extra mispredicts (7,030 ? 7,047 vs A baseline). The strict
-  //   gate is paying ~zero misprediction insurance ? it is just blocking
-  //   acceptance. Loosening lo-value to also use IQ-ready (room) unlocks
-  //   the rejected_not_ready pile without measurable misprediction risk.
-  //   tc_direct_hit independently AND's instr_queue_ready, so this gate
-  //   change cannot fire on a full IQ.
-  // -----------------------------------------------------------------------
+  // Two-tier replay gate.  A hit costs one kill_s1 bubble, so it has to buy
+  // back something the icache + BHT/BTB cannot already do:
+  //   multi-taken: each extra taken branch saves a redirect the icache
+  //                pipeline cannot avoid.  Replay whenever the IQ has room.
+  //   single-taken: the icache already delivers a one-taken window in a
+  //                cycle, so replay only pays while the frontend starves.
+  //                Require the IQ to be empty.
   logic tc_trace_is_hi_value;
   logic tc_pending_is_hi_value;
   assign tc_trace_is_hi_value   = (tc_trace_num_taken     >= TAKEN_CNT_WIDTH'(2));
   assign tc_pending_is_hi_value = (tc_pending_num_taken_q >= TAKEN_CNT_WIDTH'(2));
 
-  // Effective IQ-occupancy gate. V97: lo-value also passes when IQ has
-  // room (ready_o), matching hi-value behaviour. The original
-  // instr_queue_empty term remains as an OR so that the gate is also
-  // satisfied during the natural empty windows that V95 relied on.
   logic tc_value_gate_direct;
   logic tc_value_gate_pending_use;
+  // briefly let single-taken traces through on IQ-ready instead of
+  // IQ-empty.  On CoreMark that fired 98% of replays into a non-empty queue
+  // for +31.8k cycles of pure redirect overhead at unchanged misprediction
+  // count, so the strict gate is back.  Side effect: single-taken traces can
+  // no longer reach the pending buffer (capture needs !ready, and empty
+  // implies ready) and fall through to rejected_not_ready -- intended.
+  // v91_iq_gate_suppress counts what this costs.  +TC_LOOSE_LO_GATE reverts.
   assign tc_value_gate_direct      = tc_no_iq_gate_q || tc_trace_is_hi_value
-                                     || instr_queue_empty || instr_queue_ready;
+                                     || instr_queue_empty
+                                     || (tc_loose_lo_gate_q && instr_queue_ready);
   assign tc_value_gate_pending_use = tc_no_iq_gate_q || tc_pending_is_hi_value
-                                     || instr_queue_empty || instr_queue_ready;
+                                     || instr_queue_empty
+                                     || (tc_loose_lo_gate_q && instr_queue_ready);
 
-  // V72: Capture a TC hit into the pending buffer when IQ is not ready.
+  // Capture a TC hit into the pending buffer when IQ is not ready.
   // Do not overwrite an existing valid pending trace (it takes priority).
-  // V95: gate is now value-aware ? hi-value hits get captured even when
+  // gate is now value-aware ? hi-value hits get captured even when
   // the IQ has work backed up, so we don't lose multi-taken bubble savings.
   assign tc_pending_capture = tc_active_hit && tc_trace_policy_ok &&
                               !tc_trace_used && !instr_queue_ready &&
@@ -1222,7 +1201,7 @@ module frontend
                               !tc_pending_invalidate &&
                               !tc_pending_valid_q;
 
-  // V72-fix: Suppress I$ data into IQ for the duration of pending buffer
+  // Suppress I$ data into IQ for the duration of pending buffer
   // ownership.  tc_pending_capture covers the capture cycle itself;
   // tc_pending_valid_q covers all subsequent cycles until use/invalidation.
   // No combinational loop: instr_queue_ready (= IQ ready_o) is based
@@ -1230,15 +1209,15 @@ module frontend
   // depend on valid_to_iq ? push ? FIFO full ? ready.
   assign tc_suppress_icache = tc_pending_capture || tc_pending_valid_q;
 
-  // V72: Use the pending buffer when it is valid, IQ is ready, and no
+  // Use the pending buffer when it is valid, IQ is ready, and no
   // invalidation event has occurred.
-  // V95: value-aware gate (hi-value bypasses IQ-empty).
+  // value-aware gate (hi-value bypasses IQ-empty).
   assign tc_pending_use = tc_pending_valid_q && instr_queue_ready &&
                           tc_value_gate_pending_use &&
                           !tc_pending_invalidate;
 
-  // V72: tc_hit_this_cycle ? fires on direct same-cycle hit OR pending use.
-  // V91/V95: replay gate is now value-aware (see tc_value_gate_direct above).
+  // tc_hit_this_cycle ? fires on direct same-cycle hit OR pending use.
+  // replay gate is now value-aware (see tc_value_gate_direct above).
   logic tc_replay_iq_gate;
   assign tc_replay_iq_gate = tc_value_gate_direct;
 
@@ -1266,6 +1245,8 @@ module frontend
   int unsigned tc_dbg_reject_singleblock_q;
   int unsigned tc_dbg_reject_short_q;
   int unsigned tc_dbg_reject_policy_q;
+  int unsigned tc_dbg_reject_unvalidated_q;  // hits dropped by the full-path gate
+  int unsigned tc_dbg_hit_unvalidated_q;     // hits whose path was NOT fully validated
   int unsigned tc_dbg_feed_done_q;
   int unsigned tc_dbg_feed_cycles_q;
   int unsigned tc_dbg_hold_count_q;
@@ -1320,7 +1301,7 @@ module frontend
   int unsigned tc_dbg_pending_capture_q;
   int unsigned tc_dbg_pending_use_q;
   int unsigned tc_dbg_pending_invalidate_q;
-  // V88: Backend stall / frontend bubble counters
+  // Backend stall / frontend bubble counters
   int unsigned tc_dbg_backend_stall_q;        // cycles backend not ready (fetch_entry_valid & !fetch_entry_ready)
   int unsigned tc_dbg_iq_empty_cycles_q;      // cycles IQ was empty (frontend starvation)
   int unsigned tc_dbg_iq_not_ready_cycles_q;  // cycles IQ was full (backpressure)
@@ -1328,7 +1309,7 @@ module frontend
   int unsigned tc_dbg_replay_profit_2tk_q;    // accepted replays with exactly 2 taken
   int unsigned tc_dbg_replay_profit_3tk_q;    // accepted replays with ?3 taken
   int unsigned tc_dbg_replay_len_hist_q [8];  // accepted trace length histogram [3..7+]
-  // V91: IQ-gate suppression counter
+  // IQ-gate suppression counter
   int unsigned tc_dbg_iq_gate_suppress_q;     // hits suppressed because IQ was non-empty
   // Multi-taken coverage histograms.  Bucket tk3p is MAX_TAKEN (currently 3).
   localparam int unsigned TC_TAKEN_HIST_BINS = MAX_TAKEN + 1;
@@ -1339,7 +1320,7 @@ module frontend
   int unsigned tc_dbg_policy_taken_hist_q [TC_TAKEN_HIST_BINS];
   int unsigned tc_dbg_used_taken_hist_q [TC_TAKEN_HIST_BINS];
 
-  // V77 Hot-PC frontend tracker: hit/miss/policy for top mismatch PCs
+  // Hot-PC frontend tracker: hit/miss/policy for top mismatch PCs
   localparam logic [CVA6Cfg.VLEN-1:0] FE_HP0 = CVA6Cfg.VLEN'(64'h80002880);
   localparam logic [CVA6Cfg.VLEN-1:0] FE_HP1 = CVA6Cfg.VLEN'(64'h8000287a);
   localparam logic [CVA6Cfg.VLEN-1:0] FE_HP2 = CVA6Cfg.VLEN'(64'h80002888);
@@ -1353,7 +1334,7 @@ module frontend
   int unsigned fe_hp_miss_path [4]; // miss: path mismatch
 
   // -----------------------------------------------------------------------
-  // V72: ROI (Region of Interest) measurement
+  // ROI (Region of Interest) measurement
   // The ROI is activated by the first committed instruction in the
   // Coremark code region (PC >= 0x80000000) and deactivated when PC
   // leaves that region (e.g., WFI spin at 0x0200018a).  All TC stats
@@ -1377,7 +1358,7 @@ module frontend
   int unsigned roi_tc_hit_taken_hist_q [TC_TAKEN_HIST_BINS];
   int unsigned roi_tc_accept_taken_hist_q [TC_TAKEN_HIST_BINS];
 
-  // V72: ROI plusarg configuration
+  // ROI plusarg configuration
   initial begin
     roi_start_pc = 64'h80000000;  // default: Coremark code region start
     roi_end_pc   = 64'h80010000;  // default: Coremark code region end (64KB)
@@ -1400,6 +1381,8 @@ module frontend
       tc_dbg_reject_singleblock_q <= 0;
       tc_dbg_reject_short_q       <= 0;
       tc_dbg_reject_policy_q      <= 0;
+      tc_dbg_reject_unvalidated_q <= 0;
+      tc_dbg_hit_unvalidated_q    <= 0;
       tc_dbg_feed_done_q        <= 0;
       tc_dbg_feed_cycles_q      <= 0;
       tc_dbg_hold_count_q       <= 0;
@@ -1527,6 +1510,10 @@ module frontend
           tc_dbg_hit_taken_hist_q[trace_taken_idx] <=
               tc_dbg_hit_taken_hist_q[trace_taken_idx] + 1;
 
+          // how many hits carry branches the tag never validated
+          if (!tc_trace_path_validated)
+            tc_dbg_hit_unvalidated_q <= tc_dbg_hit_unvalidated_q + 1;
+
           if (tc_trace_policy_ok) begin
             if (tc_trace_used) begin
               tc_dbg_reject_used_q <= tc_dbg_reject_used_q + 1;
@@ -1536,7 +1523,7 @@ module frontend
               tc_dbg_reject_not_ready_q <= tc_dbg_reject_not_ready_q + 1;
               tc_dbg_not_ready_taken_hist_q[trace_taken_idx] <=
                   tc_dbg_not_ready_taken_hist_q[trace_taken_idx] + 1;
-              // V91: Count how many of these were specifically blocked by IQ gate
+              // Count how many of these were specifically blocked by IQ gate
               if (instr_queue_ready && !instr_queue_empty) begin
                 tc_dbg_iq_gate_suppress_q <= tc_dbg_iq_gate_suppress_q + 1;
                 tc_dbg_iq_gate_taken_hist_q[trace_taken_idx] <=
@@ -1550,6 +1537,9 @@ module frontend
               tc_dbg_reject_singleblock_q <= tc_dbg_reject_singleblock_q + 1;
             if (tc_trace_length < TRACE_LEN_WIDTH'(TC_MIN_ACCEPT_LEN))
               tc_dbg_reject_short_q <= tc_dbg_reject_short_q + 1;
+            // attribute rejections to the full-path validation gate
+            if (!tc_trace_path_validated && !tc_no_path_gate_q)
+              tc_dbg_reject_unvalidated_q <= tc_dbg_reject_unvalidated_q + 1;
             tc_dbg_reject_policy_q <= tc_dbg_reject_policy_q + 1;
             tc_dbg_policy_taken_hist_q[trace_taken_idx] <=
                 tc_dbg_policy_taken_hist_q[trace_taken_idx] + 1;
@@ -1564,7 +1554,7 @@ module frontend
           end
         end
 
-        // V77 Hot-PC per-lookup classification
+        // Hot-PC per-lookup classification
         for (int i = 0; i < 4; i++) begin
           logic [CVA6Cfg.VLEN-1:0] hp;
           case (i)
@@ -1725,7 +1715,7 @@ module frontend
       end
 
       if (tc_dbg_post_replay_armed_q && deq_count != 0) begin
-        // V69: Count every post-replay event; only $display a limited number
+        // Count every post-replay event; only $display a limited number
         // to prevent transcript flooding.  match=0 is EXPECTED when the IQ
         // contains stale I-cache entries before the TC trace data (the debug
         // counter tc_dbg_replay_remaining_q counts ALL dequeues, not just TC
@@ -1746,7 +1736,7 @@ module frontend
         end
       end
 
-      // V71: count TC hit cycles
+      // count TC hit cycles
       if (tc_hit_this_cycle) begin
         tc_dbg_tc_pkt_cycles_q <= tc_dbg_tc_pkt_cycles_q + 1;
         src_cnt = 0;
@@ -1761,7 +1751,7 @@ module frontend
       if (tc_hit_this_cycle && !instr_queue_empty)
         tc_dbg_iq_flush_on_capture_q <= tc_dbg_iq_flush_on_capture_q + 1;
 
-      // V88: Backend stall and frontend bubble counters
+      // Backend stall and frontend bubble counters
       if (|fetch_entry_valid_o && !(|fetch_entry_ready_i))
         tc_dbg_backend_stall_q <= tc_dbg_backend_stall_q + 1;
       if (instr_queue_empty)
@@ -1771,7 +1761,7 @@ module frontend
       if (!icache_dreq_i.valid && !flush_i && !is_mispredict)
         tc_dbg_icache_miss_cycles_q <= tc_dbg_icache_miss_cycles_q + 1;
 
-      // V90: Replay profitability tracking.
+      // Replay profitability tracking.
       if (tc_hit_this_cycle) begin
         feed_taken_idx = int'(tc_feed_src_num_taken);
         if (feed_taken_idx > MAX_TAKEN)
@@ -1792,9 +1782,9 @@ module frontend
         end
       end
 
-      // V70: scan_cancel, poison counters removed.
+      // scan_cancel, poison counters removed.
 
-      // V72: pending buffer tracking
+      // pending buffer tracking
       if (tc_pending_capture)
         tc_dbg_pending_capture_q <= tc_dbg_pending_capture_q + 1;
       if (tc_pending_use)
@@ -1802,7 +1792,7 @@ module frontend
       if (tc_pending_valid_q && tc_pending_invalidate)
         tc_dbg_pending_invalidate_q <= tc_dbg_pending_invalidate_q + 1;
 
-      // V72: ROI tracking
+      // ROI tracking
       // ROI activates when a committed instruction is in [roi_start_pc, roi_end_pc).
       // ROI deactivates when a committed instruction is outside that range
       // (after having been active), capturing exactly the benchmark region.
@@ -1900,7 +1890,7 @@ module frontend
         end
       end
 
-      // V71: no separate replay packet tracking ? TC feeds are same-cycle.
+      // no separate replay packet tracking ? TC feeds are same-cycle.
 
       if (tc_lookup_result_valid && (tc_dbg_lookup_count_q < 80)) begin
         if (tc_trace_hit) begin
@@ -1958,6 +1948,8 @@ module frontend
     $display("[TC-FINAL] accepted=%0d rejected_not_ready=%0d rejected_used=%0d rejected_policy=%0d accept_per_hit=%0d%%",
              tc_dbg_accept_count_q,
              tc_dbg_reject_not_ready_q, tc_dbg_reject_used_q, tc_dbg_reject_policy_q, tc_dbg_accept_rate_q);
+    $display("[TC-V101] path_gate: hits_unvalidated=%0d rejected_by_gate=%0d gate_enabled=%0d",
+             tc_dbg_hit_unvalidated_q, tc_dbg_reject_unvalidated_q, !tc_no_path_gate_q);
     $display("[TC-FINAL] multiblock: accepted=%0d rejected_indirect=%0d rejected_singleblock=%0d rejected_short=%0d",
              tc_dbg_accept_multiblock_q, tc_dbg_reject_indirect_q, tc_dbg_reject_singleblock_q, tc_dbg_reject_short_q);
     $display("[TC-FINAL] min_accept_len=%0d", TC_MIN_ACCEPT_LEN);
@@ -2017,7 +2009,7 @@ module frontend
              tc_dbg_replay_len_hist_q[6], tc_dbg_replay_len_hist_q[7]);
     $display("[TC-FINAL] ========================================");
 
-    // V72: ROI stats
+    // ROI stats
     begin
       int unsigned roi_tc_hit_rate;
       int unsigned roi_tc_accept_rate;
@@ -2059,7 +2051,7 @@ module frontend
       $display("[TC-ROI] ====================================");
     end
 
-    // V77 Hot-PC frontend summary
+    // Hot-PC frontend summary
     $display("[TC-HOTPC-FE] ========== Hot PC Frontend Lifecycle ==========");
     $display("[TC-HOTPC-FE] HP0(0x80002880): lookup=%0d hit=%0d accept=%0d rej_policy=%0d miss_empty=%0d miss_pc=%0d miss_path=%0d",
              fe_hp_lookup[0], fe_hp_hit[0], fe_hp_accept[0], fe_hp_reject_policy[0],

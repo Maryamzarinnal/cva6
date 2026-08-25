@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 import trace_cache_pkg::*;
 
-// V80: Global History Register with checkpoint restore for misprediction
+// Global History Register with checkpoint restore for misprediction
 // recovery.  On mispredict, the GHR is restored from a saved checkpoint
 // instead of resetting to all-zeros.
 
@@ -11,8 +11,8 @@ module tc_ghr (
     input  logic                 rst_ni,
     input  logic                 branch_valid_i, // a branch instruction is present this cycle
     input  logic                 branch_taken_i, // that branch was taken
-    input  logic                 restore_valid_i, // V80: restore from checkpoint (mispredict)
-    input  logic [GHR_WIDTH-1:0] restore_ghr_i,   // V80: checkpoint value to restore
+    input  logic                 restore_valid_i, // restore from checkpoint (mispredict)
+    input  logic [GHR_WIDTH-1:0] restore_ghr_i,   // checkpoint value to restore
     output logic [GHR_WIDTH-1:0] ghr_o           // current history (MSB=oldest, LSB=newest)
 );
 
@@ -20,7 +20,7 @@ module tc_ghr (
 
   always_comb begin
     if (restore_valid_i) begin
-      ghr_d = restore_ghr_i;  // V80: mispredict restore (highest priority)
+      ghr_d = restore_ghr_i;  // mispredict restore (highest priority)
     end else if (flush_i) begin
       ghr_d = '0;
     end else if (branch_valid_i) begin

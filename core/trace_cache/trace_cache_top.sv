@@ -2,15 +2,15 @@
 import trace_cache_pkg::*;
 import riscv::*;
 
-// V90 skewed-associative trace cache with multi-taken-branch support.
-// V90: MAX_TAKEN raised to 3.  Builder spans multiple fetch windows to
+// skewed-associative trace cache with multi-taken-branch support.
+// MAX_TAKEN raised to 3.  Builder spans multiple fetch windows to
 //      record traces with up to 3 taken branches.  Simple replay policy
 //      (accept length ? 3, no profitability filter).
 // Each way uses a different hash function (H0 / H1) so that PCs
 // colliding in one way's set likely map to different sets in the other
 // way.  This breaks hot-set concentration.
 // Traces are 1 fetch window (4 instructions, 1 taken branch max).
-// V85: builder now accepts returns (target from RAS prediction) and
+// builder now accepts returns (target from RAS prediction) and
 // direct calls (PC-relative target).  Frontend syncs the RAS during
 // trace replay.
 
@@ -30,7 +30,7 @@ module trace_cache_top #(
   input  logic                                        serving_unaligned_i,
 
   input  logic                        flush_i,
-  // V99 (Option B): high the cycle a TC replay fires.  Forwarded to the
+  // (Option B): high the cycle a TC replay fires.  Forwarded to the
   // trace_builder so it can drop a stale TB_FILL state instead of
   // waiting forever for a target window the redirected fetch will not
   // deliver.
@@ -40,22 +40,22 @@ module trace_cache_top #(
 
   input  logic [CHUNKS_PER_TRACE-1:0] branch_predictions_i,
   input  logic [BR_CNT_WIDTH-1:0]     lookup_num_branches_i,
-  input  logic                        window_has_taken_pred_i, // V79: >=1 predicted-taken CF in this window
+  input  logic                        window_has_taken_pred_i, // >=1 predicted-taken CF in this window
 
   // Resolved branch (from backend): correct-path outcomes to store as path tag, matching Rotenberg fill-at-retire semantics
   input  logic                         resolved_branch_valid_i,
   input  logic [PC_WIDTH-1:0]          resolved_branch_pc_i,
   input  logic                         resolved_branch_is_taken_i,
   input  logic                         resolved_branch_is_mispredict_i,
-  input  logic [GHR_WIDTH-1:0]         resolved_branch_ghr_i, // V81: pipeline-propagated GHR snapshot
+  input  logic [GHR_WIDTH-1:0]         resolved_branch_ghr_i, // pipeline-propagated GHR snapshot
 
   // Current GHR value (for frontend to attach to predictions)
-  output logic [GHR_WIDTH-1:0]         ghr_o,                 // V81: current GHR for pipeline propagation
+  output logic [GHR_WIDTH-1:0]         ghr_o,                 // current GHR for pipeline propagation
 
   // Lookup interface
   input  logic                         lookup_valid_i,
   input  logic [PC_WIDTH-1:0]          lookup_pc_i,
-  // V94: 1 = frontend fired this lookup as the early-unaligned variant
+  // 1 = frontend fired this lookup as the early-unaligned variant
   // (lookup_pc_i is the address of the unaligned instruction that next
   // cycle's instr_realign will deliver as addr[0]). The result cycle is
   // therefore expected to have serving_unaligned_i==1; otherwise the
@@ -116,7 +116,7 @@ module trace_cache_top #(
   assign instr_if.consumed          = instr_if.valid;
   assign instr_if.serving_unaligned = serving_unaligned_i;
 
-  // V81: Forward declarations for GHR restore (used by tc_ghr instantiation below)
+  // Forward declarations for GHR restore (used by tc_ghr instantiation below)
   logic                  is_mispredict_event;
   logic                  ghr_restore_valid;
   logic [GHR_WIDTH-1:0]  ghr_restore_value;
@@ -125,15 +125,15 @@ module trace_cache_top #(
   tc_ghr i_tc_ghr (
     .clk_i,
     .rst_ni,
-    .flush_i          (flush_i && !is_mispredict_event),  // V81: don't reset on mispredict
+    .flush_i          (flush_i && !is_mispredict_event),  // don't reset on mispredict
     .branch_valid_i   (|(instr_valid_i & is_branch_i)),
     .branch_taken_i   (|(instr_valid_i & is_branch_i & branch_taken_i)),
-    .restore_valid_i  (ghr_restore_valid),   // V81: pipeline restore
-    .restore_ghr_i    (ghr_restore_value),   // V81: restored GHR value
+    .restore_valid_i  (ghr_restore_valid),   // pipeline restore
+    .restore_ghr_i    (ghr_restore_value),   // restored GHR value
     .ghr_o            (ghr)
   );
 
-  // V81: Expose GHR for frontend to attach to branch predictions
+  // Expose GHR for frontend to attach to branch predictions
   assign ghr_o = ghr;
 
   logic                   mem_req   [NUM_WAYS];
@@ -157,16 +157,16 @@ module trace_cache_top #(
   logic [CHUNKS_PER_TRACE-1:0][PC_WIDTH-1:0] mem_branch_pcs_builder;
 
   // -----------------------------------------------------------------------
-  // V81 PIPELINE GHR RESTORE: On misprediction, the branch unit sends back
+  // PIPELINE GHR RESTORE: On misprediction, the branch unit sends back
   // the GHR snapshot that was attached to the instruction when it was
   // dispatched.  This is the pre-branch GHR ? we restore it with the
   // correct outcome shifted in.  100% accurate (no hash table collisions).
   //
-  // Replaces V80's 16-entry PC-indexed checkpoint table.
+  // Replaces an earlier 16-entry PC-indexed checkpoint table, which aliased.
   // -----------------------------------------------------------------------
   assign is_mispredict_event = resolved_branch_valid_i & resolved_branch_is_mispredict_i;
 
-  // V81: Restored GHR = pipeline snapshot with correct outcome shifted in
+  // Restored GHR = pipeline snapshot with correct outcome shifted in
   assign ghr_restore_valid = is_mispredict_event;
   assign ghr_restore_value = {resolved_branch_ghr_i[GHR_WIDTH-2:0],
                                resolved_branch_is_taken_i};
@@ -200,8 +200,8 @@ module trace_cache_top #(
   logic                        lookup_valid_q;
   logic [PC_WIDTH-1:0]         lookup_pc_q;
   logic [TRACE_ADDRW-1:0]      lookup_set_q;
-  logic [TRACE_ADDRW-1:0]      lookup_set_w1_q;  // V83: way-1 set index for FF valid lookup
-  logic [GHR_WIDTH-1:0]        lookup_ghr_q;  // V82: registered GHR for tag compare
+  logic [TRACE_ADDRW-1:0]      lookup_set_w1_q;  // way-1 set index for FF valid lookup
+  logic [GHR_WIDTH-1:0]        lookup_ghr_q;  // registered GHR for tag compare
 
   // V94: registered "this lookup targeted the unaligned PC of the cycle that
   // is now the result cycle". Used to check that the actual delivery cycle
@@ -214,34 +214,22 @@ module trace_cache_top #(
   end
 
   // Tag comparison consumes LIVE branch_predictions_i / lookup_num_branches_i
-  // from the result cycle. With the V94 early-unaligned lookup, the result
+  // from the result cycle. With the early-unaligned lookup, the result
   // cycle's window IS the window the lookup targeted (aligned-for-aligned,
   // unaligned-for-unaligned), so the live predictions correctly describe it.
   // No more prev-cycle registers, no more eff_* selectors.
   logic lookup_eligible;
 
-  // -----------------------------------------------------------------------
-  // V74 DEDUP GUARD: 2-phase commit pipeline.
-  //
-  // Phase 1 (dedup_check_fire): Builder requests commit ? capture commit
-  //   data in pipeline registers, issue tag reads for all ways at the
-  //   target set.  Lookups are blocked this cycle (tag ports busy).
-  //
-  // Phase 2 (dedup_pending_q high): Compare read-back tags against pending
-  //   commit.  If any way already holds a matching tag ? suppress write
-  //   (dedup_hit).  Otherwise ? proceed with SRAM write (dedup_write_fire).
-  //   Suppressed commits free the SRAM ports immediately for lookups.
-  //
-  // Tag match criterion: valid && base_pc && num_branches && branch_flags
-  // (same fields as the lookup tag comparison).  Two traces with the same
-  // tag traverse the same instruction sequence ? their data payloads are
-  // deterministically identical ? so a tag-only check is sufficient.
-  // -----------------------------------------------------------------------
+  // Dedup guard: two-phase commit.  Phase 1 latches the builder's commit and
+  // reads the tags of every way in the target set (lookups stall, ports are
+  // busy).  Phase 2 compares them and either suppresses the write or lets it
+  // through.  Matching on the tag alone is enough -- same tag means the same
+  // instruction sequence, so the payloads cannot differ.
 
   // Pipeline registers (hold commit data across the tag-read cycle)
   logic                    dedup_pending_q;
   logic [TRACE_ADDRW-1:0]  dedup_addr_q;       // way-0 (H0) set index
-  logic [TRACE_ADDRW-1:0]  dedup_addr_w1_q;    // way-1 (H1) set index (V77)
+  logic [TRACE_ADDRW-1:0]  dedup_addr_w1_q;    // way-1 (H1) set index
   trace_tag_t              dedup_tag_q;
   logic [TRACE_WIDTH-1:0]  dedup_data_q;
   logic [BE_WIDTH-1:0]     dedup_be_q;
@@ -251,7 +239,7 @@ module trace_cache_top #(
   logic [NUM_WAYS-1:0]     dedup_way_match;
   logic                    dedup_hit;
 
-  // V84: dedup revalidation ? suppress matched an FF-invalid entry (SRAM still has data)
+  // dedup revalidation ? suppress matched an FF-invalid entry (SRAM still has data)
   logic [NUM_WAYS-1:0]     dedup_way_ff_invalid;  // matched way was FF-invalid
   logic                    dedup_revalidate;      // suppress AND matched entry was FF-invalid
   logic                    dedup_revalidate_way;  // which way to re-validate
@@ -270,9 +258,9 @@ module trace_cache_top #(
 
   assign lookup_fire           = lookup_valid_i && !dedup_check_fire && !dedup_write_fire;
   assign lookup_result_valid_o = lookup_valid_q;
-  // V94: a lookup result is meaningful when:
+  // a lookup result is meaningful when:
   //   1. it actually fired (lookup_valid_q),
-  //   2. the result-cycle window has >=1 predicted-taken CF (V79: every
+  //   2. the result-cycle window has >=1 predicted-taken CF (every
   //      stored trace has >=1 taken branch, so a no-taken window can't hit),
   //   3. the lookup's predicted alignment matches the actual delivery
   //      (predicted-unaligned <-> serving_unaligned_i). When they disagree,
@@ -287,7 +275,7 @@ module trace_cache_top #(
   logic [PC_WIDTH-1:0] lookup_base;
   assign lookup_base = lookup_pc_i;
 
-  // V71: branch_predictions and num_branches are used LIVE (not registered)
+  // branch_predictions and num_branches are used LIVE (not registered)
   // at tag-comparison time.  They arrive from the frontend's instruction
   // scan in the same cycle as the SRAM read-data, one cycle after the
   // SRAM read-request.
@@ -296,29 +284,29 @@ module trace_cache_top #(
       lookup_valid_q        <= 1'b0;
       lookup_pc_q           <= '0;
       lookup_set_q          <= '0;
-      lookup_set_w1_q       <= '0;  // V83
-      lookup_ghr_q          <= '0;  // V82
+      lookup_set_w1_q       <= '0;
+      lookup_ghr_q          <= '0;
     end else begin
       lookup_valid_q        <= lookup_fire;
       lookup_pc_q           <= lookup_base;
       lookup_set_q          <= tc_index(lookup_base, ghr);
-      lookup_set_w1_q       <= tc_index_w1(lookup_base, ghr);  // V83: way-1 set for FF valid
-      lookup_ghr_q          <= ghr;  // V82: capture GHR at lookup time for tag compare
+      lookup_set_w1_q       <= tc_index_w1(lookup_base, ghr);  // way-1 set for FF valid
+      lookup_ghr_q          <= ghr;  // capture GHR at lookup time for tag compare
     end
   end
 
-  // V77: per-way builder indices (combinational, from builder's base_pc)
+  // per-way builder indices (combinational, from builder's base_pc)
   logic [TRACE_ADDRW-1:0] builder_idx_w0;
   logic [TRACE_ADDRW-1:0] builder_idx_w1;
-  assign builder_idx_w0 = tc_index(mem_tag_builder.base_pc, mem_tag_builder.ghr);  // V82: GHR from builder tag
-  assign builder_idx_w1 = tc_index_w1(mem_tag_builder.base_pc, mem_tag_builder.ghr);  // V82
+  assign builder_idx_w0 = tc_index(mem_tag_builder.base_pc, '0);
+  assign builder_idx_w1 = tc_index_w1(mem_tag_builder.base_pc, '0);
 
   logic lru [(1 << TRACE_ADDRW)];
   logic wr_way;
   assign wr_way = ~lru[builder_idx_w0];  // LRU keyed on H0 index
 
   // -----------------------------------------------------------------------
-  // V83 SPECULATIVE TRACE INVALIDATION
+  // SPECULATIVE TRACE INVALIDATION
   //
   // Valid bits sit in flip-flops (not SRAM) for single-cycle clearing.
   // A speculative write log tracks recent builder writes.  On misprediction,
@@ -367,7 +355,7 @@ module trace_cache_top #(
     end
   end
 
-  // V83: dedup_ff_valid ? FF valid bits at the dedup read addresses
+  // dedup_ff_valid ? FF valid bits at the dedup read addresses
   assign dedup_ff_valid[0] = valid_ff[0][dedup_addr_q];
   assign dedup_ff_valid[1] = valid_ff[1][dedup_addr_w1_q];
 
@@ -378,13 +366,13 @@ module trace_cache_top #(
   // benefit comes from conflict reduction, not replacement precision.
   // -----------------------------------------------------------------------
   logic final_wr_way;
-  // V77: per-way write address (selected after final_wr_way is known)
+  // per-way write address (selected after final_wr_way is known)
   logic [TRACE_ADDRW-1:0] dedup_wr_addr;
   logic [TRACE_ADDRW-1:0] dedup_other_addr;
   always_comb begin
     final_wr_way = dedup_wr_way_q;  // default: LRU choice
     if (dedup_pending_q && !dedup_hit) begin
-      // V83: use FF valid bits (not SRAM) for empty-slot detection
+      // use FF valid bits (not SRAM) for empty-slot detection
       if (dedup_ff_valid[dedup_wr_way_q] && !dedup_ff_valid[~dedup_wr_way_q])
         final_wr_way = ~dedup_wr_way_q;  // prefer empty slot
     end
@@ -418,7 +406,7 @@ module trace_cache_top #(
       tag_addr[final_wr_way]  = dedup_wr_addr;
       tag_wdata[final_wr_way] = dedup_tag_q;
     end else if (dedup_check_fire) begin
-      // Phase 1: read tags ? each way at its own skewed index (V77)
+      // Phase 1: read tags ? each way at its own skewed index
       tag_req[0]  = 1'b1;
       tag_we[0]   = 1'b0;
       tag_addr[0] = builder_idx_w0;
@@ -426,16 +414,16 @@ module trace_cache_top #(
       tag_we[1]   = 1'b0;
       tag_addr[1] = builder_idx_w1;
     end else if (lookup_fire) begin
-      // V77: each way reads at its own skewed hash index
+      // each way reads at its own skewed hash index
       mem_req[0]  = 1'b1;
       mem_we[0]   = 1'b0;
-      mem_addr[0] = tc_index(lookup_base, ghr);  // V82: GHR in index
+      mem_addr[0] = tc_index(lookup_base, ghr);  // GHR in index
       tag_req[0]  = 1'b1;
       tag_we[0]   = 1'b0;
       tag_addr[0] = tc_index(lookup_base, ghr);
       mem_req[1]  = 1'b1;
       mem_we[1]   = 1'b0;
-      mem_addr[1] = tc_index_w1(lookup_base, ghr);  // V82: GHR in index
+      mem_addr[1] = tc_index_w1(lookup_base, ghr);  // GHR in index
       tag_req[1]  = 1'b1;
       tag_we[1]   = 1'b0;
       tag_addr[1] = tc_index_w1(lookup_base, ghr);
@@ -471,18 +459,22 @@ module trace_cache_top #(
   end
 
   // -----------------------------------------------------------------------
-  // V83: FF valid-bit update logic
+  // FF valid-bit update logic
   // -----------------------------------------------------------------------
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       for (int w = 0; w < NUM_WAYS; w++)
         for (int s = 0; s < (1 << TRACE_ADDRW); s++)
           valid_ff[w][s] <= 1'b0;
-    end else if (flush_i && !is_mispredict_event) begin
-      // Non-misprediction flush (e.g. fence.i): clear ALL valid bits
-      for (int w = 0; w < NUM_WAYS; w++)
-        for (int s = 0; s < (1 << TRACE_ADDRW); s++)
-          valid_ff[w][s] <= 1'b0;
+    // There used to be a "clear every valid bit on any non-mispredict flush"
+    // branch here.  flush_i is (frontend flush_i || is_mispredict), so it
+    // fires on every exception, eret and set_pc_commit -- 699 times on
+    // CoreMark, against ~281 resident traces.  Harmless while valid_ff was
+    // out of the hit path, catastrophic once it went in.  An exception does
+    // not change instruction memory, so the traces are still good.
+    // fence.i genuinely should invalidate, but it never has here: the tag
+    // SRAM is not cleared on fence.i either, since flush_icache_o only goes
+    // to the cache subsystem.  Needs its own flush_all_i port to fix.
     end else begin
       // Misprediction: invalidate only speculative-write-log entries
       if (is_mispredict_event) begin
@@ -495,13 +487,13 @@ module trace_cache_top #(
       // that write is itself speculative)
       if (actual_write && !is_mispredict_event)
         valid_ff[final_wr_way][dedup_wr_addr] <= 1'b1;
-      // V84: re-validate FF bit when dedup matches an FF-invalid SRAM entry
+      // re-validate FF bit when dedup matches an FF-invalid SRAM entry
       if (dedup_revalidate && !is_mispredict_event)
         valid_ff[dedup_revalidate_way][dedup_revalidate_addr] <= 1'b1;
     end
   end
 
-  // V83: Speculative write log management
+  // Speculative write log management
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       for (int i = 0; i < SPEC_LOG_DEPTH; i++)
@@ -515,7 +507,7 @@ module trace_cache_top #(
         spec_log_valid[i] <= 1'b0;
       spec_log_head <= '0;
     end else if (actual_write || dedup_revalidate) begin
-      // V84: also log revalidated entries ? they're still speculative
+      // also log revalidated entries ? they're still speculative
       spec_log_valid[spec_log_head] <= 1'b1;
       spec_log_way[spec_log_head]   <= actual_write ? final_wr_way      : dedup_revalidate_way;
       spec_log_set[spec_log_head]   <= actual_write ? dedup_wr_addr     : dedup_revalidate_addr;
@@ -524,7 +516,7 @@ module trace_cache_top #(
   end
 
   // -----------------------------------------------------------------------
-  // V84 Dedup comparison: tag read-back from Phase 1 vs pending commit tag.
+  // Dedup comparison: tag read-back from Phase 1 vs pending commit tag.
   // Uses SRAM valid (not FF valid) so that FF-invalidated entries still
   // suppress duplicate writes.  On suppress of an FF-invalid entry, the
   // FF bit is re-validated (the data is already in SRAM).
@@ -538,14 +530,14 @@ module trace_cache_top #(
           dd_flags_ok &= (tag_rdata[w].branch_flags[b] == dedup_tag_q.branch_flags[b]);
       end
       dedup_way_match[w] = dedup_pending_q
-                         && tag_rdata[w].valid  // V84: SRAM valid (catches FF-invalid entries)
+                         && tag_rdata[w].valid  // SRAM valid (catches FF-invalid entries)
                          && (tag_rdata[w].base_pc      == dedup_tag_q.base_pc)
                          && (tag_rdata[w].num_branches  == dedup_tag_q.num_branches)
                          && dd_flags_ok;
-      dedup_way_ff_invalid[w] = dedup_way_match[w] && !dedup_ff_valid[w];  // V84
+      dedup_way_ff_invalid[w] = dedup_way_match[w] && !dedup_ff_valid[w];
     end
     dedup_hit = |dedup_way_match;
-    // V84: revalidation ? the matched entry needs its FF bit restored
+    // revalidation ? the matched entry needs its FF bit restored
     dedup_revalidate = dedup_suppress_fire && |dedup_way_ff_invalid;
     dedup_revalidate_way  = dedup_way_ff_invalid[1] ? 1'b1 : 1'b0;
     dedup_revalidate_addr = dedup_way_ff_invalid[1] ? dedup_addr_w1_q : dedup_addr_q;
@@ -564,16 +556,16 @@ module trace_cache_top #(
   for (genvar w = 0; w < NUM_WAYS; w++) begin : gen_tag_cmp
     assign trace_read[w] = mem_rdata[w];
     assign trace_tag_read[w] = tag_rdata[w];
-    // V83: hit detection uses FF valid bits (single-cycle invalidation on mispredict)
+    // hit detection uses FF valid bits (single-cycle invalidation on mispredict)
     assign way_valid[w]  = valid_ff[w][w == 0 ? lookup_set_q : lookup_set_w1_q];
     assign pc_match[w]   = way_valid[w] && (trace_tag_read[w].base_pc == lookup_pc_q);
-    // V71: comparison uses LIVE branch_predictions_i / lookup_num_branches_i
+    // comparison uses LIVE branch_predictions_i / lookup_num_branches_i
     // (provided by the frontend in the same cycle as SRAM read-data).
     assign branch_count_match[w] = way_valid[w] &&
                                    (trace_tag_read[w].num_branches ==
                                     TRIGGER_BRANCH_CNT_WIDTH'(lookup_num_branches_i));
 
-    // V94: tag compare uses LIVE branch_predictions_i / lookup_num_branches_i.
+    // tag compare uses LIVE branch_predictions_i / lookup_num_branches_i.
     // The early-unaligned lookup makes the result cycle's window match the
     // lookup target (aligned for aligned, unaligned for unaligned), so the
     // live predictions correctly describe the window the SRAM tag should be
@@ -582,7 +574,7 @@ module trace_cache_top #(
       .base_pc_i      (lookup_pc_q),
       .num_branches_i (TRIGGER_BRANCH_CNT_WIDTH'(lookup_num_branches_i)),
       .branch_flags_i (branch_predictions_i[TRIGGER_BRANCH_BITS-1:0]),
-      .ghr_i          (lookup_ghr_q),  // V82: path history
+      .ghr_i          (lookup_ghr_q),  // path history
       .stored_tag_i   (trace_tag_read[w]),
       .hit_o          (tag_hit_raw[w]),
       .lookup_tag_o   (lookup_tag_dbg[w])
@@ -605,7 +597,7 @@ module trace_cache_top #(
   logic [NUM_WAYS-1:0] raw_way_hit;
   always_comb begin
     for (int w = 0; w < NUM_WAYS; w++) begin
-      // V78: suppress lookup result when serving an unaligned instruction
+      // suppress lookup result when serving an unaligned instruction
       // that straddles two 16B fetch blocks.  In the straddle cycle the I$
       // returns the aligned block-base address (e.g. 0x80002880), so
       // tc_lookup_pc / lookup_pc_q = that block base.  But instr_realign
@@ -615,7 +607,13 @@ module trace_cache_top #(
       // what a stored trace at addr[0] occupies.  The result is always wrong;
       // suppress it (miss) rather than signalling a false pc_mismatch.
       raw_way_hit[w] = tag_hit_raw[w] & lookup_eligible;
-      way_hit[w]     = raw_way_hit[w];  // V68: no used_q filter; frontend rehit-block handles replay guards
+      // The FF valid bit has to be in the hit, not just in the diagnostics.
+      // tag_hit_raw only checks the tag SRAM's valid field, and speculative
+      // invalidation clears valid_ff -- so without this AND the whole
+      // invalidate-on-mispredict mechanism did nothing.
+      // It is also what lets tag_sram drop its reset-all later: valid_ff
+      // resets to 0, so uninitialised tags can no longer produce a hit.
+      way_hit[w]     = raw_way_hit[w] & way_valid[w];
     end
   end
 
@@ -776,7 +774,7 @@ module trace_cache_top #(
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      // V77: alternating init ? even sets?0, odd sets?1
+      // alternating init ? even sets?0, odd sets?1
       for (int s = 0; s < (1 << TRACE_ADDRW); s++)
         lru[s] <= s[0];
     end else if (flush_i) begin
@@ -790,7 +788,7 @@ module trace_cache_top #(
     end
   end
 
-  // V70: Traces are freely reusable on every loop iteration.
+  // Traces are freely reusable on every loop iteration.
   assign trace_used_o = 1'b0;
 
 `ifdef MODEL_TECH
@@ -832,7 +830,7 @@ module trace_cache_top #(
 
 `ifndef SYNTHESIS
   // -----------------------------------------------------------------------
-  // V76 PC-MISMATCH DEBUG INSTRUMENTATION
+  // PC-MISMATCH DEBUG INSTRUMENTATION
   //
   // Goal: distinguish genuine set aliasing (different PCs hashing to same
   //       set) from potential bugs in lookup-PC or stored base_pc.
@@ -976,48 +974,27 @@ module trace_cache_top #(
   int unsigned tc_lookup_requests;
   int unsigned tc_lookup_blocked_by_builder;
   int unsigned tc_tag_payload_mismatch;
-  int unsigned tc_unaligned_suppressed; // V78: lookups suppressed due to serving_unaligned
-  int unsigned tc_no_taken_suppressed;  // V79: lookups suppressed due to no predicted-taken CF
-  int unsigned tc_ghr_restores;         // V81: GHR restored from pipeline on mispredict
-  int unsigned tc_ghr_resets;           // V81: GHR reset to 0 (non-mispredict flush)
-  int unsigned tc_mispredicts_seen;     // V81: total mispredicts observed
-  int unsigned tc_spec_invalidations;   // V83: traces invalidated on misprediction
-  int unsigned tc_spec_log_clears;      // V83: spec log cleared (correct resolution)
-  int unsigned tc_spec_log_overflows;   // V83: spec log head wrapped before clear
-  int unsigned tc_dedup_revalidations;  // V84: dedup suppress re-validated an FF-invalid entry
+  int unsigned tc_unaligned_suppressed; // lookups suppressed due to serving_unaligned
+  int unsigned tc_no_taken_suppressed;  // lookups suppressed due to no predicted-taken CF
+  int unsigned tc_ghr_restores;         // GHR restored from pipeline on mispredict
+  int unsigned tc_ghr_resets;           // GHR reset to 0 (non-mispredict flush)
+  int unsigned tc_mispredicts_seen;     // total mispredicts observed
+  int unsigned tc_spec_invalidations;   // traces invalidated on misprediction
+  int unsigned tc_spec_log_clears;      // spec log cleared (correct resolution)
+  int unsigned tc_spec_log_overflows;   // spec log head wrapped before clear
+  int unsigned tc_dedup_revalidations;  // dedup suppress re-validated an FF-invalid entry
 
-  // -----------------------------------------------------------------------
-  // V73 COMMIT DEBUG: Shadow tag/data arrays + churn analysis counters.
-  //
-  // "Trace signature" definition:
-  //   sig = {base_pc, num_branches, branch_flags[0:num_branches-1], target_addr}
-  // Two traces with the same signature traverse the same instruction path
-  // from the same start PC through the same branch outcomes to the same
-  // exit PC.  Identical signatures ? functionally identical traces.
-  //
-  // Counter semantics (how they distinguish real diversity from churn):
-  //   commit_into_invalid   ? cold-fill into an empty/reset slot.
-  //                           High early, drops once SRAM is warm.
-  //   commit_replace_valid  ? eviction of a live entry.
-  //                           ? total churn pressure.
-  //   commit_replace_same_sig ? exact re-recording of the same trace.
-  //                           Pure waste / duplicate recording bug.
-  //   commit_replace_same_pc_diff_path ? same base_pc, different branch
-  //                           path.  Real path diversity IF distinct paths
-  //                           are both useful; churn if they keep evicting
-  //                           each other.
-  //   commit_replace_diff_pc ? different base_pc.  Capacity/aliasing miss
-  //                           eviction; unrelated traces compete for the
-  //                           same set.
-  //   commit_other_way_same_sig ? the OTHER way already holds an entry
-  //                           with the exact same signature.  This is a
-  //                           duplicate-recording bug: two ways store the
-  //                           same trace.
-  //   commit_other_way_same_pc ? the OTHER way has the same base_pc but a
-  //                           different path.  This means both branch
-  //                           variants of a PC coexist ? real path
-  //                           diversity utilising both ways.
-  // -----------------------------------------------------------------------
+  // Commit churn instrumentation.  A trace's "signature" is
+  // {base_pc, num_branches, branch_flags, target_addr} -- same signature
+  // means same path from the same start to the same exit, so the traces are
+  // interchangeable.  The counters split evictions by cause:
+  //   into_invalid            cold fill, expected to fade as the SRAM warms
+  //   replace_valid           evicted a live entry -- overall churn pressure
+  //   replace_same_sig        re-recorded an identical trace; should be 0
+  //   replace_same_pc_diff_path  two paths from one PC fighting over a way
+  //   replace_diff_pc         capacity or index aliasing
+  //   other_way_same_sig      both ways hold the same trace; a bug if != 0
+  //   other_way_same_pc       both path variants resident, using the ways well
 
   // Shadow tag array ? mirrors the tag SRAMs, updated on every builder
   // write, so we can read the "about-to-be-replaced" tag combinationally
@@ -1222,15 +1199,15 @@ module trace_cache_top #(
   end
 
   // -----------------------------------------------------------------------
-  // V74 Dedup counters + V75 LRU override counter
+  // Dedup counters + LRU override counter
   // -----------------------------------------------------------------------
   int unsigned tc_dedup_attempts;       // total builder commit requests
   int unsigned tc_dedup_skipped;        // suppressed by dedup guard
   int unsigned tc_dedup_match_chosen;   // match was in LRU-chosen (victim) way
   int unsigned tc_dedup_match_other;    // match was in the other way
-  int unsigned tc_lru_invalid_override; // V75: times we overrode LRU to use empty slot
-  int unsigned tc_wr_way0;             // V75: writes to way 0
-  int unsigned tc_wr_way1;             // V75: writes to way 1
+  int unsigned tc_lru_invalid_override; // times we overrode LRU to use empty slot
+  int unsigned tc_wr_way0;             // writes to way 0
+  int unsigned tc_wr_way1;             // writes to way 1
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -1263,7 +1240,7 @@ module trace_cache_top #(
   end
 
   // -----------------------------------------------------------------------
-  // V77 Hot-PC dedup/write tracker: monitors the lifecycle of the top
+  // Hot-PC dedup/write tracker: monitors the lifecycle of the top
   // mismatch PCs through the dedup pipeline.
   // -----------------------------------------------------------------------
   localparam logic [PC_WIDTH-1:0] HP0 = 64'h80002880;
@@ -1333,7 +1310,7 @@ module trace_cache_top #(
       if (lookup_valid_i && (dedup_check_fire || dedup_write_fire))
         tc_lookup_blocked_by_builder <= tc_lookup_blocked_by_builder + 1;
 
-      // V94: counters reflect the alignment-mismatch suppression. With the
+      // counters reflect the alignment-mismatch suppression. With the
       // early-unaligned lookup the prediction usually matches delivery; this
       // increments only when a flush/mispredict cancels the predicted cycle
       // (predicted aligned but delivery unaligned, or vice versa).
@@ -1342,11 +1319,11 @@ module trace_cache_top #(
       else if (lookup_valid_q && !window_has_taken_pred_i)
         tc_no_taken_suppressed <= tc_no_taken_suppressed + 1;
 
-      // V81: GHR pipeline restore counters
+      // GHR pipeline restore counters
       if (is_mispredict_event) begin
         tc_mispredicts_seen <= tc_mispredicts_seen + 1;
-        tc_ghr_restores <= tc_ghr_restores + 1;  // V81: always restores (pipeline propagation)
-        // V83: count speculative invalidations
+        tc_ghr_restores <= tc_ghr_restores + 1;  // always restores (pipeline propagation)
+        // count speculative invalidations
         begin
           int n_inval;
           n_inval = 0;
@@ -1358,13 +1335,13 @@ module trace_cache_top #(
       if (flush_i && !is_mispredict_event)
         tc_ghr_resets <= tc_ghr_resets + 1;
 
-      // V83: spec log clears on correct resolution
+      // spec log clears on correct resolution
       if (resolved_branch_valid_i && !resolved_branch_is_mispredict_i)
         tc_spec_log_clears <= tc_spec_log_clears + 1;
-      // V83: spec log overflow (head wraps with valid entry still present)
+      // spec log overflow (head wraps with valid entry still present)
       if (actual_write && spec_log_valid[spec_log_head])
         tc_spec_log_overflows <= tc_spec_log_overflows + 1;
-      // V84: count dedup revalidations
+      // count dedup revalidations
       if (dedup_revalidate)
         tc_dedup_revalidations <= tc_dedup_revalidations + 1;
 
@@ -1401,7 +1378,7 @@ module trace_cache_top #(
     $display("[TC-DEDUP] match_chosen_way=%0d match_other_way=%0d",
              tc_dedup_match_chosen, tc_dedup_match_other);
 
-    // V77 Hot-PC lifecycle summary
+    // Hot-PC lifecycle summary
     $display("[TC-HOTPC-DEDUP] ========== Hot PC Dedup Lifecycle ==========");
     for (int i = 0; i < 4; i++)
       $display("[TC-HOTPC-DEDUP] HP%0d (0x%h): attempt=%0d skip=%0d write=%0d",
@@ -1424,7 +1401,7 @@ module trace_cache_top #(
              tc_miss_total, tc_miss_empty, tc_miss_pc, tc_miss_path);
     `endif
 
-    // V73 commit churn analysis
+    // commit churn analysis
     $display("[TC-CHURN] ========== Commit Churn Analysis ==========");
     $display("[TC-CHURN] total_commits=%0d into_invalid=%0d replace_valid=%0d",
              tc_recorded_traces, cmt_into_invalid, cmt_replace_valid);
@@ -1445,7 +1422,7 @@ module trace_cache_top #(
              cmt_taken_hist[MAX_TAKEN]);
     $display("[TC-CHURN] ==========================================");
 
-    // V76 PC-mismatch analysis summary
+    // PC-mismatch analysis summary
     $display("[TC-PCMISS] ========== PC Mismatch Analysis ==========");
     $display("[TC-PCMISS] total=%0d  1_valid_way=%0d  2_valid_ways=%0d",
              pcm_event_count, pcm_1valid, pcm_2valid);

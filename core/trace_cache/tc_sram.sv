@@ -53,7 +53,7 @@
 //                       `rdata_o` when `req_i` and `we_i` are asserted. The output data is stable
 //                       on write requests.
 
-module tc_sram #(
+module trace_data_sram #(
   parameter int unsigned NumWords     = 32'd1024, // Number of Words in data array
   parameter int unsigned DataWidth    = 32'd128,  // Data signal width
   parameter int unsigned ByteWidth    = 32'd8,    // Width of a data byte
@@ -220,7 +220,7 @@ module tc_sram #(
   initial begin: p_sim_hello
     if (PrintSimCfg) begin
       $display("#################################################################################");
-      $display("tc_sram functional instantiated with the configuration:"                          );
+      $display("trace_data_sram functional instantiated with the configuration:"                          );
       $display("Instance: %m"                                                                     );
       $display("Number of ports   (dec): %0d", NumPorts                                           );
       $display("Number of words   (dec): %0d", NumWords                                           );
