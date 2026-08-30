@@ -20,11 +20,12 @@ package trace_cache_pkg;
   localparam int unsigned TRIGGER_BRANCH_BITS = SLOTS_PER_CYCLE;
   localparam int unsigned TRIGGER_BRANCH_CNT_WIDTH = $clog2(TRIGGER_BRANCH_BITS + 1);
 
-  // Instructions stored as 16-bit chunks (RVC = 1 chunk, RV32 = 2 chunks).
+  // Upper bound on branches recorded per trace, and the width of the branch
+  // bookkeeping vectors.  Two per instruction is the worst case the builder
+  // has to describe, so this stays at TRACE_LEN*2 even though instructions
+  // themselves are now stored one per slot.
   localparam int unsigned CHUNKS_PER_TRACE = TRACE_LEN * 2;  // 8
   localparam int unsigned BR_CNT_WIDTH = $clog2(CHUNKS_PER_TRACE + 1);
-  localparam int unsigned SUFFIX_CHUNKS = MAX_TRACE_INSTR * 2;
-  localparam int unsigned SUFFIX_LEN_WIDTH = $clog2(MAX_TRACE_INSTR + 1);
 
   // Taken branches a trace may cross.  A third target costs 64 bits in every
   // entry and served 12 hits out of 768592 on CoreMark, so it is not worth
@@ -40,7 +41,7 @@ package trace_cache_pkg;
     + CHUNKS_PER_TRACE + BR_CNT_WIDTH
     + TAKEN_CNT_WIDTH + (MAX_TAKEN * PC_WIDTH)
     + PC_WIDTH
-    + (CHUNKS_PER_TRACE * 16) + CHUNKS_PER_TRACE;
+    + (TRACE_LEN * INSTR_WIDTH) + TRACE_LEN;
 
   localparam int unsigned BE_WIDTH = (TRACE_WIDTH + 7) / 8;
 
@@ -64,18 +65,6 @@ package trace_cache_pkg;
   } trace_tag_t;
 
   typedef struct packed {
-    logic                                       valid;
-    logic [PC_WIDTH-1:0]                        start_pc;
-    logic [PC_WIDTH-1:0]                        exit_pc;
-    logic [SUFFIX_LEN_WIDTH-1:0]                len;
-    logic [SUFFIX_CHUNKS-1:0][15:0]             chunks;
-    logic [SUFFIX_CHUNKS-1:0]                   valid_chunks;
-  } trace_payload_t;
-
-  localparam int unsigned TRACE_TAG_WIDTH = $bits(trace_tag_t);
-  localparam int unsigned TRACE_PAYLOAD_WIDTH = $bits(trace_payload_t);
-
-  typedef struct packed {
     logic                               valid;
     logic [PC_WIDTH-1:0]                base_pc;
     logic [CHUNKS_PER_TRACE-1:0]        lookup_branch_flags;
@@ -90,8 +79,13 @@ package trace_cache_pkg;
     // Final next PC after the trace ends
     logic [PC_WIDTH-1:0]                target_addr;
 
-    logic [CHUNKS_PER_TRACE-1:0][15:0]  chunks;
-    logic [CHUNKS_PER_TRACE-1:0]        valid_chunks;
+    // One slot per instruction, already aligned.  A compressed instruction is
+    // stored zero-extended, so replay needs no unpacking step.  Packing these
+    // as 16-bit chunks saved nothing, because the builder caps a trace at
+    // TRACE_LEN instructions regardless of how few chunks they occupy, and it
+    // forced a variable-stride unpack loop that cannot be synthesised.
+    logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0] instrs;
+    logic [TRACE_LEN-1:0]                  instr_valid;
   } trace_data_t;
 
   function automatic trace_tag_t make_trace_tag(

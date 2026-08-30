@@ -62,7 +62,6 @@ module trace_data_sram #(
   parameter              SimInit      = "none",   // Simulation initialization
   parameter bit          PrintSimCfg  = 1'b0,     // Print configuration
   parameter              ImplKey      = "none",   // Reference to specific implementation
-  parameter              FPGAImplKey  = "auto",   // Reference to specific implementation for fpga
   // DEPENDENT PARAMETERS, DO NOT OVERWRITE!
   parameter int unsigned AddrWidth = (NumWords > 32'd1) ? $clog2(NumWords) : 32'd1,
   parameter int unsigned BeWidth   = (DataWidth + ByteWidth - 32'd1) / ByteWidth, // ceil_div
@@ -81,6 +80,21 @@ module trace_data_sram #(
   // output ports
   output data_t [NumPorts-1:0] rdata_o     // read data
 );
+
+// ////////////////////////////////////////////////////////////////////////
+// SYNTHESIS BLACKBOX -- STEP 1 of 3
+// This is the change from tech_cells_generic commit #47, "tc_sram:
+// Instantiate blackbox when synthesized".  Uncomment these five lines to put
+// everything below into the simulation-only branch.
+//
+// `ifdef SYNTHESIS
+//   `define TC_GENERIC_SRAM_SYNTHESIS
+// `elsif TARGET_SYNTHESIS
+//   `define TC_GENERIC_SRAM_SYNTHESIS
+// `endif
+//
+// `ifndef TC_GENERIC_SRAM_SYNTHESIS
+// ////////////////////////////////////////////////////////////////////////
 
   // memory array
   data_t sram [NumWords-1:0];
@@ -164,7 +178,10 @@ module trace_data_sram #(
     // write memory array
     always_ff @(posedge clk_i or negedge rst_ni) begin
       if (!rst_ni) begin
-        sram <= init_val;
+        // Fix to avoid runtime space reaching maximum capacity in simulation
+        foreach (init_val[i]) begin
+          sram[i] <= init_val[i];
+        end
         for (int i = 0; i < NumPorts; i++) begin
           r_addr_q[i] <= {AddrWidth{1'b0}};
           // initialize the read output register for each port
@@ -243,4 +260,62 @@ module trace_data_sram #(
 `endif
 `endif
 // pragma translate_on
+
+// ////////////////////////////////////////////////////////////////////////
+// SYNTHESIS BLACKBOX -- STEP 2 of 3
+// Uncomment this block.  It closes the simulation branch opened in STEP 1 and
+// puts an empty cell in its place, carrying the array geometry so the flow can
+// pick the matching memory macro.
+//
+// `else
+//   (* sram_num_words = NumWords, sram_data_width = DataWidth,
+//      sram_byte_width = ByteWidth, sram_num_ports = NumPorts,
+//      sram_latency = Latency, sram_impl_key = ImplKey *)
+//   trace_data_sram_blackbox #(
+//     .NumWords     ( NumWords     ),
+//     .DataWidth    ( DataWidth    ),
+//     .ByteWidth    ( ByteWidth    ),
+//     .NumPorts     ( NumPorts     ),
+//     .Latency      ( Latency      ),
+//     .SimInit      ( SimInit      ),
+//     .PrintSimCfg  ( PrintSimCfg  ),
+//     .ImplKey      ( ImplKey      )
+//   ) i_trace_data_sram_blackbox (.*);
+// `endif
+// ////////////////////////////////////////////////////////////////////////
+
 endmodule
+
+// ////////////////////////////////////////////////////////////////////////
+// SYNTHESIS BLACKBOX -- STEP 3 of 3
+// Uncomment this empty module.  Same ports as trace_data_sram, no contents:
+// that is what tells the tool to leave a placeholder for a memory macro
+// instead of building the array out of flip-flops.
+//
+// (* black_box, syn_black_box = 1 *)
+// module trace_data_sram_blackbox #(
+//   parameter int unsigned NumWords     = 32'd1024,
+//   parameter int unsigned DataWidth    = 32'd128,
+//   parameter int unsigned ByteWidth    = 32'd8,
+//   parameter int unsigned NumPorts     = 32'd2,
+//   parameter int unsigned Latency      = 32'd1,
+//   parameter              SimInit      = "none",
+//   parameter bit          PrintSimCfg  = 1'b0,
+//   parameter              ImplKey      = "none",
+//   parameter int unsigned AddrWidth = (NumWords > 32'd1) ? $clog2(NumWords) : 32'd1,
+//   parameter int unsigned BeWidth   = (DataWidth + ByteWidth - 32'd1) / ByteWidth,
+//   parameter type         addr_t    = logic [AddrWidth-1:0],
+//   parameter type         data_t    = logic [DataWidth-1:0],
+//   parameter type         be_t      = logic [BeWidth-1:0]
+// ) (
+//   input  logic                 clk_i,
+//   input  logic                 rst_ni,
+//   input  logic  [NumPorts-1:0] req_i,
+//   input  logic  [NumPorts-1:0] we_i,
+//   input  addr_t [NumPorts-1:0] addr_i,
+//   input  data_t [NumPorts-1:0] wdata_i,
+//   input  be_t   [NumPorts-1:0] be_i,
+//   output data_t [NumPorts-1:0] rdata_o
+// );
+// endmodule
+// ////////////////////////////////////////////////////////////////////////

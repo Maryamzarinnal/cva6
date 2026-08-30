@@ -42,7 +42,6 @@ module trace_builder #(
     output logic [CHUNKS_PER_TRACE-1:0][PC_WIDTH-1:0] mem_branch_pcs_o
 );
 
-  localparam int unsigned CHUNK_PTR_W = $clog2(CHUNKS_PER_TRACE + 1);
   localparam int unsigned INSTR_CNT_W = $clog2(MAX_INSTR_PER_TRACE + 1);
   // Minimum instruction count for a committed trace to survive replay-time
   // policy (tc_trace_policy_ok in frontend.sv).  Must equal TC_MIN_ACCEPT_LEN.
@@ -134,12 +133,11 @@ module trace_builder #(
   logic [PC_WIDTH-1:0]                     accum_base_pc_q;
   logic [TRIGGER_BRANCH_BITS-1:0]          accum_trig_flags_q;
   logic [TRIGGER_BRANCH_CNT_WIDTH-1:0]     accum_trig_cnt_q;
-  logic [CHUNKS_PER_TRACE-1:0][15:0]       accum_chunks_q;
-  logic [CHUNKS_PER_TRACE-1:0]             accum_valid_chunks_q;
+  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]  accum_instrs_q;
+  logic [TRACE_LEN-1:0]                   accum_instr_valid_q;
   logic [CHUNKS_PER_TRACE-1:0]             accum_br_flags_q;
   logic [BR_CNT_WIDTH-1:0]                 accum_num_br_q;
   logic [PC_WIDTH-1:0]                     accum_taken_target_q;
-  logic [CHUNK_PTR_W-1:0]                  accum_chunk_ptr_q;
   logic [INSTR_CNT_W-1:0]                  accum_instr_cnt_q;
   logic [GHR_WIDTH-1:0]                    accum_ghr_q;  // GHR snapshot at trace start
   // multi-taken accumulators
@@ -150,12 +148,11 @@ module trace_builder #(
   logic [PC_WIDTH-1:0]                     accum_base_pc_nxt;
   logic [TRIGGER_BRANCH_BITS-1:0]          accum_trig_flags_nxt;
   logic [TRIGGER_BRANCH_CNT_WIDTH-1:0]     accum_trig_cnt_nxt;
-  logic [CHUNKS_PER_TRACE-1:0][15:0]       accum_chunks_nxt;
-  logic [CHUNKS_PER_TRACE-1:0]             accum_valid_chunks_nxt;
+  logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]  accum_instrs_nxt;
+  logic [TRACE_LEN-1:0]                   accum_instr_valid_nxt;
   logic [CHUNKS_PER_TRACE-1:0]             accum_br_flags_nxt;
   logic [BR_CNT_WIDTH-1:0]                 accum_num_br_nxt;
   logic [PC_WIDTH-1:0]                     accum_taken_target_nxt;
-  logic [CHUNK_PTR_W-1:0]                  accum_chunk_ptr_nxt;
   logic [INSTR_CNT_W-1:0]                  accum_instr_cnt_nxt;
   // multi-taken next-state wires
   logic [TAKEN_CNT_WIDTH-1:0]              accum_taken_cnt_nxt;
@@ -233,12 +230,11 @@ module trace_builder #(
       accum_base_pc_q      <= '0;
       accum_trig_flags_q   <= '0;
       accum_trig_cnt_q     <= '0;
-      accum_chunks_q       <= '0;
-      accum_valid_chunks_q <= '0;
+      accum_instrs_q       <= '0;
+      accum_instr_valid_q <= '0;
       accum_br_flags_q     <= '0;
       accum_num_br_q       <= '0;
       accum_taken_target_q <= '0;
-      accum_chunk_ptr_q    <= '0;
       accum_instr_cnt_q    <= '0;
       accum_ghr_q          <= '0;
       accum_taken_cnt_q    <= '0;
@@ -247,12 +243,11 @@ module trace_builder #(
       accum_base_pc_q      <= '0;
       accum_trig_flags_q   <= '0;
       accum_trig_cnt_q     <= '0;
-      accum_chunks_q       <= '0;
-      accum_valid_chunks_q <= '0;
+      accum_instrs_q       <= '0;
+      accum_instr_valid_q <= '0;
       accum_br_flags_q     <= '0;
       accum_num_br_q       <= '0;
       accum_taken_target_q <= '0;
-      accum_chunk_ptr_q    <= '0;
       accum_instr_cnt_q    <= '0;
       accum_ghr_q          <= '0;
       accum_taken_cnt_q    <= '0;
@@ -263,12 +258,11 @@ module trace_builder #(
       accum_base_pc_q      <= accum_base_pc_nxt;
       accum_trig_flags_q   <= accum_trig_flags_nxt;
       accum_trig_cnt_q     <= accum_trig_cnt_nxt;
-      accum_chunks_q       <= accum_chunks_nxt;
-      accum_valid_chunks_q <= accum_valid_chunks_nxt;
+      accum_instrs_q       <= accum_instrs_nxt;
+      accum_instr_valid_q <= accum_instr_valid_nxt;
       accum_br_flags_q     <= accum_br_flags_nxt;
       accum_num_br_q       <= accum_num_br_nxt;
       accum_taken_target_q <= accum_taken_target_nxt;
-      accum_chunk_ptr_q    <= accum_chunk_ptr_nxt;
       accum_instr_cnt_q    <= accum_instr_cnt_nxt;
       accum_taken_cnt_q    <= accum_taken_cnt_nxt;
       accum_taken_targets_q <= accum_taken_targets_nxt;
@@ -289,13 +283,12 @@ module trace_builder #(
     logic                                    w_has_base;
     logic [TRIGGER_BRANCH_BITS-1:0]          w_trig_flags;
     int unsigned                             w_trig_cnt;
-    logic [CHUNKS_PER_TRACE-1:0][15:0]       w_chunks;
-    logic [CHUNKS_PER_TRACE-1:0]             w_valid_chunks;
+    logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]   w_instrs;
+    logic [TRACE_LEN-1:0]                    w_instr_valid;
     logic [CHUNKS_PER_TRACE-1:0]             w_br_flags;
     logic [BR_CNT_WIDTH-1:0]                 w_num_br;
     logic [PC_WIDTH-1:0]                     w_taken_target;
     logic [PC_WIDTH-1:0]                     w_exit_pc;
-    logic [CHUNK_PTR_W-1:0]                  w_cptr;
     logic [INSTR_CNT_W-1:0]                  w_icnt;
     logic                                    w_has_taken;
     logic                                    w_reject;
@@ -327,12 +320,11 @@ module trace_builder #(
     accum_base_pc_nxt      = '0;
     accum_trig_flags_nxt   = '0;
     accum_trig_cnt_nxt     = '0;
-    accum_chunks_nxt       = '0;
-    accum_valid_chunks_nxt = '0;
+    accum_instrs_nxt       = '0;
+    accum_instr_valid_nxt = '0;
     accum_br_flags_nxt     = '0;
     accum_num_br_nxt       = '0;
     accum_taken_target_nxt = '0;
-    accum_chunk_ptr_nxt    = '0;
     accum_instr_cnt_nxt    = '0;
     accum_taken_cnt_nxt    = '0;
     accum_taken_targets_nxt = '0;
@@ -355,21 +347,19 @@ module trace_builder #(
 
     // In FILL, start scan from accumulated state
     if (state_q == TB_FILL) begin
-      w_chunks       = accum_chunks_q;
-      w_valid_chunks = accum_valid_chunks_q;
+      w_instrs       = accum_instrs_q;
+      w_instr_valid = accum_instr_valid_q;
       w_br_flags     = accum_br_flags_q;
       w_num_br       = accum_num_br_q;
-      w_cptr         = accum_chunk_ptr_q;
       w_icnt         = accum_instr_cnt_q;
       w_exit_pc      = accum_taken_target_q;  // default exit: branch target
       w_taken_cnt    = accum_taken_cnt_q;
       w_taken_targets = accum_taken_targets_q;
     end else begin
-      w_chunks       = '0;
-      w_valid_chunks = '0;
+      w_instrs       = '0;
+      w_instr_valid = '0;
       w_br_flags     = '0;
       w_num_br       = '0;
-      w_cptr         = '0;
       w_icnt         = '0;
     end
 
@@ -448,23 +438,17 @@ module trace_builder #(
           break;
         end
 
-        // Check chunk capacity
-        if ((!rvc && (w_cptr + CHUNK_PTR_W'(2) > CHUNK_PTR_W'(CHUNKS_PER_TRACE))) ||
-            ( rvc && (w_cptr + CHUNK_PTR_W'(1) > CHUNK_PTR_W'(CHUNKS_PER_TRACE)))) begin
+        // No room for another instruction slot
+        if (w_icnt >= INSTR_CNT_W'(MAX_INSTR_PER_TRACE)) begin
           w_overflow = 1'b1;
           break;
         end
 
-        // Store instruction as 16-bit chunks
-        w_valid_chunks[w_cptr] = 1'b1;
-        w_chunks[w_cptr]       = instr_i.inst[i][15:0];
-        if (rvc) begin
-          w_cptr = w_cptr + CHUNK_PTR_W'(1);
-        end else begin
-          w_valid_chunks[w_cptr + CHUNK_PTR_W'(1)] = 1'b0;
-          w_chunks[w_cptr + CHUNK_PTR_W'(1)]       = instr_i.inst[i][31:16];
-          w_cptr = w_cptr + CHUNK_PTR_W'(2);
-        end
+        // One slot per instruction; compressed instructions are zero-extended
+        // so replay can read the slot directly.
+        w_instr_valid[w_icnt] = 1'b1;
+        w_instrs[w_icnt]      = rvc ? {16'b0, instr_i.inst[i][15:0]}
+                                    : instr_i.inst[i];
         w_icnt = w_icnt + INSTR_CNT_W'(1);
 
         // Exit PC: address following this instruction
@@ -507,12 +491,11 @@ module trace_builder #(
               accum_base_pc_nxt      = w_base_pc;
               accum_trig_flags_nxt   = w_trig_flags;
               accum_trig_cnt_nxt     = TRIGGER_BRANCH_CNT_WIDTH'(w_trig_cnt);
-              accum_chunks_nxt       = w_chunks;
-              accum_valid_chunks_nxt = w_valid_chunks;
+              accum_instrs_nxt       = w_instrs;
+              accum_instr_valid_nxt = w_instr_valid;
               accum_br_flags_nxt     = w_br_flags;
               accum_num_br_nxt       = w_num_br;
               accum_taken_target_nxt = w_taken_target;
-              accum_chunk_ptr_nxt    = w_cptr;
               accum_instr_cnt_nxt    = w_icnt;
               accum_taken_cnt_nxt    = w_taken_cnt;
               accum_taken_targets_nxt = w_taken_targets;
@@ -528,8 +511,8 @@ module trace_builder #(
             payload               = '0;
             payload.valid         = 1'b1;
             payload.base_pc       = accum_base_pc_q;
-            payload.chunks        = accum_chunks_q;
-            payload.valid_chunks  = accum_valid_chunks_q;
+            payload.instrs        = accum_instrs_q;
+            payload.instr_valid  = accum_instr_valid_q;
             payload.branch_flags  = accum_br_flags_q;
             payload.num_branches  = accum_num_br_q;
             payload.num_taken     = accum_taken_cnt_q;
@@ -565,12 +548,11 @@ module trace_builder #(
                 accum_base_pc_nxt      = accum_base_pc_q;  // keep original base
                 accum_trig_flags_nxt   = accum_trig_flags_q;
                 accum_trig_cnt_nxt     = accum_trig_cnt_q;
-                accum_chunks_nxt       = w_chunks;
-                accum_valid_chunks_nxt = w_valid_chunks;
+                accum_instrs_nxt       = w_instrs;
+                accum_instr_valid_nxt = w_instr_valid;
                 accum_br_flags_nxt     = w_br_flags;
                 accum_num_br_nxt       = w_num_br;
                 accum_taken_target_nxt = w_taken_target;
-                accum_chunk_ptr_nxt    = w_cptr;
                 accum_instr_cnt_nxt    = w_icnt;
                 accum_taken_cnt_nxt    = w_taken_cnt;
                 accum_taken_targets_nxt = w_taken_targets;
@@ -582,8 +564,8 @@ module trace_builder #(
                 payload               = '0;
                 payload.valid         = 1'b1;
                 payload.base_pc       = accum_base_pc_q;
-                payload.chunks        = w_chunks;
-                payload.valid_chunks  = w_valid_chunks;
+                payload.instrs        = w_instrs;
+                payload.instr_valid  = w_instr_valid;
                 payload.branch_flags  = w_br_flags;
                 payload.num_branches  = w_num_br;
                 payload.num_taken     = w_taken_cnt;
@@ -615,8 +597,8 @@ module trace_builder #(
                 payload               = '0;
                 payload.valid         = 1'b1;
                 payload.base_pc       = accum_base_pc_q;
-                payload.chunks        = accum_chunks_q;
-                payload.valid_chunks  = accum_valid_chunks_q;
+                payload.instrs        = accum_instrs_q;
+                payload.instr_valid  = accum_instr_valid_q;
                 payload.branch_flags  = accum_br_flags_q;
                 payload.num_branches  = accum_num_br_q;
                 payload.num_taken     = accum_taken_cnt_q;

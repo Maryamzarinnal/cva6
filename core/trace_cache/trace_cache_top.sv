@@ -68,8 +68,6 @@ module trace_cache_top #(
   output logic [TRACE_LEN-1:0][INSTR_WIDTH-1:0]       trace_instructions_o,
   output logic [TRACE_LEN_WIDTH-1:0]                  trace_length_o,
   output logic [PC_WIDTH-1:0]                         trace_next_pc_o,
-  output logic [CHUNKS_PER_TRACE-1:0][15:0]           trace_chunks_o,
-  output logic [CHUNKS_PER_TRACE-1:0]                 trace_valid_chunks_o,
   output logic [TRACE_LEN-1:0][PC_WIDTH-1:0]          trace_pcs_o,
   output logic [CHUNKS_PER_TRACE-1:0]                 trace_branch_flags_o,
   output logic [BR_CNT_WIDTH-1:0]                     trace_num_branches_o,
@@ -95,8 +93,10 @@ module trace_cache_top #(
   input  logic                                        mark_used_i
 );
 
+`ifndef SYNTHESIS
   initial assert (MaxTraceInstr <= TRACE_LEN)
     else $fatal(1, "trace_cache_top: MaxTraceInstr (%0d) must be <= TRACE_LEN (%0d)", MaxTraceInstr, TRACE_LEN);
+`endif
 
   tracebuilder_instr_if instr_if (
     .clk_i (clk_i),
@@ -662,51 +662,23 @@ module trace_cache_top #(
   end
 
   assign trace_next_pc_o       = hit_trace.target_addr;
-  assign trace_chunks_o        = hit_trace.chunks;
-  assign trace_valid_chunks_o  = hit_trace.valid_chunks;
   assign trace_branch_flags_o  = hit_trace.branch_flags;
   assign trace_num_branches_o  = hit_trace.num_branches;
   assign trace_taken_targets_o = hit_trace.taken_targets;
   assign trace_num_taken_o     = hit_trace.num_taken;
 
-  // Reconstruct instructions from 16-bit chunks.
-  // For a 32-bit instruction, valid_chunks[k]=1 on the low half and valid_chunks[k+1]=0 on the high half.
+  // Instructions are stored one per slot, so replay is a direct read.  The
+  // length is the number of valid slots, which is a fixed-width popcount.
   logic [TRACE_LEN_WIDTH-1:0] trace_instr_count;
   always_comb begin
-    int instr_idx;
-    int chunk_idx;
-    logic [15:0] low16;
-
     trace_instructions_o = '0;
     trace_instr_count    = '0;
-
-    instr_idx = 0;
-    chunk_idx = 0;
-
-    while ((chunk_idx < CHUNKS_PER_TRACE) && (instr_idx < TRACE_LEN)) begin
-      if (!hit_trace.valid_chunks[chunk_idx]) begin
-        chunk_idx++;
-      end else begin
-        low16 = hit_trace.chunks[chunk_idx];
-
-        // 32-bit instruction
-        if ((low16[1:0] == 2'b11) &&
-            (chunk_idx + 1 < CHUNKS_PER_TRACE) &&
-            (hit_trace.valid_chunks[chunk_idx + 1] === 1'b0)) begin
-          trace_instructions_o[instr_idx] = {hit_trace.chunks[chunk_idx + 1], low16};
-          instr_idx++;
-          chunk_idx += 2;
-        end
-        // 16-bit compressed instruction
-        else begin
-          trace_instructions_o[instr_idx] = {16'b0, low16};
-          instr_idx++;
-          chunk_idx += 1;
-        end
+    for (int unsigned i = 0; i < TRACE_LEN; i++) begin
+      if (hit_trace.instr_valid[i]) begin
+        trace_instructions_o[i] = hit_trace.instrs[i];
+        trace_instr_count       = trace_instr_count + TRACE_LEN_WIDTH'(1);
       end
     end
-
-    trace_instr_count = TRACE_LEN_WIDTH'(instr_idx);
   end
 
   assign trace_length_o = trace_hit ? trace_instr_count : '0;
@@ -821,7 +793,9 @@ module trace_cache_top #(
   assign tc_miss_pc_o    = tc_miss_pc;
   assign tc_miss_path_o  = tc_miss_path;
 `else
+`ifndef SYNTHESIS
   initial $display("[TC-DEBUG] trace_cache_top: miss breakdown DISABLED (MODEL_TECH not defined - add +define+MODEL_TECH to compile)");
+`endif
   assign tc_miss_total_o = 32'b0;
   assign tc_miss_empty_o = 32'b0;
   assign tc_miss_pc_o    = 32'b0;
@@ -1100,21 +1074,11 @@ module trace_cache_top #(
       cmt_oth_same_sig  = cmt_oth_same_pc && c_oth_same_nbr && c_oth_same_flags && c_oth_same_target;
     end
 
-    // --- Instruction count from chunks ---
+    // --- Instruction count = number of occupied slots ---
     begin
-      int c_cidx;
       cmt_new_instr_cnt = 0;
-      c_cidx = 0;
-      while (c_cidx < CHUNKS_PER_TRACE) begin
-        if (c_new_data.valid_chunks[c_cidx]) begin
-          if ((c_new_data.chunks[c_cidx][1:0] == 2'b11) && (c_cidx + 1 < CHUNKS_PER_TRACE))
-            c_cidx += 2;
-          else
-            c_cidx += 1;
-          cmt_new_instr_cnt++;
-        end else
-          c_cidx++;
-      end
+      for (int unsigned ci = 0; ci < TRACE_LEN; ci++)
+        if (c_new_data.instr_valid[ci]) cmt_new_instr_cnt++;
     end
   end
 
